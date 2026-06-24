@@ -1780,6 +1780,28 @@ class ServerArgs:
         "Enforce shared experts fusion even when it would normally be disabled (e.g. under DeepEP). Mutually exclusive with --disable-shared-experts-fusion.",
     ] = False
 
+    # Paged Experts: keep K of E MoE experts resident on the GPU and page the rest from pinned host
+    # RAM on demand (serve an MoE model larger than VRAM). Compute stays on the GPU.
+    enable_paged_experts: A[
+        bool,
+        "Enable Paged Experts: keep K of E MoE experts resident on the GPU and page the rest from "
+        "pinned host RAM (serve an MoE model larger than VRAM).",
+    ] = False
+    paged_experts_num_resident: A[
+        str,
+        "Resident experts per layer (K) for --enable-paged-experts, or 'auto' to size from free VRAM.",
+    ] = "auto"
+    paged_experts_store: A[
+        str,
+        Arg(
+            help="Host expert store kind for --enable-paged-experts. 'pinned' (default) page-locks the "
+            "store and pages with the fast transfer kernel. 'paged' uses a non-pinned store paged with a "
+            "plain indexed copy — correct but slower; use it only when the pinned store would exceed the "
+            "host's page-locked memory limit (e.g. an unquantized model on a small-RAM box).",
+            choices=["pinned", "paged"],
+        ),
+    ] = "pinned"
+
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn
     # -------------------------------------------------------------------------
