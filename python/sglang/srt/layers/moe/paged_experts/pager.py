@@ -82,6 +82,14 @@ class PagedExpertStore:
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device)
         self._step = 0
 
+        # On-device residency state (the captured path; allocated lazily by setup_ondevice). The decision
+        # then runs in the decide kernel with NO host sync, so sglang's decode CUDA graph can capture it.
+        self.ondevice = False
+        self.store_devptr: Dict[str, int] = {}
+        self._slot_expert_d = self._slot_lastuse_d = self._freq_d = None
+        self._step_ctr_d = self._src_d = self._dst_d = self._n_out_d = None
+        self._topk_i32 = None
+
     def distinct_active(self, topk_ids: torch.Tensor):
         """Sorted distinct active (>=0) expert ids this step, as a host list (one host sync)."""
         return [int(e) for e in torch.unique(topk_ids).tolist() if e >= 0]
@@ -154,6 +162,117 @@ class PagedExpertStore:
             for name, gpu_param in self.gpu.items():
                 rows = self.host[name].index_select(0, src_cpu).to(gpu_param.device)
                 gpu_param.data.index_copy_(0, dst_slots, rows)
+
+    def setup_ondevice(self) -> None:
+        """Allocate the device-resident residency state for the captured path and resolve the pinned
+        store's UVA device pointer (once, outside any graph). Requires a pinned store with 16-byte-aligned
+        per-expert blocks (the gather is float4). Slots 0..K-1 start holding experts 0..K-1, matching the
+        eager seeding."""
+        from sglang.jit_kernel.paged_experts_decide import paged_experts_host_devptr
+
+        assert self.pin_host, "on-device gather needs a pinned store (UVA)"
+        for name, sz in self.item_bytes.items():
+            if sz % 16 != 0:
+                raise RuntimeError(
+                    f"[paged-experts] on-device gather needs 16-byte-aligned per-expert blocks; "
+                    f"{name!r} is {sz} B. Use --disable-cuda-graph (eager transfer_kv path)."
+                )
+            self.store_devptr[name] = paged_experts_host_devptr(self.host[name])
+
+        dev = self.device
+        i32 = torch.int32
+        self._slot_expert_d = torch.arange(self.K, dtype=i32, device=dev)
+        self._slot_lastuse_d = torch.zeros(self.K, dtype=i32, device=dev)
+        self._freq_d = torch.zeros(self.E, dtype=i32, device=dev)
+        self._step_ctr_d = torch.zeros(1, dtype=i32, device=dev)
+        self._src_d = torch.zeros(self.K, dtype=i32, device=dev)
+        self._dst_d = torch.zeros(self.K, dtype=i32, device=dev)
+        self._n_out_d = torch.zeros(1, dtype=i32, device=dev)
+        # expert_slot and idx are the same buffer the forward remap reads (logical_to_gpu_index_cuda).
+        self.ondevice = True
+
+    def _prep_topk_ondevice(self, topk_ids: torch.Tensor) -> None:
+        """Copy the router's topk ids into the persistent int32 buffer the kernels read (casts int64 ->
+        int32; capture-safe). Allocated once at the captured shape, reused across replays.
+        """
+        flat = topk_ids.reshape(-1)
+        if self._topk_i32 is None or self._topk_i32.numel() != flat.numel():
+            self._topk_i32 = torch.empty(
+                flat.numel(), dtype=torch.int32, device=self.device
+            )
+        self._topk_i32.copy_(flat)
+
+    def _gather_planned_ondevice(self) -> None:
+        """Gather the experts the last decide chose (``_src_d`` -> ``_dst_d``, count ``_n_out_d``) from the
+        pinned store into the GPU pool, for every paged tensor. Count read on-device -> capture-safe.
+        """
+        from sglang.jit_kernel.paged_experts_decide import paged_experts_gather
+
+        for name, gpu_param in self.gpu.items():
+            paged_experts_gather(
+                self.store_devptr[name],
+                gpu_param.data,
+                self._src_d,
+                self._dst_d,
+                self._n_out_d,
+                self.item_bytes[name],
+            )
+
+    def decide_and_page_ondevice(self, topk_ids: torch.Tensor) -> None:
+        """Capture-safe keep-warm: decide residency + page the misses entirely on-device (no host sync).
+        Mutates the persistent state buffers and ``logical_to_gpu_index_cuda`` (the remap table) in place;
+        gathers exactly the chosen experts. Requires distinct active experts <= K (the caller guarantees it
+        via the shape guard ``num_tokens * top_k <= K``)."""
+        from sglang.jit_kernel.paged_experts_decide import paged_experts_decide
+
+        self._prep_topk_ondevice(topk_ids)
+        l2g = self.logical_to_gpu_index_cuda  # serves as both expert_slot and idx
+        paged_experts_decide(
+            self._topk_i32,
+            self._step_ctr_d,
+            self._slot_expert_d,
+            l2g,
+            self._slot_lastuse_d,
+            self._freq_d,
+            False,  # LRU (matches the host keep-warm path)
+            self._src_d,
+            self._dst_d,
+            self._n_out_d,
+            l2g,
+        )
+        self._gather_planned_ondevice()
+
+    def decide_and_page_wave_ondevice(self, topk_ids: torch.Tensor, wave: int) -> None:
+        """One static wave (distinct > K, e.g. prefill): plan + gather the in-wave experts on-device. The
+        caller runs ceil(E/K) waves and sums the per-wave GEMM partials, then calls
+        ``resync_residency_ondevice`` so the keep-warm state matches the slots."""
+        from sglang.jit_kernel.paged_experts_decide import paged_experts_decide_wave
+
+        if wave == 0:
+            self._prep_topk_ondevice(topk_ids)
+        paged_experts_decide_wave(
+            self._topk_i32,
+            self.E,
+            self.K,
+            wave,
+            self._src_d,
+            self._dst_d,
+            self._n_out_d,
+            self.logical_to_gpu_index_cuda,
+        )
+        self._gather_planned_ondevice()
+
+    def resync_residency_ondevice(self, last_wave: int) -> None:
+        """After the wave loop the slots physically hold wave ``last_wave``'s experts. Point the device
+        keep-warm state at that so the next decode step is consistent (``logical_to_gpu_index_cuda`` was
+        already set to this wave by the last ``decide_wave``)."""
+        lo = last_wave * self.K
+        ngrp = min(self.K, self.E - lo)
+        idx = torch.arange(lo, lo + ngrp, dtype=torch.int32, device=self.device)
+        self._slot_expert_d[:ngrp] = idx
+        if ngrp < self.K:
+            self._slot_expert_d[ngrp:] = -1
+        self._slot_lastuse_d.zero_()
 
     def set_residency(self, experts) -> None:
         """Force slot ``i`` to hold ``experts[i]`` and rebuild the maps. Called after the wave path so
@@ -340,4 +459,6 @@ def setup_pager(method, layer) -> PagedExpertStore:
         len(store.gpu),
         list(store.gpu),
     )
+    if getattr(method, "use_ondevice", False):
+        store.setup_ondevice()  # captured path: device-resident decide + UVA gather
     return store

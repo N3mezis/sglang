@@ -118,11 +118,14 @@ def _make_method_class():
             num_experts_E: int,
             num_resident_K: int,
             pin_host: bool = True,
+            use_ondevice: bool = False,
         ):
             self.base_method = base_method
             self.E = num_experts_E
             self.num_resident = num_resident_K
             self.pin_host = pin_host
+            # On-device decide + UVA gather (the capturable decode path). Requires a pinned store.
+            self.use_ondevice = use_ondevice and pin_host
             self._pager = None
             # Initial residents = experts 0..K-1 in slots 0..K-1; the pager re-seeds + pages the rest.
             self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
@@ -203,7 +206,12 @@ def make_for_layer(
         K = int(num_resident)
     if pin_host is None:
         pin_host = getattr(server_args, "paged_experts_store", "pinned") != "paged"
-    return _make_method_class()(base_method, E, K, pin_host=bool(pin_host))
+    # Use the on-device (capturable) decode path unless CUDA graphs are disabled. With graphs off it's the
+    # eager kernel-free path (host decide + transfer_kv); with graphs on the decode step is captured.
+    use_ondevice = not bool(getattr(server_args, "disable_cuda_graph", False))
+    return _make_method_class()(
+        base_method, E, K, pin_host=bool(pin_host), use_ondevice=use_ondevice
+    )
 
 
 def make_for_layer_from_env(layer, base_method):

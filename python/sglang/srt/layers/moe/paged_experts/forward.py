@@ -1,7 +1,7 @@
-"""Paged-experts forward (eager).
+"""Paged-experts forward.
 
-Per decode step, the active experts are paged into the K-slot pool and the real fused-MoE GEMM runs over
-it. Two regimes:
+Per step the active experts are paged into the K-slot pool and the real fused-MoE GEMM runs over it, in
+two regimes:
 
 * ``distinct active experts <= K``: keep-warm. Page only the misses (resident experts are reused across
   steps), remap, one GEMM.
@@ -10,8 +10,14 @@ it. Two regimes:
   wave, runs the GEMM, and the per-wave partials are **summed**. Each active expert is in exactly one wave
   and out-of-wave experts are masked to weight 0, so the sum equals the full MoE output (lossless).
 
-Routing stays E-wide; only the table is K. (The captured fast path will replace the host-side decision
-with static-wave masking; same GEMM.)
+Two implementations of the decision + page-in:
+
+* **On-device** (``pager.ondevice``): the decide kernel + UVA gather run on the GPU with no host sync, so
+  sglang's decode CUDA graph captures the step. The keep-warm/wave regime is chosen from shapes alone
+  (``num_tokens * top_k <= K``), which is static under capture. This is the default when graphs are on.
+* **Eager host** (graphs disabled): a host-side keep-warm/LRU decision + ``transfer_kv`` — kernel-free.
+
+Routing stays E-wide; only the table is K.
 """
 
 from __future__ import annotations
@@ -76,14 +82,50 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
     return out
 
 
+def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
+    """On-device static-wave path (distinct > K, e.g. prefill): ceil(E/K) waves, each planned+gathered
+    on-device, GEMM'd and summed. No host sync. Resyncs the keep-warm state to the last wave so a
+    following decode step is consistent. Lossless (each active expert is served in exactly one wave).
+    """
+    pager = method._pager
+    nwaves = (pager.E + pager.K - 1) // pager.K
+    out = None
+    for w in range(nwaves):
+        pager.decide_and_page_wave_ondevice(topk_ids, w)
+        remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
+        partial = _gemm_hidden(method, layer, dispatch_output, remap, clone_hidden=True)
+        out = partial if out is None else out + partial
+    pager.resync_residency_ondevice(nwaves - 1)
+    return out
+
+
 def paged_apply(method, layer, dispatch_output):
-    """Orchestrate the page-in + GEMM and wrap the result for the combiner."""
+    """Orchestrate the page-in + GEMM and wrap the result for the combiner.
+
+    On-device path (``pager.ondevice``, the captured-decode build): the residency decision and page-in run
+    on the GPU with no host sync, so sglang's decode CUDA graph captures the step. The keep-warm vs wave
+    regime is selected from shapes alone (``num_tokens * top_k <= K`` -> distinct can't exceed K), which is
+    static under capture. Eager path (graphs disabled): the kernel-free host decide + transfer_kv.
+    """
     from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
     pager = method._pager
     topk_ids = dispatch_output.topk_output.topk_ids
-    distinct = pager.distinct_active(topk_ids)
 
+    if pager.ondevice:
+        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] <= pager.K
+        if keep_warm:
+            pager.decide_and_page_ondevice(topk_ids)
+            remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
+            hidden = _gemm_hidden(
+                method, layer, dispatch_output, remap, clone_hidden=False
+            )
+        else:
+            hidden = _ondevice_wave_apply(method, layer, dispatch_output, topk_ids)
+        return StandardCombineInput(hidden_states=hidden)
+
+    # Eager (host) path — branch-1 behavior, requires --disable-cuda-graph.
+    distinct = pager.distinct_active(topk_ids)
     if len(distinct) <= pager.K:
         src, dst = pager.decide_keep_warm(topk_ids, distinct=distinct)
         pager.page_in(src, dst)
@@ -91,14 +133,4 @@ def paged_apply(method, layer, dispatch_output):
         hidden = _gemm_hidden(method, layer, dispatch_output, remap, clone_hidden=False)
     else:
         hidden = _wave_apply(method, layer, dispatch_output, topk_ids, distinct)
-
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "paged_apply L%s: topk=%s distinct=%d K=%d (%s)",
-            getattr(layer, "layer_id", "?"),
-            tuple(topk_ids.shape),
-            len(distinct),
-            pager.K,
-            "wave" if len(distinct) > pager.K else "keep-warm",
-        )
     return StandardCombineInput(hidden_states=hidden)
