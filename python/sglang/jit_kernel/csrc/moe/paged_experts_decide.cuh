@@ -12,6 +12,7 @@
 #include <sgl_kernel/utils.h>   // For RuntimeCheck
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 
+#include <cuda_runtime.h>  // For cudaHostGetDevicePointer (UVA device pointer of the pinned store)
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -143,6 +144,21 @@ __global__ void decide_wave_kernel(
   *n_out = n;
 }
 
+// Gather: copy n experts (src[i] -> dst[i]) from the pinned host store into the GPU slot pool, float4.
+// The page-in count *n is read ON-DEVICE, so under CUDA-graph capture each replay moves exactly the
+// experts the decide kernel chose this step (transfer_kv would move a fixed src_indices.numel() instead).
+// ``store`` is the pinned host buffer addressed through its UVA device pointer; ``e16`` = per-expert
+// bytes / 16. Copy-only — marlin int4 / bf16 rows travel packed; no dequant.
+__global__ void gather_kernel(
+    const float4* store, float4* slot, const int32_t* src, const int32_t* dst, const int32_t* n, long e16) {
+  const long M = static_cast<long>(*n) * e16;
+  const long stride = static_cast<long>(gridDim.x) * blockDim.x;
+  for (long j = blockIdx.x * static_cast<long>(blockDim.x) + threadIdx.x; j < M; j += stride) {
+    const long s = j / e16, off = j % e16;
+    slot[static_cast<long>(dst[s]) * e16 + off] = store[static_cast<long>(src[s]) * e16 + off];
+  }
+}
+
 // ---- launchers -------------------------------------------------------------------------------------
 
 void decide(
@@ -223,6 +239,45 @@ void decide_wave(
       static_cast<int32_t*>(dst.data_ptr()),
       static_cast<int32_t*>(n_out.data_ptr()),
       static_cast<int32_t*>(idx.data_ptr()));
+}
+
+// Resolve the UVA device pointer of a pinned host tensor, once at setup (NOT inside the captured
+// region). Returned as int64 and passed back to ``gather`` so no host CUDA call happens during replay.
+int64_t host_devptr(tvm::ffi::TensorView pinned) {
+  void* d = nullptr;
+  cudaError_t e = cudaHostGetDevicePointer(&d, pinned.data_ptr(), 0);
+  host::RuntimeCheck(e == cudaSuccess, "cudaHostGetDevicePointer failed: ", cudaGetErrorString(e));
+  return reinterpret_cast<int64_t>(d);
+}
+
+void gather(
+    int64_t store_devptr,
+    tvm::ffi::TensorView slot,
+    tvm::ffi::TensorView src,
+    tvm::ffi::TensorView dst,
+    tvm::ffi::TensorView n_out,
+    int64_t item_bytes) {
+  using namespace host;
+
+  SymbolicSize Nsrc = {"n_src"}, One = {"one"};
+  SymbolicDevice device_;
+  device_.set_options<kDLCUDA>();
+  TensorMatcher({Nsrc}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(src).verify(dst);
+  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(n_out);
+  const DLDevice device = device_.unwrap();
+  RuntimeCheck(
+      item_bytes % 16 == 0,
+      "paged_experts gather needs 16-byte-aligned per-expert blocks (float4); got ",
+      item_bytes);
+
+  LaunchKernel(2048, 256, device)(
+      gather_kernel,
+      reinterpret_cast<const float4*>(store_devptr),
+      reinterpret_cast<float4*>(slot.data_ptr()),
+      static_cast<const int32_t*>(src.data_ptr()),
+      static_cast<const int32_t*>(dst.data_ptr()),
+      static_cast<const int32_t*>(n_out.data_ptr()),
+      static_cast<long>(item_bytes / 16));
 }
 
 }  // namespace
