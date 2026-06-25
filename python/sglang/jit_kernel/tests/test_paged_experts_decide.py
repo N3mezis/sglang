@@ -15,6 +15,8 @@ import torch
 from sglang.jit_kernel.paged_experts_decide import (
     paged_experts_decide,
     paged_experts_decide_wave,
+    paged_experts_gather,
+    paged_experts_host_devptr,
 )
 
 
@@ -194,6 +196,82 @@ def test_decide_is_cuda_graph_capturable():
     assert (
         captured_idx == eager_idx
     )  # exact match: on-device counter makes replay == eager
+
+
+@requires_cuda
+def test_gather_dynamic_count():
+    """decide -> gather: the gather moves exactly the experts decide chose (count read on-device), placing
+    the right host rows in the right slots."""
+    E, K, W = 16, 6, 32  # 32 float32 = 128 B/expert (16-byte aligned)
+    store = torch.empty((E, W), dtype=torch.float32, device="cpu", pin_memory=True)
+    for e in range(E):
+        store[e].fill_(float(e + 1))  # expert e's data == e+1
+    devptr = paged_experts_host_devptr(store)
+    slot = torch.zeros((K, W), dtype=torch.float32, device="cuda")
+    for s in range(K):
+        slot[s].fill_(
+            float(s + 1)
+        )  # slots 0..K-1 start holding experts 0..K-1 (value s+1)
+
+    sc, se, es, lu, fq, src, dst, n_out, idx = _new_state(E, K)
+    # route to expert 1 (resident hit) + 9, 12 (misses) -> decide pages 2 experts
+    paged_experts_decide(
+        _i32([1, 9, 12]), sc, se, es, lu, fq, False, src, dst, n_out, idx
+    )
+    n = int(n_out.item())
+    assert n == 2, n
+    paged_experts_gather(devptr, slot, src, dst, n_out, W * 4)
+    torch.cuda.synchronize()
+    # the two paged experts now sit in their assigned slots, with the right host values
+    for i in range(n):
+        e, s = int(src[i].item()), int(dst[i].item())
+        assert (slot[s] == e + 1).all().item(), f"expert {e} -> slot {s}"
+    # untouched slots keep their original contents (gather moved exactly n, not K)
+    touched = set(int(dst[i].item()) for i in range(n))
+    for s in range(K):
+        if s not in touched:
+            assert (slot[s] == s + 1).all().item(), f"slot {s} should be untouched"
+
+
+@requires_cuda
+def test_decide_gather_capturable():
+    """The full per-step primitive (decide -> gather) captured once and replayed with topk mutated in
+    place: each replay pages exactly the misses for that step (dynamic count survives capture).
+    """
+    E, K, W = 16, 6, 32
+    store = torch.empty((E, W), dtype=torch.float32, device="cpu", pin_memory=True)
+    for e in range(E):
+        store[e].fill_(float(e + 1))
+    devptr = paged_experts_host_devptr(store)
+    slot = torch.zeros((K, W), dtype=torch.float32, device="cuda")
+    for s in range(K):
+        slot[s].fill_(float(s + 1))
+    sc, se, es, lu, fq, src, dst, n_out, idx = _new_state(E, K)
+    topk_buf = _i32([1, 9, 12])
+
+    def step():
+        paged_experts_decide(topk_buf, sc, se, es, lu, fq, False, src, dst, n_out, idx)
+        paged_experts_gather(devptr, slot, src, dst, n_out, W * 4)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        step()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        step()
+
+    # replay with a fresh routing step; the experts it pages must end up resident in their slots
+    topk_buf.copy_(_i32([2, 10, 13]))
+    g.replay()
+    torch.cuda.synchronize()
+    es_l = es.tolist()
+    for e in (2, 10, 13):
+        sidx = es_l[e]
+        assert (
+            sidx >= 0 and (slot[sidx] == e + 1).all().item()
+        ), f"expert {e} not gathered to its slot"
 
 
 if __name__ == "__main__":
