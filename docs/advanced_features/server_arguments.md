@@ -343,6 +343,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-paged-experts` | Enable Paged Experts: keep K of E MoE experts resident on the GPU and page the rest from host RAM on demand, to serve an MoE model larger than VRAM. Single GPU, eager (requires `--disable-cuda-graph`). See [Paged Experts](paged_experts.md). | `False` | bool flag (set to enable) |
 | `--paged-experts-num-resident` | Resident experts per layer (K) for `--enable-paged-experts`, or `auto` to size from free VRAM using SGLang's memory model. | `auto` | `auto` or Type: int |
 | `--paged-experts-store` | Host expert store kind for `--enable-paged-experts`. `pinned` page-locks the store and pages with the fast transfer kernel; `paged` uses a non-pinned store paged with a plain indexed copy — correct but slower — for when the pinned store would exceed the host's page-locked memory limit (e.g. an unquantized model on a small-RAM box). | `pinned` | `pinned`, `paged` |
+| `--paged-experts-kv-reserve-gb` | KV-cache headroom (GB) to reserve when auto-sizing K. Default `-1` reserves a single-stream context; the K-slot pool is fixed and SGLang sizes the real KV pool from the leftover, so K is **not** scaled down by `--max-running-requests`. Raise it to guarantee a larger KV pool at the cost of fewer resident experts. | `-1` | Type: float |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |

@@ -46,6 +46,13 @@ host to GPU each step — which shapes its performance profile (see [Performance
   on a small-RAM box, or under WSL where the page-locked pool is capped at roughly half of system RAM).
   The `paged` store pages via a plain indexed copy, which is correct but noticeably slower than `pinned`.
 
+- **`--paged-experts-kv-reserve-gb`**: KV-cache headroom (GB) to reserve when auto-sizing K
+  (`--paged-experts-num-resident auto`). Default `-1` reserves a single-stream context. The K-slot pool
+  is fixed (it does not grow with concurrency) and SGLang sizes the real KV pool from the post-weights
+  leftover, so K is deliberately **not** scaled down by `--max-running-requests`. Raise this to guarantee
+  a larger KV pool (e.g. for high concurrency or long context) at the cost of fewer resident experts —
+  i.e. more paging.
+
 The following standard arguments interact with Paged Experts and are worth setting deliberately:
 
 - **`--disable-cuda-graph`**: Currently required (the per-step paging decision is not CUDA-graph
