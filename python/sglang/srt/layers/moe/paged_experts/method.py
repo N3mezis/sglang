@@ -61,13 +61,21 @@ def resolve_num_resident_experts(
         bits = qc.get("bits") or qc.get("weights", {}).get("num_bits") or 16
     per_el = 3 * htc.moe_intermediate_size * htc.hidden_size * (bits / 8.0) * 1.03
 
-    # Per-token KV cell: MLA (DeepSeek V2/V3) vs MHA/GQA, mirroring sglang's DefaultPoolConfigurator.
+    # KV headroom to reserve when sizing K. The K-slot pool is FIXED (it does not grow with concurrency);
+    # sglang sizes the real KV pool from the post-weights leftover and derives max_running_requests from
+    # THAT. So reserving the worst case (max_running_requests x full context) here double-counts and
+    # starves K — a footgun on the constrained cards Paged Experts targets (a high --max-running-requests
+    # silently floored K to top_k). Reserve a SINGLE-STREAM context by default; sglang's actual KV pool
+    # (the leftover) then supports real concurrency. --paged-experts-kv-reserve-gb overrides to reserve a
+    # larger guaranteed KV pool (smaller K). sizing.compute_num_resident_experts clamps it to physical.
     kv_elt = 1 if "fp8" in (sa.kv_cache_dtype or "").lower() else 2
-    concurrency = sa.max_running_requests or 1
     ctx = sa.context_length or getattr(mc, "context_len", None) or 2048
-    if getattr(mc, "kv_lora_rank", None):  # MLA
+    kv_gb = getattr(sa, "paged_experts_kv_reserve_gb", -1.0)
+    if kv_gb is not None and kv_gb >= 0:
+        kv_reserve = kv_gb * 1e9
+    elif getattr(mc, "kv_lora_rank", None):  # MLA
         cell = (mc.kv_lora_rank + mc.qk_rope_head_dim) * layers * kv_elt
-        kv_reserve = concurrency * ctx * cell
+        kv_reserve = ctx * cell  # single-stream
     else:  # MHA / GQA — reuse the pure helper (get_num_kv_heads handles GQA + TP)
         tp = getattr(sa, "tp_size", 1) or 1
         kv_reserve = kv_reserve_bytes_mha(
@@ -75,7 +83,7 @@ def resolve_num_resident_experts(
             num_kv_heads=mc.get_num_kv_heads(tp),
             head_dim=(mc.head_dim + mc.v_head_dim) // 2,  # combined K+V per-head width
             kv_dtype_bytes=kv_elt,
-            max_running_requests=concurrency,
+            max_running_requests=1,  # single-stream headroom, NOT worst-case concurrency
             context_length=ctx,
         )
 

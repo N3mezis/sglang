@@ -1801,6 +1801,13 @@ class ServerArgs:
             choices=["pinned", "paged"],
         ),
     ] = "pinned"
+    paged_experts_kv_reserve_gb: A[
+        float,
+        "KV-cache headroom (GB) to reserve when auto-sizing K (--paged-experts-num-resident auto). "
+        "Default -1 reserves a single-stream context; the K-slot pool is fixed and sglang sizes the real "
+        "KV pool from the leftover, so K is NOT scaled down by --max-running-requests. Raise this to "
+        "guarantee a larger KV pool at the cost of fewer resident experts (more paging).",
+    ] = -1.0
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn

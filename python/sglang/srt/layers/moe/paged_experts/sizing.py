@@ -32,9 +32,21 @@ def compute_num_resident_experts(
     ``free_vram_bytes`` is the PRE-load free memory: sglang reserves ``free*(1-mem_fraction)`` for
     activations + cuda graphs and gives the rest to weights + KV, and the K-slot pool is "weights", so
     ``K_pool <= free*mem_fraction - nonexpert - kv_reserve``.
+
+    The K-slot pool and the KV cache compete for the SAME budget, so ``kv_reserve_bytes`` is clamped to
+    what's physically left after a minimum (``top_k``) pool. Without that clamp an over-estimated reserve
+    (e.g. a high ``--max-running-requests`` x full context) drives the budget negative and floors K to
+    ``top_k`` — starving K for a KV pool that can never be allocated (sglang sizes the real KV pool from
+    the leftover afterwards, clamped to physical VRAM).
     """
-    budget = free_vram_bytes * mem_fraction - nonexpert_bytes - kv_reserve_bytes
-    k = int(budget / (moe_layers * per_expert_layer_bytes))
+    per_expert_pool = (
+        moe_layers * per_expert_layer_bytes
+    )  # VRAM for one resident expert (all layers)
+    budget = (
+        free_vram_bytes * mem_fraction - nonexpert_bytes
+    )  # shared by the K-slot pool AND the KV pool
+    kv_reserve_bytes = max(0.0, min(kv_reserve_bytes, budget - top_k * per_expert_pool))
+    k = int((budget - kv_reserve_bytes) / per_expert_pool)
     return max(top_k, min(num_experts, k))
 
 
