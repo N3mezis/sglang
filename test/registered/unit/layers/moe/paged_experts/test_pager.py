@@ -9,6 +9,11 @@ import unittest
 import torch
 
 from sglang.srt.layers.moe.paged_experts.pager import PagedExpertStore
+from sglang.srt.layers.moe.paged_experts.store import (
+    ExpertStore,
+    PageableExpertStore,
+    PinnedExpertStore,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -123,6 +128,29 @@ class TestPagedExpertStore(CustomTestCase):
         self.assertEqual(
             int(store.logical_to_gpu_index[2]), 1
         )  # resident hit kept its slot
+
+
+    def test_store_seam(self):
+        # The pager delegates host backing + page-in to an ExpertStore (store.py); --paged-experts-store
+        # selects the transport (pinned transfer_kv vs pageable copy). The decision/residency stays on the
+        # pager. This locks the seam: the right store subclass is composed, and the pager re-exposes it.
+        E, K, dev = 8, 4, "cuda"
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.nn.Parameter(
+            torch.zeros(K, 2, 4, device=dev), requires_grad=False
+        )
+
+        pinned = PagedExpertStore(layer, E, K, dev)  # pin_host=True default
+        self.assertIsInstance(pinned.store, PinnedExpertStore)
+        self.assertTrue(pinned.pin_host and pinned.store.pinned)
+
+        pageable = PagedExpertStore(layer, E, K, dev, pin_host=False)
+        self.assertIsInstance(pageable.store, PageableExpertStore)
+        self.assertFalse(pageable.pin_host or pageable.store.pinned)
+
+        # ExpertStore is abstract — page_in is the contract subclasses must implement.
+        with self.assertRaises(TypeError):
+            ExpertStore(layer, E, K, dev)
 
 
 if __name__ == "__main__":
