@@ -53,6 +53,12 @@ host to GPU each step — which shapes its performance profile (see [Performance
   a larger KV pool (e.g. for high concurrency or long context) at the cost of fewer resident experts —
   i.e. more paging.
 
+- **`--paged-experts-eviction {lru,lfu}`**: The residency (eviction) policy — which non-needed resident
+  expert to evict when a step needs an absent one. `lru` (default) evicts the least-recently-used; `lfu`
+  evicts the least-frequently-used (use count, LRU tiebreak), which keeps hot experts resident across
+  brief gaps and tends to win when expert routing is skewed. The choice trades nothing but hit rate, so
+  it is workload-dependent; `lru` is a safe default.
+
 The following standard arguments interact with Paged Experts and are worth setting deliberately:
 
 - **`--disable-cuda-graph`**: Currently required (the per-step paging decision is not CUDA-graph

@@ -126,11 +126,13 @@ def _make_method_class():
             num_experts_E: int,
             num_resident_K: int,
             pin_host: bool = True,
+            eviction: str = "lru",
         ):
             self.base_method = base_method
             self.E = num_experts_E
             self.num_resident = num_resident_K
             self.pin_host = pin_host
+            self.eviction = eviction
             self._pager = None
             # Initial residents = experts 0..K-1 in slots 0..K-1; the pager re-seeds + pages the rest.
             self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
@@ -201,7 +203,7 @@ def make_for_layer(
     """Factory invoked from the FusedMoE init hook when paged experts is enabled: enforce the
     compatibility guard, resolve K, and wrap ``base_method``. ``num_resident`` is ``"auto"`` or an int.
     ``pin_host`` defaults from ``--paged-experts-store`` (pinned -> True, paged -> False); the env entry
-    overrides it.
+    overrides it. The eviction policy comes from ``--paged-experts-eviction`` (lru | lfu).
     """
     check_paged_experts_compat(server_args)
     E = int(getattr(layer, "num_local_experts", None) or layer.num_experts)
@@ -211,7 +213,10 @@ def make_for_layer(
         K = int(num_resident)
     if pin_host is None:
         pin_host = getattr(server_args, "paged_experts_store", "pinned") != "paged"
-    return _make_method_class()(base_method, E, K, pin_host=bool(pin_host))
+    eviction = getattr(server_args, "paged_experts_eviction", "lru")
+    return _make_method_class()(
+        base_method, E, K, pin_host=bool(pin_host), eviction=eviction
+    )
 
 
 def make_for_layer_from_env(layer, base_method):

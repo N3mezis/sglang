@@ -1808,6 +1808,15 @@ class ServerArgs:
         "KV pool from the leftover, so K is NOT scaled down by --max-running-requests. Raise this to "
         "guarantee a larger KV pool at the cost of fewer resident experts (more paging).",
     ] = -1.0
+    paged_experts_eviction: A[
+        str,
+        Arg(
+            help="Residency (eviction) policy for --enable-paged-experts. 'lru' (default) evicts the "
+            "least-recently-used non-needed expert. 'lfu' evicts the least-frequently-used (use count, "
+            "LRU tiebreak) — better for skewed expert routing, where a few experts are hot.",
+            choices=["lru", "lfu"],
+        ),
+    ] = "lru"
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn

@@ -9,6 +9,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.moe.paged_experts.pager import PagedExpertStore
+from sglang.srt.layers.moe.paged_experts.policy import LFUPolicy, LRUPolicy
 from sglang.srt.layers.moe.paged_experts.store import (
     ExpertStore,
     PageableExpertStore,
@@ -151,6 +152,18 @@ class TestPagedExpertStore(CustomTestCase):
         # ExpertStore is abstract — page_in is the contract subclasses must implement.
         with self.assertRaises(TypeError):
             ExpertStore(layer, E, K, dev)
+
+    def test_eviction_policy_seam(self):
+        # --paged-experts-eviction selects the residency policy the pager composes (default lru).
+        E, K, dev = 8, 4, "cuda"
+        layer = torch.nn.Module()
+        layer.w13_weight = torch.nn.Parameter(
+            torch.zeros(K, 2, 4, device=dev), requires_grad=False
+        )
+        self.assertIsInstance(PagedExpertStore(layer, E, K, dev).policy, LRUPolicy)
+        self.assertIsInstance(
+            PagedExpertStore(layer, E, K, dev, eviction="lfu").policy, LFUPolicy
+        )
 
 
 if __name__ == "__main__":

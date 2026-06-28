@@ -18,16 +18,22 @@ from typing import Dict, Optional
 
 import torch
 
+from sglang.srt.layers.moe.paged_experts.policy import (
+    ResidencyPolicy,
+    make_residency_policy,
+)
 from sglang.srt.layers.moe.paged_experts.store import ExpertStore, make_expert_store
 
 logger = logging.getLogger(__name__)
 
 
 class PagedExpertStore:
-    """Per-step residency decision over the K-slot pool; delegates backing + page-in to an ``ExpertStore``.
+    """Per-step residency decision over the K-slot pool; delegates backing + page-in to an ``ExpertStore``
+    and the eviction choice to a ``ResidencyPolicy``.
 
     Name + positional constructor kept for back-compat: ``(layer, E, K, device, pin_host=...)`` builds the
     matching store, or pass a prebuilt ``store=`` to compose one directly (what ``setup_pager`` does).
+    ``eviction`` selects the residency policy (``lru`` default | ``lfu``).
     """
 
     def __init__(
@@ -39,6 +45,7 @@ class PagedExpertStore:
         pin_host: bool = True,
         *,
         store: Optional[ExpertStore] = None,
+        eviction: str = "lru",
     ):
         self.store = store or make_expert_store(
             layer, num_experts_E, num_resident_K, device, pin_host=pin_host
@@ -49,13 +56,13 @@ class PagedExpertStore:
 
         # Residency state (host-side decide; the store does the device transfer). Slots 0..K-1 start
         # holding experts 0..K-1 (what the native loader put there). logical_to_gpu_index[e] is the slot
-        # of expert e (-1 if not resident); its device mirror drives the remap each step.
+        # of expert e (-1 if not resident); its device mirror drives the remap each step. The policy owns
+        # the eviction choice + its recency/frequency bookkeeping (see policy.py).
+        self.policy: ResidencyPolicy = make_residency_policy(eviction, self.K, self.E)
         self.slot_expert = list(range(self.K))  # slot -> expert id (-1 == empty)
-        self.slot_lastuse = [0] * self.K
         self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
         self.logical_to_gpu_index[: self.K] = torch.arange(self.K, dtype=torch.int32)
         self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(self.device)
-        self._step = 0
 
     # --- backing delegated to the store (exposed on the pager for the fill code + back-compat) ---
     @property
@@ -83,32 +90,26 @@ class PagedExpertStore:
         return [int(e) for e in torch.unique(topk_ids).tolist() if e >= 0]
 
     def decide_keep_warm(self, topk_ids: torch.Tensor, distinct=None):
-        """Host-side residency decision (eager keep-warm + LRU): for each distinct active expert not
-        resident, evict the LRU non-needed slot and assign it. Updates the maps in place and returns
-        ``(src_experts, dst_slots)`` (device int64) for ``page_in``. **Requires ``len(distinct) <= K``**
-        — the caller routes steps with more distinct experts to the wave path (see forward.py). Data-
-        dependent -> not capturable (the eager path).
+        """Host-side residency decision (eager keep-warm): for each distinct active expert not resident,
+        evict a non-needed slot (chosen by ``self.policy`` — LRU/LFU) and assign it. Updates the maps in
+        place and returns ``(src_experts, dst_slots)`` (device int64) for ``page_in``. **Requires
+        ``len(distinct) <= K``** — the caller routes steps with more distinct experts to the wave path
+        (see forward.py). Data-dependent -> not capturable (the eager path).
         """
-        self._step += 1
-        step = self._step
+        self.policy.begin_step()
         if distinct is None:
             distinct = self.distinct_active(topk_ids)
         l2g = self.logical_to_gpu_index
         needed = set(distinct)
-        for e in distinct:  # touch recency of resident hits
+        for e in distinct:  # touch recency/frequency of resident hits
             s = int(l2g[e])
             if s >= 0:
-                self.slot_lastuse[s] = step
+                self.policy.record_use(e, s)
         src, dst = [], []
         for e in distinct:
             if int(l2g[e]) >= 0:
                 continue  # already resident (or just assigned)
-            victim, best_lu = -1, None  # LRU non-needed slot
-            for s in range(self.K):
-                if self.slot_expert[s] in needed:
-                    continue
-                if best_lu is None or self.slot_lastuse[s] < best_lu:
-                    best_lu, victim = self.slot_lastuse[s], s
+            victim = self.policy.pick_victim(self.slot_expert, needed)
             if victim < 0:
                 continue  # pool too small (shouldn't happen: distinct <= K)
             old = self.slot_expert[victim]
@@ -116,7 +117,7 @@ class PagedExpertStore:
                 l2g[old] = -1
             self.slot_expert[victim] = e
             l2g[e] = victim
-            self.slot_lastuse[victim] = step
+            self.policy.record_use(e, victim)  # the fresh assignment counts as a use
             src.append(e)
             dst.append(victim)
         self.logical_to_gpu_index_cuda.copy_(l2g)
@@ -310,4 +311,6 @@ def setup_pager(method, layer) -> PagedExpertStore:
         len(store.gpu),
         list(store.gpu),
     )
-    return PagedExpertStore(store=store)
+    return PagedExpertStore(
+        store=store, eviction=getattr(method, "eviction", "lru")
+    )
