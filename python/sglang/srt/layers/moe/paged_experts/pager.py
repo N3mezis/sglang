@@ -1,11 +1,12 @@
-"""Paged expert store + page-in, built on sglang's existing host<->device transfer kernel.
+"""Paged expert pager: the per-step residency decision over the K-slot GPU pool.
 
-The K-slot GPU pool *is* the layer's expert params (the native loader filled slots 0..K-1). We allocate a
-pinned host store holding ALL E experts per paged tensor and fill it from the checkpoint (repacked to the
-marlin layout for gptq-int4, copied directly for bf16) — no offline artifact. On a miss, ``page_in`` copies
-expert rows into their slots with
-``transfer_kv_per_layer_mla`` (device-indexed, dynamic count, capture-safe) — no custom CUDA. ``item_size``
-is the per-expert row in bytes, so one call per tensor moves the chosen experts.
+The pager owns *which* expert lives in *which* slot and when — a host-side keep-warm + LRU decision each
+decode step — and hands the resulting ``(src_experts, dst_slots)`` plan to its ``ExpertStore``
+(``store.py``), which owns the host backing and the actual byte movement (pinned ``transfer_kv`` or a
+pageable copy). Slots 0..K-1 start holding experts 0..K-1 (what sglang's native loader put there);
+``logical_to_gpu_index[e]`` is the slot of expert e (-1 if not resident) and its device mirror drives the
+forward remap. Store fill from the checkpoint (marlin repack for gptq-int4, direct copy for bf16 — no
+offline artifact) lives in ``setup_pager`` below.
 """
 
 from __future__ import annotations
@@ -13,74 +14,55 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
+from sglang.srt.layers.moe.paged_experts.policy import (
+    ResidencyPolicy,
+    make_residency_policy,
+)
+from sglang.srt.layers.moe.paged_experts.store import ExpertStore, make_expert_store
+
 logger = logging.getLogger(__name__)
-
-# packed-quant scaffolding the fused-MoE kernel never reads on the paged path
-_NONPAGED_SUFFIXES = ("_g_idx", "_g_idx_sort_indices", "_weight_shape")
-
-
-def discover_paged_params(layer, num_slots: int) -> Dict[str, torch.Tensor]:
-    """Per-expert params on ``layer``: leading dim == num_slots (the K-slot pool) and non-empty per-slot."""
-    out = {}
-    for name, p in list(layer.named_parameters(recurse=False)) + list(
-        layer.named_buffers(recurse=False)
-    ):
-        if any(name.endswith(s) for s in _NONPAGED_SUFFIXES):
-            continue
-        if p.dim() >= 1 and p.shape[0] == num_slots and p[0].numel() > 0:
-            out[name] = p
-    return out
 
 
 class PagedExpertStore:
+    """Per-step residency decision over the K-slot pool; delegates backing + page-in to an ``ExpertStore``
+    and the eviction choice to a ``ResidencyPolicy``.
+
+    Name + positional constructor kept for back-compat: ``(layer, E, K, device, pin_host=...)`` builds the
+    matching store, or pass a prebuilt ``store=`` to compose one directly (what ``setup_pager`` does).
+    ``eviction`` selects the residency policy (``lru`` default | ``lfu``).
+    """
+
     def __init__(
         self,
-        layer,
-        num_experts_E: int,
-        num_resident_K: int,
-        device,
+        layer=None,
+        num_experts_E: int = 0,
+        num_resident_K: int = 0,
+        device=None,
         pin_host: bool = True,
+        *,
+        store: Optional[ExpertStore] = None,
+        eviction: str = "lru",
     ):
-        self.E = num_experts_E
-        self.K = num_resident_K
-        self.device = device
-        # Pinned store -> fast transfer_kv page-in. Pageable store -> a plain indexed copy (see page_in):
-        # correct but slower, for when the pinned store would exceed the host page-locked limit.
-        self.pin_host = pin_host
-        self.gpu = discover_paged_params(
-            layer, num_resident_K
-        )  # the K-slot GPU pool (layer params)
-        assert self.gpu, "no per-expert params found on layer"
-        self.host: Dict[str, torch.Tensor] = {}
-        self.item_bytes: Dict[str, int] = {}
-        for name, p in self.gpu.items():
-            self.host[name] = torch.empty(
-                (self.E, *p.shape[1:]), dtype=p.dtype, device="cpu", pin_memory=pin_host
-            )
-            self.item_bytes[name] = p[0].numel() * p.element_size()
-            # transfer_kv_per_layer_mla requires the per-expert block to be 8-byte aligned. Real
-            # weight rows (bf16 / marlin qweight+scales+qzeros) satisfy this; a 1-D per-expert scalar
-            # scale (e.g. fp8, 4 B) does not -> that needs the deferred scalar-gather path. The pageable
-            # copy path has no such requirement.
-            if pin_host and self.item_bytes[name] % 8 != 0:
-                raise RuntimeError(
-                    f"[paged-experts] paged tensor {name!r} per-expert size {self.item_bytes[name]} B is "
-                    "not 8-byte aligned (transfer_kv requirement); unsupported on the reuse gather path."
-                )
+        self.store = store or make_expert_store(
+            layer, num_experts_E, num_resident_K, device, pin_host=pin_host
+        )
+        self.E = self.store.E
+        self.K = self.store.K
+        self.device = self.store.device
 
-        # Eager residency state (host-side decide; page_in does the device transfer). Slots 0..K-1
-        # start holding experts 0..K-1 (what the native loader put there). logical_to_gpu_index[e] is
-        # the slot of expert e (-1 if not resident); its device mirror drives the remap each step.
+        # Residency state (host-side decide; the store does the device transfer). Slots 0..K-1 start
+        # holding experts 0..K-1 (what the native loader put there). logical_to_gpu_index[e] is the slot
+        # of expert e (-1 if not resident); its device mirror drives the remap each step. The policy owns
+        # the eviction choice + its recency/frequency bookkeeping (see policy.py).
+        self.policy: ResidencyPolicy = make_residency_policy(eviction, self.K, self.E)
         self.slot_expert = list(range(self.K))  # slot -> expert id (-1 == empty)
-        self.slot_lastuse = [0] * self.K
         self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
         self.logical_to_gpu_index[: self.K] = torch.arange(self.K, dtype=torch.int32)
-        self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(device)
-        self._step = 0
+        self.logical_to_gpu_index_cuda = self.logical_to_gpu_index.to(self.device)
 
         # On-device residency state (the captured path; allocated lazily by setup_ondevice). The decision
         # then runs in the decide kernel with NO host sync, so sglang's decode CUDA graph can capture it.
@@ -90,37 +72,52 @@ class PagedExpertStore:
         self._step_ctr_d = self._src_d = self._dst_d = self._n_out_d = None
         self._topk_i32 = None
 
+    # --- backing delegated to the store (exposed on the pager for the fill code + back-compat) ---
+    @property
+    def gpu(self) -> Dict[str, torch.Tensor]:
+        return self.store.gpu
+
+    @property
+    def host(self) -> Dict[str, torch.Tensor]:
+        return self.store.host
+
+    @property
+    def item_bytes(self) -> Dict[str, int]:
+        return self.store.item_bytes
+
+    @property
+    def pin_host(self) -> bool:
+        return self.store.pinned
+
+    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+        """Page the chosen experts into their slots via the store (transport-specific; a no-op if empty)."""
+        self.store.page_in(src_experts, dst_slots)
+
     def distinct_active(self, topk_ids: torch.Tensor):
         """Sorted distinct active (>=0) expert ids this step, as a host list (one host sync)."""
         return [int(e) for e in torch.unique(topk_ids).tolist() if e >= 0]
 
     def decide_keep_warm(self, topk_ids: torch.Tensor, distinct=None):
-        """Host-side residency decision (eager keep-warm + LRU): for each distinct active expert not
-        resident, evict the LRU non-needed slot and assign it. Updates the maps in place and returns
-        ``(src_experts, dst_slots)`` (device int64) for ``page_in``. **Requires ``len(distinct) <= K``**
-        — the caller routes steps with more distinct experts to the wave path (see forward.py). Data-
-        dependent -> not capturable (the eager path).
+        """Host-side residency decision (eager keep-warm): for each distinct active expert not resident,
+        evict a non-needed slot (chosen by ``self.policy`` — LRU/LFU) and assign it. Updates the maps in
+        place and returns ``(src_experts, dst_slots)`` (device int64) for ``page_in``. **Requires
+        ``len(distinct) <= K``** — the caller routes steps with more distinct experts to the wave path
+        (see forward.py). Data-dependent -> not capturable (the eager path).
         """
-        self._step += 1
-        step = self._step
+        self.policy.begin_step()
         if distinct is None:
             distinct = self.distinct_active(topk_ids)
         l2g = self.logical_to_gpu_index
         needed = set(distinct)
-        for e in distinct:  # touch recency of resident hits
+        for e in distinct:  # touch recency/frequency of resident hits
             s = int(l2g[e])
             if s >= 0:
-                self.slot_lastuse[s] = step
+                self.policy.record_use(e, s)
         src, dst = [], []
         for e in distinct:
             if int(l2g[e]) >= 0:
                 continue  # already resident (or just assigned)
-            victim, best_lu = -1, None  # LRU non-needed slot
-            for s in range(self.K):
-                if self.slot_expert[s] in needed:
-                    continue
-                if best_lu is None or self.slot_lastuse[s] < best_lu:
-                    best_lu, victim = self.slot_lastuse[s], s
+            victim = self.policy.pick_victim(self.slot_expert, needed)
             if victim < 0:
                 continue  # pool too small (shouldn't happen: distinct <= K)
             old = self.slot_expert[victim]
@@ -128,7 +125,7 @@ class PagedExpertStore:
                 l2g[old] = -1
             self.slot_expert[victim] = e
             l2g[e] = victim
-            self.slot_lastuse[victim] = step
+            self.policy.record_use(e, victim)  # the fresh assignment counts as a use
             src.append(e)
             dst.append(victim)
         self.logical_to_gpu_index_cuda.copy_(l2g)
@@ -136,32 +133,6 @@ class PagedExpertStore:
             torch.tensor(src, dtype=torch.int64, device=self.device),
             torch.tensor(dst, dtype=torch.int64, device=self.device),
         )
-
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
-        """Copy ``host[src_experts[i]] -> gpu[dst_slots[i]]`` for every paged tensor.
-
-        Pinned store: reuse sglang's ``transfer_kv_per_layer_mla`` (pinned-host -> device, indices read
-        on-device, dynamic count). Pageable store: a plain indexed copy (gather rows on the host, one H2D,
-        scatter into the slots) — ``transfer_kv`` would read stale data from non-page-locked memory.
-        """
-        if src_experts.numel() == 0:
-            return
-        if self.pin_host:
-            from sgl_kernel import transfer_kv_per_layer_mla
-
-            for name, gpu_param in self.gpu.items():
-                transfer_kv_per_layer_mla(
-                    src=self.host[name],
-                    dst=gpu_param.data,
-                    src_indices=src_experts,
-                    dst_indices=dst_slots,
-                    item_size=self.item_bytes[name],
-                )
-        else:
-            src_cpu = src_experts.to("cpu")
-            for name, gpu_param in self.gpu.items():
-                rows = self.host[name].index_select(0, src_cpu).to(gpu_param.device)
-                gpu_param.data.index_copy_(0, dst_slots, rows)
 
     def setup_ondevice(self) -> None:
         """Allocate the device-resident residency state for the captured path and resolve the pinned
@@ -311,7 +282,7 @@ def _weight_map(snap: str) -> Dict[str, str]:
 
 
 def _fill_gptq_marlin_from_checkpoint(
-    store: PagedExpertStore, model_path: str, layer_idx: int
+    store: ExpertStore, model_path: str, layer_idx: int
 ) -> None:
     """gptq-int4: repack the GPTQ checkpoint into the on-GPU marlin layout for ALL E experts, using
     sglang's own ops, straight into the host store. sglang's loader repacks only the K resident slots
@@ -397,7 +368,7 @@ def _fill_gptq_marlin_from_checkpoint(
 
 
 def _fill_bf16_from_checkpoint(
-    store: PagedExpertStore, model_path: str, layer_idx: int
+    store: ExpertStore, model_path: str, layer_idx: int
 ) -> None:
     """bf16: host w13_weight=[E,2*inter,hidden]=concat(gate,up), w2_weight=[E,hidden,inter]."""
     from safetensors import safe_open
@@ -427,13 +398,13 @@ def _fill_bf16_from_checkpoint(
 
 
 def setup_pager(method, layer) -> PagedExpertStore:
-    """Build the host store and fill it from the checkpoint (all E experts), then return the pager.
-    ``method`` carries E, K, and the resident map. gptq-int4 is repacked to marlin at load time; bf16 is
+    """Build the host store and fill it from the checkpoint (all E experts), then return the pager wrapping
+    it. ``method`` carries E, K, and the resident map. gptq-int4 is repacked to marlin at load time; bf16 is
     copied directly. No offline artifact."""
     from sglang.srt.server_args import get_global_server_args
 
     dev = next(layer.parameters()).device
-    store = PagedExpertStore(
+    store = make_expert_store(
         layer,
         method.E,
         method.num_resident,
@@ -459,6 +430,7 @@ def setup_pager(method, layer) -> PagedExpertStore:
         len(store.gpu),
         list(store.gpu),
     )
+    pager = PagedExpertStore(store=store, eviction=getattr(method, "eviction", "lru"))
     if getattr(method, "use_ondevice", False):
-        store.setup_ondevice()  # captured path: device-resident decide + UVA gather
-    return store
+        pager.setup_ondevice()  # captured path: device-resident decide + UVA gather
+    return pager

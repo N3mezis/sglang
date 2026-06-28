@@ -127,6 +127,7 @@ def _make_method_class():
             num_resident_K: int,
             pin_host: bool = True,
             use_ondevice: bool = False,
+            eviction: str = "lru",
         ):
             self.base_method = base_method
             self.E = num_experts_E
@@ -134,6 +135,7 @@ def _make_method_class():
             self.pin_host = pin_host
             # On-device decide + UVA gather (the capturable decode path). Requires a pinned store.
             self.use_ondevice = use_ondevice and pin_host
+            self.eviction = eviction
             self._pager = None
             # Initial residents = experts 0..K-1 in slots 0..K-1; the pager re-seeds + pages the rest.
             self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
@@ -204,7 +206,7 @@ def make_for_layer(
     """Factory invoked from the FusedMoE init hook when paged experts is enabled: enforce the
     compatibility guard, resolve K, and wrap ``base_method``. ``num_resident`` is ``"auto"`` or an int.
     ``pin_host`` defaults from ``--paged-experts-store`` (pinned -> True, paged -> False); the env entry
-    overrides it.
+    overrides it. The eviction policy comes from ``--paged-experts-eviction`` (lru | lfu).
     """
     check_paged_experts_compat(server_args)
     E = int(getattr(layer, "num_local_experts", None) or layer.num_experts)
@@ -217,8 +219,14 @@ def make_for_layer(
     # Use the on-device (capturable) decode path unless CUDA graphs are disabled. With graphs off it's the
     # eager kernel-free path (host decide + transfer_kv); with graphs on the decode step is captured.
     use_ondevice = not bool(getattr(server_args, "disable_cuda_graph", False))
+    eviction = getattr(server_args, "paged_experts_eviction", "lru")
     return _make_method_class()(
-        base_method, E, K, pin_host=bool(pin_host), use_ondevice=use_ondevice
+        base_method,
+        E,
+        K,
+        pin_host=bool(pin_host),
+        use_ondevice=use_ondevice,
+        eviction=eviction,
     )
 
 

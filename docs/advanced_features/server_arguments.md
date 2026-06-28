@@ -344,6 +344,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--paged-experts-num-resident` | Resident experts per layer (K) for `--enable-paged-experts`, or `auto` to size from free VRAM using SGLang's memory model. | `auto` | `auto` or Type: int |
 | `--paged-experts-store` | Host expert store kind for `--enable-paged-experts`. `pinned` page-locks the store and pages with the fast transfer kernel; `paged` uses a non-pinned store paged with a plain indexed copy — correct but slower — for when the pinned store would exceed the host's page-locked memory limit (e.g. an unquantized model on a small-RAM box). | `pinned` | `pinned`, `paged` |
 | `--paged-experts-kv-reserve-gb` | KV-cache headroom (GB) to reserve when auto-sizing K. Default `-1` reserves a single-stream context; the K-slot pool is fixed and SGLang sizes the real KV pool from the leftover, so K is **not** scaled down by `--max-running-requests`. Raise it to guarantee a larger KV pool at the cost of fewer resident experts. | `-1` | Type: float |
+| `--paged-experts-eviction` | Residency (eviction) policy for `--enable-paged-experts`. `lru` evicts the least-recently-used non-needed expert; `lfu` evicts the least-frequently-used (use count, LRU tiebreak) — better for skewed expert routing. Trades only hit rate. | `lru` | `lru`, `lfu` |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |
