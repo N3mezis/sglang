@@ -10,12 +10,9 @@ two regimes:
   wave, runs the GEMM, and the per-wave partials are **summed**. Each active expert is in exactly one wave
   and out-of-wave experts are masked to weight 0, so the sum equals the full MoE output (lossless).
 
-Two implementations of the decision + page-in:
-
-* **On-device** (``pager.ondevice``): the decide kernel + UVA gather run on the GPU with no host sync, so
-  sglang's decode CUDA graph captures the step. The keep-warm/wave regime is chosen from shapes alone
-  (``num_tokens * top_k <= K``), which is static under capture. This is the default when graphs are on.
-* **Eager host** (graphs disabled): a host-side keep-warm/LRU decision + ``transfer_kv`` — kernel-free.
+*Where* the decision + page-in run — host (eager) or on the GPU inside the captured decode graph — is a
+``Placement`` strategy (``placement.py``); ``paged_apply`` just dispatches to it. The shared building
+blocks (``mask_and_remap_expert_ids``, ``_gemm_hidden``, and the two wave helpers) live here.
 
 Routing stays E-wide; only the table is K.
 """
@@ -100,37 +97,9 @@ def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
 
 
 def paged_apply(method, layer, dispatch_output):
-    """Orchestrate the page-in + GEMM and wrap the result for the combiner.
+    """Dispatch the step to the method's decode placement (eager host vs captured on-device).
 
-    On-device path (``pager.ondevice``, the captured-decode build): the residency decision and page-in run
-    on the GPU with no host sync, so sglang's decode CUDA graph captures the step. The keep-warm vs wave
-    regime is selected from shapes alone (``num_tokens * top_k <= K`` -> distinct can't exceed K), which is
-    static under capture. Eager path (graphs disabled): the kernel-free host decide + transfer_kv.
+    The placement (``method._placement``) owns the decide + page-in flow; both end in ``_gemm_hidden``
+    over the K-slot pool. See ``placement.py``.
     """
-    from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-    pager = method._pager
-    topk_ids = dispatch_output.topk_output.topk_ids
-
-    if pager.ondevice:
-        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] <= pager.K
-        if keep_warm:
-            pager.decide_and_page_ondevice(topk_ids)
-            remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
-            hidden = _gemm_hidden(
-                method, layer, dispatch_output, remap, clone_hidden=False
-            )
-        else:
-            hidden = _ondevice_wave_apply(method, layer, dispatch_output, topk_ids)
-        return StandardCombineInput(hidden_states=hidden)
-
-    # Eager (host) path — branch-1 behavior, requires --disable-cuda-graph.
-    distinct = pager.distinct_active(topk_ids)
-    if len(distinct) <= pager.K:
-        src, dst = pager.decide_keep_warm(topk_ids, distinct=distinct)
-        pager.page_in(src, dst)
-        remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
-        hidden = _gemm_hidden(method, layer, dispatch_output, remap, clone_hidden=False)
-    else:
-        hidden = _wave_apply(method, layer, dispatch_output, topk_ids, distinct)
-    return StandardCombineInput(hidden_states=hidden)
+    return method._placement.apply(method, layer, dispatch_output)

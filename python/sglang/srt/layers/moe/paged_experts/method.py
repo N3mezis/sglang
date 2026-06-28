@@ -18,6 +18,7 @@ from typing import Any
 import torch
 
 from sglang.srt.layers.moe.paged_experts.guard import check_paged_experts_compat
+from sglang.srt.layers.moe.paged_experts.placement import make_placement
 from sglang.srt.layers.moe.paged_experts.sizing import (
     compute_num_resident_experts,
     kv_reserve_bytes_mha,
@@ -133,9 +134,11 @@ def _make_method_class():
             self.E = num_experts_E
             self.num_resident = num_resident_K
             self.pin_host = pin_host
-            # On-device decide + UVA gather (the capturable decode path). Requires a pinned store.
-            self.use_ondevice = use_ondevice and pin_host
             self.eviction = eviction
+            # Decode placement: captured (on-device decide + UVA gather, needs a pinned store) when CUDA
+            # graphs are on, else eager host. The bool resolves to a Placement strategy (placement.py).
+            self.use_ondevice = use_ondevice and pin_host
+            self._placement = make_placement(self.use_ondevice)
             self._pager = None
             # Initial residents = experts 0..K-1 in slots 0..K-1; the pager re-seeds + pages the rest.
             self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)

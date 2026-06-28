@@ -431,6 +431,6 @@ def setup_pager(method, layer) -> PagedExpertStore:
         list(store.gpu),
     )
     pager = PagedExpertStore(store=store, eviction=getattr(method, "eviction", "lru"))
-    if getattr(method, "use_ondevice", False):
+    if method._placement.needs_ondevice_store:
         pager.setup_ondevice()  # captured path: device-resident decide + UVA gather
     return pager
