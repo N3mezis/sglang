@@ -18,6 +18,7 @@ def _jit_paged_experts_decide_module() -> Module:
         cuda_files=["moe/paged_experts_decide.cuh"],
         cuda_wrappers=[
             ("decide", "decide"),
+            ("decide_bounded", "decide_bounded"),
             ("decide_wave", "decide_wave"),
             ("gather", "gather"),
             ("host_devptr", "host_devptr"),
@@ -65,6 +66,66 @@ def paged_experts_decide(
         dst,
         n_out,
         idx,
+    )
+
+
+def paged_experts_decide_bounded(
+    topk: torch.Tensor,
+    step_ctr: torch.Tensor,
+    slot_expert: torch.Tensor,
+    expert_slot: torch.Tensor,
+    slot_lastuse: torch.Tensor,
+    freq: torch.Tensor,
+    lfu: bool,
+    defer_cold: bool,
+    log2hot: torch.Tensor,
+    log2cold: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    n_out: torch.Tensor,
+    cold_log: torch.Tensor,
+    cold_dst: torch.Tensor,
+    cold_n: torch.Tensor,
+    idx: torch.Tensor,
+    needed: torch.Tensor,
+) -> None:
+    """On-device keep-warm + LRU/LFU decision for the pinned-WINDOW store (distinct active experts <= K).
+
+    Like :func:`paged_experts_decide`, but splits the page-in plan by window membership so the captured
+    gather only reads the pinned hot block. ``log2hot[e]`` is the hot-block index if expert ``e`` is in the
+    pinned window (else -1); ``log2cold[e]`` is the cold-block index if ``e`` is cold (else -1). Window hits
+    go to ``(src, dst, n_out)`` (on-device gather from ``host_hot``). Cold misses, when ``defer_cold`` (the
+    replay-twice / Rung-2 path), record their **logical** id in ``cold_log`` and stay unresident+unmasked-off
+    (no eviction) for the host to stage out-of-graph then replay again; without ``defer_cold`` (Rung 1,
+    registered cold tier) they get a slot and emit the **cold-block** index in ``cold_log`` + slot in
+    ``cold_dst``. ``needed[s]`` marks slots holding an expert needed this step (the refill must not evict
+    them, or the replay-twice loop never converges).
+
+    All tensors are ``int32`` CUDA. Shapes: ``topk`` ``[topk_n]``; ``step_ctr``/``n_out``/``cold_n`` ``[1]``;
+    ``slot_expert``/``slot_lastuse``/``src``/``dst``/``cold_log``/``cold_dst``/``needed`` ``[K]`` (``src``/
+    ``dst``/``cold_*`` are ``[>=K]`` plan buffers); ``expert_slot``/``freq``/``idx``/``log2hot``/``log2cold``
+    ``[E]``. ``step_ctr`` is bumped on-device so a captured graph advances recency every replay.
+    """
+    module = _jit_paged_experts_decide_module()
+    module.decide_bounded(
+        topk,
+        int(lfu),
+        int(defer_cold),
+        log2hot,
+        log2cold,
+        step_ctr,
+        slot_expert,
+        expert_slot,
+        slot_lastuse,
+        freq,
+        src,
+        dst,
+        n_out,
+        cold_log,
+        cold_dst,
+        cold_n,
+        idx,
+        needed,
     )
 
 

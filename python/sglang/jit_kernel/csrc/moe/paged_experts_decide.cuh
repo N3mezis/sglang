@@ -106,6 +106,99 @@ __global__ void decide_kernel(
   for (int e = 0; e < E; ++e) idx[e] = expert_slot[e];
 }
 
+// Bounded keep-warm + LRU/LFU decision for the pinned-WINDOW store (distinct active experts <= K). Same
+// residency logic as ``decide_kernel`` but partitions the page-in plan by window membership so the captured
+// gather only ever reads the pinned hot block. ``log2hot[e]`` = hot-block index if expert e is in the
+// pinned window, else -1; ``log2cold[e]`` = cold-block (host_cold) index if e is cold, else -1.
+//   * window hit (hot)  -> (src=hot index, dst=slot) in the windowed plan -> on-device gather from host_hot.
+//   * cold, ``defer_cold`` (replay-twice / Rung 2): the expert isn't gatherable in-graph (pageable/disk).
+//     Record its LOGICAL id in ``cold_log`` and leave it UNRESIDENT (idx stays -1 -> masked this replay) with
+//     NO eviction (don't displace a window hit for an expert we can't gather). The host stages it into the
+//     window out-of-graph and replays the SAME graph again until no miss.
+//   * cold, not deferred (Rung 1, registered cold tier): assign a slot and emit (cold_log=COLD-BLOCK index,
+//     cold_dst=slot) so the caller's gather indexes host_cold directly.
+// ``needed[s]`` = 1 iff slot s holds an expert needed THIS step (logical id in topk): the replay-twice refill
+// must not evict these, else a still-needed expert re-misses and the loop never converges.
+__global__ void decide_bounded_kernel(
+    const int32_t* topk,
+    int topk_n,
+    int E,
+    int K,
+    int lfu,
+    int defer_cold,
+    const int32_t* log2hot,  // [E] hot-block index if e in window, else -1
+    const int32_t* log2cold,  // [E] cold-block index if e is cold, else -1
+    int32_t* step_ctr,       // [1] monotonic step counter, incremented on-device (capture-safe)
+    int32_t* slot_expert,    // [K] slot -> expert id (-1 == empty), mutated
+    int32_t* expert_slot,    // [E] expert -> slot (-1 == not resident), mutated
+    int32_t* slot_lastuse,   // [K] last step each slot was used, mutated
+    int32_t* freq,           // [E] per-expert use count (LFU key), mutated
+    int32_t* src,            // [>=K] out: windowed page-in source (hot-block index)
+    int32_t* dst,            // [>=K] out: windowed page-in destination slots
+    int32_t* n_out,          // [1]  out: number of windowed page-ins
+    int32_t* cold_log,       // [>=K] out: cold page-in source (cold-block index, or logical id when deferred)
+    int32_t* cold_dst,       // [>=K] out: cold page-in destination slots (unused entries when deferred)
+    int32_t* cold_n,         // [1]  out: number of cold entries
+    int32_t* idx,            // [E]  out: logical -> slot map snapshot
+    int32_t* needed) {       // [K]  out: 1 iff slot holds an expert needed this step
+  if (threadIdx.x || blockIdx.x) return;
+  const int step = ++(*step_ctr);
+  // pass 1: bump per-expert use count (LFU key) and resident-hit recency (LRU key / tiebreak)
+  for (int i = 0; i < topk_n; ++i) {
+    const int e = topk[i];
+    if (e < 0 || e >= E) continue;
+    freq[e]++;
+    const int s = expert_slot[e];
+    if (s >= 0) slot_lastuse[s] = step;
+  }
+  // pass 2: each miss is split by window membership (hot -> in-graph gather, cold -> defer or host_cold)
+  int nw = 0, nc = 0;
+  for (int i = 0; i < topk_n; ++i) {
+    const int e = topk[i];
+    if (e < 0 || e >= E) continue;
+    if (expert_slot[e] >= 0) continue;  // resident (or just assigned this step)
+    const int hi = log2hot[e];
+    if (defer_cold && hi < 0) {
+      // Replay-twice: window-miss is not gatherable in-graph -> record logical id, no eviction, stays masked.
+      cold_log[nc] = e;
+      ++nc;
+      continue;
+    }
+    const int victim = pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq);
+    if (victim < 0) continue;  // pool too small (should not happen: distinct <= K)
+    const int old = slot_expert[victim];
+    if (old >= 0) expert_slot[old] = -1;
+    slot_expert[victim] = e;
+    expert_slot[e] = victim;
+    slot_lastuse[victim] = step;
+    if (hi >= 0) {  // windowed hit -> on-device gather from the pinned hot block
+      src[nw] = hi;
+      dst[nw] = victim;
+      ++nw;
+    } else {  // Rung 1 cold (registered cold tier) -> host_cold gather
+      cold_log[nc] = log2cold[e];
+      cold_dst[nc] = victim;
+      ++nc;
+    }
+  }
+  *n_out = nw;
+  *cold_n = nc;
+  for (int e = 0; e < E; ++e) idx[e] = expert_slot[e];
+  for (int s = 0; s < K; ++s) {
+    const int se = slot_expert[s];
+    int nd = 0;
+    if (se >= 0) {
+      for (int i = 0; i < topk_n; ++i) {
+        if (topk[i] == se) {
+          nd = 1;
+          break;
+        }
+      }
+    }
+    needed[s] = nd;
+  }
+}
+
 // Static fixed-wave decision (distinct active experts > K, e.g. prefill / batched decode). Expert e has a
 // STATIC home: wave floor(e/K), slot e%K. For wave w this emits the page-in plan for the distinct in-wave
 // experts present in topk (src=e, dst=e-w*K) and writes idx[e] = (e in [w*K, (w+1)*K)) ? e-w*K : -1. The
@@ -205,6 +298,66 @@ void decide(
       static_cast<int32_t*>(dst.data_ptr()),
       static_cast<int32_t*>(n_out.data_ptr()),
       static_cast<int32_t*>(idx.data_ptr()));
+}
+
+void decide_bounded(
+    tvm::ffi::TensorView topk,
+    int64_t lfu,
+    int64_t defer_cold,
+    tvm::ffi::TensorView log2hot,
+    tvm::ffi::TensorView log2cold,
+    tvm::ffi::TensorView step_ctr,
+    tvm::ffi::TensorView slot_expert,
+    tvm::ffi::TensorView expert_slot,
+    tvm::ffi::TensorView slot_lastuse,
+    tvm::ffi::TensorView freq,
+    tvm::ffi::TensorView src,
+    tvm::ffi::TensorView dst,
+    tvm::ffi::TensorView n_out,
+    tvm::ffi::TensorView cold_log,
+    tvm::ffi::TensorView cold_dst,
+    tvm::ffi::TensorView cold_n,
+    tvm::ffi::TensorView idx,
+    tvm::ffi::TensorView needed) {
+  using namespace host;
+
+  // E bound to expert_slot, K to slot_expert; the per-expert maps (freq/idx/log2hot/log2cold) are [E], the
+  // per-slot ones (slot_lastuse/needed) and page-in plans (src/dst/cold_*) are [K], topk is [T].
+  SymbolicSize E = {"num_experts"}, K = {"num_slots"}, T = {"topk_n"};
+  SymbolicDevice device_;
+  device_.set_options<kDLCUDA>();
+  TensorMatcher({E}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(expert_slot).verify(freq).verify(idx).verify(log2hot).verify(log2cold);
+  TensorMatcher({K}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(slot_expert).verify(slot_lastuse).verify(src).verify(dst).verify(cold_log).verify(cold_dst).verify(needed);
+  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk);
+
+  const int e = static_cast<int>(E.unwrap());
+  const int k = static_cast<int>(K.unwrap());
+  const int t = static_cast<int>(T.unwrap());
+  const DLDevice device = device_.unwrap();
+
+  LaunchKernel(1, 1, device)(
+      decide_bounded_kernel,
+      static_cast<const int32_t*>(topk.data_ptr()),
+      t,
+      e,
+      k,
+      static_cast<int>(lfu),
+      static_cast<int>(defer_cold),
+      static_cast<const int32_t*>(log2hot.data_ptr()),
+      static_cast<const int32_t*>(log2cold.data_ptr()),
+      static_cast<int32_t*>(step_ctr.data_ptr()),
+      static_cast<int32_t*>(slot_expert.data_ptr()),
+      static_cast<int32_t*>(expert_slot.data_ptr()),
+      static_cast<int32_t*>(slot_lastuse.data_ptr()),
+      static_cast<int32_t*>(freq.data_ptr()),
+      static_cast<int32_t*>(src.data_ptr()),
+      static_cast<int32_t*>(dst.data_ptr()),
+      static_cast<int32_t*>(n_out.data_ptr()),
+      static_cast<int32_t*>(cold_log.data_ptr()),
+      static_cast<int32_t*>(cold_dst.data_ptr()),
+      static_cast<int32_t*>(cold_n.data_ptr()),
+      static_cast<int32_t*>(idx.data_ptr()),
+      static_cast<int32_t*>(needed.data_ptr()));
 }
 
 void decide_wave(

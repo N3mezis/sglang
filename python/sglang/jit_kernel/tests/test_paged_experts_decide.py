@@ -14,6 +14,7 @@ import torch
 
 from sglang.jit_kernel.paged_experts_decide import (
     paged_experts_decide,
+    paged_experts_decide_bounded,
     paged_experts_decide_wave,
     paged_experts_gather,
     paged_experts_host_devptr,
@@ -272,6 +273,169 @@ def test_decide_gather_capturable():
         assert (
             sidx >= 0 and (slot[sidx] == e + 1).all().item()
         ), f"expert {e} not gathered to its slot"
+
+
+# ---------------------------------------------------------------------------
+# Bounded (pinned-window) decide
+# ---------------------------------------------------------------------------
+def _ref_decide_bounded(
+    topk, slot_expert, expert_slot, slot_lastuse, freq, step, lfu, defer_cold, log2hot, log2cold
+):
+    """In-place bounded keep-warm decision; returns (src, dst, cold_log, cold_dst, needed)."""
+    E, K = len(expert_slot), len(slot_expert)
+    distinct = [int(e) for e in topk if 0 <= e < E]
+    for e in distinct:
+        freq[e] += 1
+        s = expert_slot[e]
+        if s >= 0:
+            slot_lastuse[s] = step
+    src, dst, cold_log, cold_dst = [], [], [], []
+    for e in distinct:
+        if expert_slot[e] >= 0:
+            continue
+        hi = log2hot[e]
+        if defer_cold and hi < 0:  # replay-twice defer: record logical id, no eviction, stays masked
+            cold_log.append(e)
+            continue
+        victim, best_f, best_lu = -1, None, None
+        for s in range(K):
+            se = slot_expert[s]
+            if se in distinct:  # never evict a slot needed this step
+                continue
+            f = freq[se] if (lfu and se >= 0) else 0
+            lu = slot_lastuse[s]
+            if best_f is None or f < best_f or (f == best_f and lu < best_lu):
+                best_f, best_lu, victim = f, lu, s
+        if victim < 0:
+            continue
+        old = slot_expert[victim]
+        if old >= 0:
+            expert_slot[old] = -1
+        slot_expert[victim] = e
+        expert_slot[e] = victim
+        slot_lastuse[victim] = step
+        if hi >= 0:  # windowed -> on-device gather from host_hot
+            src.append(hi)
+            dst.append(victim)
+        else:  # Rung 1 cold -> host_cold gather (cold-block index)
+            cold_log.append(log2cold[e])
+            cold_dst.append(victim)
+    needed = [1 if (slot_expert[s] >= 0 and slot_expert[s] in distinct) else 0 for s in range(K)]
+    return src, dst, cold_log, cold_dst, needed
+
+
+def _window_maps(E, W):
+    """Experts [0, W) are hot (pinned window), [W, E) are cold. log2hot/log2cold as the kernel expects."""
+    log2hot = [e if e < W else -1 for e in range(E)]
+    log2cold = [(e - W) if e >= W else -1 for e in range(E)]
+    return _i32(log2hot), _i32(log2cold)
+
+
+def _new_bounded_buffers(K):
+    cold_log = _i32([0] * K)
+    cold_dst = _i32([0] * K)
+    cold_n = _i32([0])
+    needed = _i32([0] * K)
+    return cold_log, cold_dst, cold_n, needed
+
+
+@requires_cuda
+@pytest.mark.parametrize("lfu", [False, True])
+@pytest.mark.parametrize("defer_cold", [False, True])
+def test_decide_bounded_matches_reference(lfu, defer_cold):
+    """Bounded decide matches the pure-Python reference over a random multi-step run: window hits land in
+    (src,dst), cold misses either defer (logical id in cold_log, unresident) or take a slot + emit the
+    cold-block index, and needed[] marks slots in use this step."""
+    E, K, W = 16, 6, 8  # experts 0..7 hot (window), 8..15 cold; K=6 resident slots
+    log2hot, log2cold = _window_maps(E, W)
+    sc, se, es, lu, fq, src, dst, n_out, idx = _new_state(E, K)
+    cold_log, cold_dst, cold_n, needed = _new_bounded_buffers(K)
+    r_se, r_es = list(range(K)), [-1] * E
+    r_es[:K] = list(range(K))
+    r_lu, r_fq = [0] * K, [0] * E
+    rlog2hot = [e if e < W else -1 for e in range(E)]
+    rlog2cold = [(e - W) if e >= W else -1 for e in range(E)]
+
+    torch.manual_seed(1)
+    for step in range(1, 25):
+        ndist = int(torch.randint(1, K + 1, (1,)).item())  # 1..K distinct (keep-warm regime)
+        experts = torch.randperm(E)[:ndist].tolist()
+        paged_experts_decide_bounded(
+            _i32(experts), sc, se, es, lu, fq, lfu, defer_cold, log2hot, log2cold,
+            src, dst, n_out, cold_log, cold_dst, cold_n, idx, needed,
+        )
+        r_src, r_dst, r_cl, r_cd, r_needed = _ref_decide_bounded(
+            experts, r_se, r_es, r_lu, r_fq, step, lfu, defer_cold, rlog2hot, rlog2cold
+        )
+        nw, nc = int(n_out.item()), int(cold_n.item())
+        assert int(sc.item()) == step, f"step {step}: counter"
+        assert se.tolist() == r_se, f"step {step}: slot_expert"
+        assert es.tolist() == r_es, f"step {step}: expert_slot"
+        assert idx.tolist() == r_es, f"step {step}: idx snapshot"
+        assert src[:nw].tolist() == r_src, f"step {step}: windowed src"
+        assert dst[:nw].tolist() == r_dst, f"step {step}: windowed dst"
+        assert cold_log[:nc].tolist() == r_cl, f"step {step}: cold_log"
+        if not defer_cold:  # cold_dst only meaningful for Rung-1 (deferred entries don't take a slot)
+            assert cold_dst[:nc].tolist() == r_cd, f"step {step}: cold_dst"
+        assert needed.tolist() == r_needed, f"step {step}: needed"
+        if defer_cold:  # deferred (window-miss) experts must stay unresident this step
+            for e in cold_log[:nc].tolist():
+                assert es[e].item() == -1, f"step {step}: deferred expert {e} should be unresident"
+
+
+@requires_cuda
+def test_decide_bounded_is_cuda_graph_capturable():
+    """Capture decide_bounded once and replay with topk mutated in place; on-device counter makes the
+    captured residency evolution identical to the eager run (the substrate for replay-twice)."""
+    E, K, W = 16, 6, 8
+    log2hot, log2cold = _window_maps(E, W)
+    steps = [[1, 6, 9], [2, 7, 11], [9, 3, 14], [6, 1, 2], [0, 7, 11]]
+
+    def fresh():
+        st = _new_state(E, K)
+        return (*st, *_new_bounded_buffers(K))
+
+    # eager reference (kernel, no capture)
+    sc, se, es, lu, fq, src, dst, n_out, idx, cl, cd, cn, nd = fresh()
+    eager_idx = []
+    for experts in steps:
+        paged_experts_decide_bounded(
+            _i32(experts), sc, se, es, lu, fq, False, True, log2hot, log2cold,
+            src, dst, n_out, cl, cd, cn, idx, nd,
+        )
+        eager_idx.append(idx.tolist())
+
+    # captured run
+    sc, se, es, lu, fq, src, dst, n_out, idx, cl, cd, cn, nd = fresh()
+    topk_buf = _i32(steps[0])
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        paged_experts_decide_bounded(
+            topk_buf, sc, se, es, lu, fq, False, True, log2hot, log2cold,
+            src, dst, n_out, cl, cd, cn, idx, nd,
+        )
+    torch.cuda.current_stream().wait_stream(s)
+    sc.zero_()
+    se.copy_(_i32(list(range(K))))
+    es.copy_(_new_state(E, K)[2])
+    lu.zero_()
+    fq.zero_()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        paged_experts_decide_bounded(
+            topk_buf, sc, se, es, lu, fq, False, True, log2hot, log2cold,
+            src, dst, n_out, cl, cd, cn, idx, nd,
+        )
+
+    captured_idx = []
+    for experts in steps:
+        topk_buf.copy_(_i32(experts))
+        g.replay()
+        torch.cuda.synchronize()
+        captured_idx.append(idx.tolist())
+
+    assert captured_idx == eager_idx
 
 
 if __name__ == "__main__":
