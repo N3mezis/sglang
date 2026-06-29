@@ -93,11 +93,17 @@ def _post_replay_refill_all() -> bool:
         _maybe_profile_refresh()  # token converged (no misses) -> count it toward the profiling horizon
         return False
     counts = _MISS_VEC[:_MISS_VEC_N].tolist()
+    missed = [p for p in _REPLAY_PAGERS if counts[p._miss_idx] > 0]
     staged = False
-    for p in _REPLAY_PAGERS:
-        cn = counts[p._miss_idx]
-        if cn > 0 and p._refill_after_replay(cn):
-            staged = True
+    if missed:
+        # Batch the per-layer refill reads into 3 D2H copies total (stack across all missed layers) instead
+        # of 3 .tolist() per layer.
+        cold_logs = torch.stack([p._cold_log_d for p in missed]).cpu().tolist()
+        neededs = torch.stack([p._needed_d for p in missed]).cpu().tolist()
+        slot_exps = torch.stack([p._slot_expert_d for p in missed]).cpu().tolist()
+        for i, p in enumerate(missed):
+            if p._refill_after_replay(counts[p._miss_idx], cold_logs[i], neededs[i], slot_exps[i]):
+                staged = True
     if staged:
         torch.cuda.synchronize()  # one device sync for all layers' staging, then replay again
         return True
@@ -370,31 +376,40 @@ class PagedExpertStore:
         )
         self._gather_planned_ondevice()  # window hits only; cold misses deferred to _refill_after_replay
 
-    def _refill_after_replay(self, cn: int) -> bool:
-        """Post-replay (out-of-graph): stage the ``cn`` deferred cold experts ``host_cold`` -> their GPU
-        slots and mark them resident, so the next replay's ``decide_bounded`` sees them as hits and the loop
-        converges (typically one extra replay). Evicts only slots NOT needed this step (the ``needed[]`` mask
-        decide emits), so a still-needed expert is never displaced. Eager copies; the hook syncs once for all
-        layers before replaying again."""
-        missed = self._cold_log_d[:cn].tolist()  # logical ids (defer mode emits logical ids)
-        needed = self._needed_d.tolist()
+    def _refill_after_replay(self, cn: int, cold_log, needed, se) -> bool:
+        """Post-replay (out-of-graph): stage the deferred cold experts ``host_cold`` -> their GPU slots and
+        mark them resident, so the next replay's ``decide_bounded`` sees them as hits and the loop converges.
+        Evicts only slots NOT needed this step (the ``needed[]`` mask). ``cold_log``/``needed``/``se`` are
+        host lists the hook read in batched D2H copies (no per-layer sync here).
+
+        Robust to a momentary shortage: if there are fewer evictable slots than cold misses this round (no
+        eviction headroom — e.g. K too close to top_k), it stages as many as fit and returns True so the loop
+        retries the rest, rather than giving up and masking experts. (With K > top_k the headroom exists and
+        it converges in one extra replay; K <= top_k is the misconfig this guards — raise
+        --paged-experts-num-resident above top_k.)"""
+        missed = cold_log[:cn]  # logical ids (defer mode emits logical ids)
         evictable = [s for s in range(self.K) if not needed[s]]
-        if len(evictable) < cn:
-            logger.error(
-                "[paged-experts] replay-twice: %d cold misses but only %d evictable slots (K=%d) — "
-                "keep-warm invariant (distinct <= K) broken",
-                cn,
-                len(evictable),
-                self.K,
+        n = min(len(evictable), cn)
+        if n < cn:
+            logger.warning(
+                "[paged-experts] replay-twice: %d cold misses but only %d evictable slots (K=%d) — staging "
+                "%d this round, retrying the rest. Raise --paged-experts-num-resident above top_k.",
+                cn, len(evictable), self.K, n,
             )
-            return False
+        if n == 0:
+            return False  # no headroom this round; nothing staged (avoid a no-progress replay)
         l2g = self.logical_to_gpu_index_cuda
-        se = self._slot_expert_d.tolist()
-        for e, slot in zip(missed, evictable):
+        slots = evictable[:n]
+        ids = list(missed[:n])
+        # Batch staging into ONE index_copy_ per tensor (vs n separate copy_ launches): host-gather the cold
+        # rows, then a single host->device scatter into the victim slots.
+        slots_dev = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        for name, gpu_param in self.gpu.items():
+            rows = torch.stack([self.store.row(name, e) for e in ids])  # [n, *shape] from host_cold
+            gpu_param.data.index_copy_(0, slots_dev, rows.to(gpu_param.device, non_blocking=True))
+        for e, slot in zip(ids, slots):  # update device residency so replay-2's decide sees e resident
             old = se[slot]
-            for name, gpu_param in self.gpu.items():  # eager stage host_cold -> GPU slot (out of graph)
-                gpu_param.data[slot].copy_(self.store.row(name, e), non_blocking=True)
-            if old >= 0:  # update device residency so replay-2's decide sees e resident in `slot`
+            if old >= 0:
                 l2g[old] = -1
             self._slot_expert_d[slot] = e
             l2g[e] = slot
