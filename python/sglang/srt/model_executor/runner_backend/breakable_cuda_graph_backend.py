@@ -51,6 +51,20 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
+# Per-step post-replay hook (the breakable analog of the full backend's). Fires once after replay() returns
+# — i.e. after the full forward + all eager breaks complete and before the next step — so it is a safe
+# boundary to mutate state the captured gathers read (e.g. the paged-experts freq-window re-pin). Unlike the
+# full backend's hook this does NOT loop/re-replay: BCG pages cold experts inline at the break, so there is
+# nothing to converge; the hook is purely a per-step boundary callback. None = no hook installed.
+_post_replay_hook: Optional[Callable[[], None]] = None
+
+
+def set_post_replay_hook(fn: Optional[Callable[[], None]]) -> None:
+    """Register a once-per-step callback fired after each decode replay (between steps)."""
+    global _post_replay_hook
+    _post_replay_hook = fn
+
+
 class BreakableCudaGraphBackend(BaseCudaGraphBackend):
     """Segmented capture: graphs break at attention / mamba boundaries;
     attention metadata is recomputed at replay outside captured segments.
@@ -222,6 +236,8 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         self._graphs[shape_key].replay()
+        if _post_replay_hook is not None:
+            _post_replay_hook()  # once-per-step boundary (no re-replay; cold already staged at the break)
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:

@@ -73,6 +73,36 @@ def _maybe_profile_refresh() -> None:
     )
 
 
+_BCG_HOOK_INSTALLED = False
+
+
+def _bcg_post_step() -> None:
+    """BCG freq-window driver, fired once per decode step at the breakable backend's post-replay boundary
+    (after the full forward + all eager breaks complete, before the next step). This is the ONLY safe place
+    to re-pin: ``refresh_window_freq`` -> ``set_window_membership`` rewrites the pinned ``host_hot`` store in
+    place, and that store is read by the captured UVA gather. Doing it mid-step (e.g. at a layer's break)
+    races the in-flight gathers of the later layers and corrupts their output. Here no captured gather is in
+    flight; we still synchronize first so the step's async gathers are done before host_hot is permuted."""
+    if _profile_done or _PROFILE_TOKENS <= 0:
+        return  # nothing left to do once re-pinned (no per-step cost after the horizon)
+    torch.cuda.synchronize()  # the step's captured gathers must finish before host_hot is rewritten
+    _maybe_profile_refresh()
+
+
+def _ensure_bcg_post_step_hook() -> None:
+    """Install the per-step boundary hook on the breakable backend the first time the BCG break path runs
+    (we only know decode is breakable once a break actually executes)."""
+    global _BCG_HOOK_INSTALLED
+    if _BCG_HOOK_INSTALLED:
+        return
+    from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+        set_post_replay_hook as _set_bcg_hook,
+    )
+
+    _set_bcg_hook(_bcg_post_step)
+    _BCG_HOOK_INSTALLED = True
+
+
 def _alloc_miss_slot(device) -> tuple:
     """Reserve this layer's slot in the shared miss-vector; returns (index, the [1] view decide writes)."""
     global _MISS_VEC, _MISS_VEC_N
@@ -390,6 +420,9 @@ class PagedExpertStore:
                 self._needed_d.tolist(),
                 self._slot_expert_d.tolist(),
             )
+        # Freq-window driver: install the per-step boundary hook on the breakable backend on first use. The
+        # actual re-pin runs there (between steps), NOT here mid-step — see _bcg_post_step.
+        _ensure_bcg_post_step_hook()
 
     def _refill_after_replay(self, cn: int, cold_log, needed, se) -> bool:
         """Post-replay (out-of-graph): stage the deferred cold experts ``host_cold`` -> their GPU slots and
