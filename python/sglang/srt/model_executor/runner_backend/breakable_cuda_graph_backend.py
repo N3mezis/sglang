@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -143,6 +144,17 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            # e.g. LogitsProcessorOutput: slice the per-token tensor fields (next_token_logits /
+            # hidden_states), leave None / scalar / list fields (logprobs, filled later by the sampler) as-is.
+            return dataclasses.replace(
+                output,
+                **{
+                    f.name: getattr(output, f.name)[:num_tokens]
+                    for f in dataclasses.fields(output)
+                    if torch.is_tensor(getattr(output, f.name))
+                },
+            )
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _copy_output_to_buffer(
@@ -181,6 +193,14 @@ class BreakableCudaGraphBackend(BaseCudaGraphBackend):
                 )
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
+            return
+        if dataclasses.is_dataclass(output) and dataclasses.is_dataclass(output_buffer):
+            for f in dataclasses.fields(output):
+                v = getattr(output, f.name)
+                if torch.is_tensor(v):  # copy the per-token tensor fields into the captured buffer
+                    self._copy_output_to_buffer(
+                        v, getattr(output_buffer, f.name), num_tokens
+                    )
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "

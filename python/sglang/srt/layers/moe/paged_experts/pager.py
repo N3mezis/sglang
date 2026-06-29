@@ -376,6 +376,21 @@ class PagedExpertStore:
         )
         self._gather_planned_ondevice()  # window hits only; cold misses deferred to _refill_after_replay
 
+    def stage_cold_at_break(self) -> None:
+        """BCG break-and-page-in: stage THIS step's deferred cold experts at an in-layer eager break
+        (between decide and the expert GEMM), instead of deferring to a post-replay refill. Runs eager
+        every replay; reads this layer's cold-miss count + plan and refills directly — so the GEMM segment
+        sees the cold experts resident with NO second full-graph replay. Reuses the replay-twice refill,
+        but inline (one D2H for the count, plus the staging copies)."""
+        cn = int(self._cold_n_d.item())
+        if cn > 0:
+            self._refill_after_replay(
+                cn,
+                self._cold_log_d[:cn].tolist(),
+                self._needed_d.tolist(),
+                self._slot_expert_d.tolist(),
+            )
+
     def _refill_after_replay(self, cn: int, cold_log, needed, se) -> bool:
         """Post-replay (out-of-graph): stage the deferred cold experts ``host_cold`` -> their GPU slots and
         mark them resident, so the next replay's ``decide_bounded`` sees them as hits and the loop converges.

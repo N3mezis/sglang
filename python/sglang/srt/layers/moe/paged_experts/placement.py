@@ -121,9 +121,72 @@ class CapturedWindowedPlacement(Placement):
         return StandardCombineInput(hidden_states=hidden)
 
 
-def make_placement(use_ondevice: bool, windowed: bool = False) -> Placement:
+_bcg_break = None
+
+
+def _bcg_cold_break():
+    """The eager break that stages a windowed layer's cold experts (BCG break-and-page-in). Wrapped with
+    ``eager_on_graph`` so, under breakable-decode capture, calling it ends the decide+gather segment, runs
+    the staging eager (host_cold -> slots), and starts the GEMM segment — eliminating the replay-twice
+    second full-graph replay. Built lazily (eager_on_graph hard-raises off CUDA)."""
+    global _bcg_break
+    if _bcg_break is None:
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            eager_on_graph,
+        )
+
+        def _stage(pager, hidden_states):
+            pager.stage_cold_at_break()  # side effect: refill cold into slots + update residency maps
+            return hidden_states  # pass-through so the break has a (copyable) output
+
+        _bcg_break = eager_on_graph(True)(_stage)
+    return _bcg_break
+
+
+class CapturedWindowedBCGPlacement(Placement):
+    """Captured windowed decode under the *breakable* backend (BCG break-and-page-in). Same on-device
+    decide_bounded + windowed gather as the replay-twice variant, but the deferred cold experts are staged
+    at an in-layer eager break (between decide and the expert GEMM) — so a cold miss is paged inline in the
+    same forward pass, with NO second full-graph replay. Requires --cuda-graph-backend-decode breakable."""
+
+    needs_ondevice_store = True
+
+    def apply(self, method, layer, dispatch_output):
+        from sglang.srt.layers.moe.paged_experts.forward import (
+            _gemm_hidden,
+            _wave_apply,
+            mask_and_remap_expert_ids,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        pager = method._pager
+        topk_ids = dispatch_output.topk_output.topk_ids
+        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] <= pager.K
+        if keep_warm:
+            pager.decide_and_page_bounded_ondevice(topk_ids)  # segment 1: decide + window-hit gather
+            # eager break: stage this step's cold experts into their slots, then the GEMM segment runs with
+            # them resident (no replay-twice). Called for its side effect + the segment boundary; it passes
+            # hidden_states through unchanged (the GEMM below reads the same fixed-address buffer), so the
+            # return is ignored (dispatch_output.hidden_states is a read-only property).
+            _bcg_cold_break()(pager, dispatch_output.hidden_states)
+            remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
+            hidden = _gemm_hidden(
+                method, layer, dispatch_output, remap, clone_hidden=False
+            )
+        else:  # prefill / big batch: eager host wave (not on the captured decode path)
+            distinct = pager.distinct_active(topk_ids)
+            hidden = _wave_apply(method, layer, dispatch_output, topk_ids, distinct)
+        return StandardCombineInput(hidden_states=hidden)
+
+
+def make_placement(
+    use_ondevice: bool, windowed: bool = False, breakable_decode: bool = False
+) -> Placement:
     """Captured when CUDA graphs are on (and a pinned store is available), else eager host. A windowed
-    (>pin-ceiling) store uses the captured replay-twice variant when on-device."""
+    (>pin-ceiling) store uses the captured replay-twice variant when on-device — or the BCG break-and-page-in
+    variant when decode runs under the breakable backend (no second full-graph replay)."""
     if not use_ondevice:
         return EagerPlacement()
-    return CapturedWindowedPlacement() if windowed else CapturedPlacement()
+    if windowed:
+        return CapturedWindowedBCGPlacement() if breakable_decode else CapturedWindowedPlacement()
+    return CapturedPlacement()
