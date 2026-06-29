@@ -1817,6 +1817,15 @@ class ServerArgs:
             choices=["lru", "lfu"],
         ),
     ] = "lru"
+    paged_experts_window_size: A[
+        str,
+        "Pinned-window fallback for --paged-experts-store pinned, for stores that exceed the host's "
+        "page-locked memory limit. '0' (default) page-locks every expert (today's behaviour). An integer "
+        "W pins only the W hot experts and keeps the E-W cold tail in pageable host RAM (paged with a "
+        "plain indexed copy) — the only way to serve, and later capture, a store too large to fully pin "
+        "(e.g. an unquantized model on a small-RAM box, or WSL where the page-locked pool is ~half RAM). "
+        "'auto' (greedy-pin-until-fail) is not yet wired.",
+    ] = "0"
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn

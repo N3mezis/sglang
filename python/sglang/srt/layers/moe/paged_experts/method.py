@@ -127,12 +127,16 @@ def _make_method_class():
             num_resident_K: int,
             pin_host: bool = True,
             eviction: str = "lru",
+            window: int = 0,
         ):
             self.base_method = base_method
             self.E = num_experts_E
             self.num_resident = num_resident_K
             self.pin_host = pin_host
             self.eviction = eviction
+            # Pinned-window fallback: 0 = full pin (every expert page-locked); 0 < window < E pins only the
+            # W hot experts and keeps the E-W cold tail pageable, for stores past the page-lock ceiling.
+            self.window = window
             self._pager = None
             # Initial residents = experts 0..K-1 in slots 0..K-1; the pager re-seeds + pages the rest.
             self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
@@ -214,9 +218,43 @@ def make_for_layer(
     if pin_host is None:
         pin_host = getattr(server_args, "paged_experts_store", "pinned") != "paged"
     eviction = getattr(server_args, "paged_experts_eviction", "lru")
-    return _make_method_class()(
-        base_method, E, K, pin_host=bool(pin_host), eviction=eviction
+    window = _resolve_window_size(
+        getattr(server_args, "paged_experts_window_size", "0"), E, pin_host=bool(pin_host)
     )
+    return _make_method_class()(
+        base_method, E, K, pin_host=bool(pin_host), eviction=eviction, window=window
+    )
+
+
+def _resolve_window_size(raw: Any, num_experts_E: int, *, pin_host: bool) -> int:
+    """Resolve ``--paged-experts-window-size`` to a pinned-window expert count W (0 = full pin / off).
+
+    ``0`` | ``off`` | ``none`` -> 0 (every expert page-locked, today's behaviour). An integer pins that
+    many experts and keeps the cold tail pageable. ``auto`` (greedy-pin-until-fail) is not yet wired — it
+    falls back to full pin with a warning. The window only applies to the pinned store (it *is* the
+    page-lock fallback), so it is ignored when ``--paged-experts-store paged``.
+    """
+    if raw is None:
+        return 0
+    s = str(raw).strip().lower()
+    if s in ("", "0", "off", "none"):
+        return 0
+    if not pin_host:
+        logger.warning(
+            "[paged-experts] --paged-experts-window-size is ignored with --paged-experts-store paged "
+            "(the whole store is already pageable)."
+        )
+        return 0
+    if s == "auto":
+        logger.warning(
+            "[paged-experts] --paged-experts-window-size=auto (greedy-pin-until-fail) is not yet wired; "
+            "specify an integer expert count to pin. Falling back to full pin (window off)."
+        )
+        return 0
+    w = int(s)
+    if w <= 0 or w >= num_experts_E:
+        return 0  # <=0 off; >=E is a full pin -> the plain pinned store, no window needed
+    return w
 
 
 def make_for_layer_from_env(layer, base_method):

@@ -88,6 +88,17 @@ class ExpertStore(ABC):
         no-op for an empty plan.
         """
 
+    # --- checkpoint-fill accessors (store-layout-agnostic; used by ``pager.setup_pager``) ---
+    # A single ``[E, *]`` host buffer here; ``WindowedExpertStore`` overrides both to route an expert into
+    # its hot/cold tier, so the fill code never special-cases the store layout.
+    def row(self, name: str, e: int) -> torch.Tensor:
+        """Writable host slice backing expert ``e`` for paged tensor ``name`` (per-expert fill)."""
+        return self.host[name][e]
+
+    def fill_tensor(self, name: str, full: torch.Tensor) -> None:
+        """Fill the whole host backing for ``name`` from a contiguous ``[E, *slot_shape]`` CPU tensor."""
+        self.host[name].copy_(full)
+
 
 class PinnedExpertStore(ExpertStore):
     """Pinned (page-locked) host store, paged with sglang's existing ``transfer_kv_per_layer_mla`` block
@@ -126,9 +137,119 @@ class PageableExpertStore(ExpertStore):
             gpu_param.data.index_copy_(0, dst_slots, rows)
 
 
+class WindowedExpertStore(ExpertStore):
+    """Pinned hot window + pageable cold tail — the fallback for stores that can't be fully page-locked.
+
+    The ``W`` hot experts live in a page-locked ``host_hot[name]`` block (paged with ``transfer_kv``, and —
+    in the captured path, pr3 — gatherable on-device through its UVA device pointer); the remaining ``E-W``
+    cold experts live in a pageable ``host_cold[name]`` block (paged with a plain indexed copy, or — under
+    capture — staged out-of-graph on a deferred miss). ``host[name]`` is *not* allocated: there is no single
+    ``[E, *]`` buffer, so the fill goes through ``row`` / ``fill_tensor``.
+
+    Membership defaults to the static ``[0, W)`` split (``hot_pos`` / ``cold_pos``); a frequency profile may
+    later pin the hottest ``W`` (the maps make that a fill-order change, not a layout change). This is the
+    >pin-ceiling path: ``W`` = what actually fits page-locked, the rest stays pageable but still served.
+    """
+
+    pinned = True  # the hot window is page-locked; the cold tail is pageable by design
+
+    def __init__(
+        self, layer, num_experts_E: int, num_resident_K: int, device, *, window_W: int
+    ):
+        self.E = num_experts_E
+        self.K = num_resident_K
+        self.device = device
+        self.W = max(0, min(int(window_W), num_experts_E))
+        self.gpu = discover_paged_params(layer, num_resident_K)
+        assert self.gpu, "no per-expert params found on layer"
+        self.host_hot: Dict[str, torch.Tensor] = {}  # [W, *shape] PINNED (transfer_kv / UVA gather)
+        self.host_cold: Dict[str, torch.Tensor] = {}  # [E-W, *shape] PAGEABLE (indexed copy / staged)
+        self.item_bytes: Dict[str, int] = {}
+        for name, p in self.gpu.items():
+            self.host_hot[name] = torch.empty(
+                (self.W, *p.shape[1:]), dtype=p.dtype, device="cpu", pin_memory=True
+            )
+            self.host_cold[name] = torch.empty(
+                (self.E - self.W, *p.shape[1:]), dtype=p.dtype, device="cpu", pin_memory=False
+            )
+            self.item_bytes[name] = p[0].numel() * p.element_size()
+            # the hot tier feeds transfer_kv -> same 8-byte alignment requirement as the pinned store
+            # (see ExpertStore.__init__). The pageable cold tier has none.
+            if self.item_bytes[name] % 8 != 0:
+                raise RuntimeError(
+                    f"[paged-experts] paged tensor {name!r} per-expert size {self.item_bytes[name]} B "
+                    "is not 8-byte aligned (transfer_kv requirement on the pinned window); unsupported. "
+                    "Use --paged-experts-store paged (the pageable copy has no such requirement)."
+                )
+        # expert -> (tier, row). v1: static split -> hot experts [0, W), cold experts [W, E). hot_pos[e] is
+        # the row of e in host_hot (-1 if cold); cold_pos[e] the row in host_cold (-1 if hot).
+        self.hot_pos = torch.full((self.E,), -1, dtype=torch.int64)
+        self.cold_pos = torch.full((self.E,), -1, dtype=torch.int64)
+        self.hot_pos[: self.W] = torch.arange(self.W, dtype=torch.int64)
+        self.cold_pos[self.W :] = torch.arange(self.E - self.W, dtype=torch.int64)
+
+    def is_hot(self, e: int) -> bool:
+        return bool(self.hot_pos[e] >= 0)
+
+    # --- fill accessors: route per expert into the hot/cold tier (no single [E,*] buffer) ---
+    def row(self, name: str, e: int) -> torch.Tensor:
+        hp = int(self.hot_pos[e])
+        if hp >= 0:
+            return self.host_hot[name][hp]
+        return self.host_cold[name][int(self.cold_pos[e])]
+
+    def fill_tensor(self, name: str, full: torch.Tensor) -> None:
+        # v1 membership is the contiguous [0, W) split, so the tiers are full[:W] / full[W:]. (A frequency
+        # profile would gather by hot_pos/cold_pos instead — a fill-order change, deferred to P3.)
+        self.host_hot[name].copy_(full[: self.W])
+        self.host_cold[name].copy_(full[self.W :])
+
+    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+        if src_experts.numel() == 0:
+            return
+        src_cpu = src_experts.to("cpu")
+        hot_mask = self.hot_pos[src_cpu] >= 0  # which planned experts live in the pinned window
+        # hot experts -> transfer_kv from the pinned window (fast path), remapped to host_hot rows
+        if bool(hot_mask.any()):
+            sel = hot_mask.to(dst_slots.device)
+            hot_src_rows = self.hot_pos[src_cpu[hot_mask]].to(src_experts.device)
+            hot_dst = dst_slots[sel]
+            from sgl_kernel import transfer_kv_per_layer_mla
+
+            for name, gpu_param in self.gpu.items():
+                transfer_kv_per_layer_mla(
+                    src=self.host_hot[name],
+                    dst=gpu_param.data,
+                    src_indices=hot_src_rows,
+                    dst_indices=hot_dst,
+                    item_size=self.item_bytes[name],
+                )
+        # cold experts -> plain indexed copy from the pageable tail, remapped to host_cold rows
+        cold_mask = ~hot_mask
+        if bool(cold_mask.any()):
+            sel = cold_mask.to(dst_slots.device)
+            cold_rows = self.cold_pos[src_cpu[cold_mask]]
+            cold_dst = dst_slots[sel]
+            for name, gpu_param in self.gpu.items():
+                rows = self.host_cold[name].index_select(0, cold_rows).to(gpu_param.device)
+                gpu_param.data.index_copy_(0, cold_dst, rows)
+
+
 def make_expert_store(
-    layer, num_experts_E: int, num_resident_K: int, device, *, pin_host: bool
+    layer,
+    num_experts_E: int,
+    num_resident_K: int,
+    device,
+    *,
+    pin_host: bool,
+    window_W: int = 0,
 ) -> ExpertStore:
-    """Build the host expert store: pinned (fast ``transfer_kv`` path) or pageable (plain indexed copy)."""
+    """Build the host expert store. ``window_W > 0`` and ``< E`` (with ``pin_host``) selects the windowed
+    fallback (pinned hot window + pageable cold tail) for stores that exceed the page-lock ceiling; else
+    pinned (fast ``transfer_kv``) or pageable (plain indexed copy)."""
+    if pin_host and 0 < window_W < num_experts_E:
+        return WindowedExpertStore(
+            layer, num_experts_E, num_resident_K, device, window_W=window_W
+        )
     cls = PinnedExpertStore if pin_host else PageableExpertStore
     return cls(layer, num_experts_E, num_resident_K, device)
