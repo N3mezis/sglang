@@ -88,6 +88,42 @@ class CapturedPlacement(Placement):
         return StandardCombineInput(hidden_states=hidden)
 
 
-def make_placement(use_ondevice: bool) -> Placement:
-    """Captured when CUDA graphs are on (and a pinned store is available), else eager host."""
-    return CapturedPlacement() if use_ondevice else EagerPlacement()
+class CapturedWindowedPlacement(Placement):
+    """Captured decode for the pinned-WINDOW store (the >pin-ceiling fallback). Keep-warm decode runs the
+    on-device ``decide_bounded`` + windowed gather: window hits gather in-graph from ``host_hot``, while cold
+    (window-missing) experts are deferred and staged out-of-graph by the replay-twice post-replay hook
+    (registered when the pager set up its window state). The rare ``distinct > K`` step (prefill / big batch)
+    falls back to the eager host wave path — the window store pages hot via ``transfer_kv`` and cold via an
+    indexed copy — since prefill is one-shot and not on the captured decode path."""
+
+    needs_ondevice_store = True
+
+    def apply(self, method, layer, dispatch_output):
+        from sglang.srt.layers.moe.paged_experts.forward import (
+            _gemm_hidden,
+            _wave_apply,
+            mask_and_remap_expert_ids,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        pager = method._pager
+        topk_ids = dispatch_output.topk_output.topk_ids
+        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] <= pager.K
+        if keep_warm:
+            pager.decide_and_page_bounded_ondevice(topk_ids)
+            remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
+            hidden = _gemm_hidden(
+                method, layer, dispatch_output, remap, clone_hidden=False
+            )
+        else:  # prefill / big batch: eager host wave (window store pages hot+cold); not captured
+            distinct = pager.distinct_active(topk_ids)
+            hidden = _wave_apply(method, layer, dispatch_output, topk_ids, distinct)
+        return StandardCombineInput(hidden_states=hidden)
+
+
+def make_placement(use_ondevice: bool, windowed: bool = False) -> Placement:
+    """Captured when CUDA graphs are on (and a pinned store is available), else eager host. A windowed
+    (>pin-ceiling) store uses the captured replay-twice variant when on-device."""
+    if not use_ondevice:
+        return EagerPlacement()
+    return CapturedWindowedPlacement() if windowed else CapturedPlacement()

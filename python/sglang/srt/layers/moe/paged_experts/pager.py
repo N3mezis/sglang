@@ -27,6 +27,61 @@ from sglang.srt.layers.moe.paged_experts.store import ExpertStore, make_expert_s
 logger = logging.getLogger(__name__)
 
 
+# --- Replay-twice registry (captured pinned-window fallback) -------------------------------------------
+# Each windowed layer registers its pager here and gets a slot in a shared device miss-vector. After a
+# captured decode replay, the post-replay hook polls the whole vector in ONE D2H: if every layer hit its
+# window (count 0) the token is correct and we stop; otherwise each missed layer stages its deferred cold
+# experts into their GPU slots out-of-graph and we replay the SAME graph again (the residency maps it reads
+# are fixed-address, so the next replay sees them resident). Converges in ~1 extra replay.
+_REPLAY_PAGERS: list = []
+_MISS_VEC: Optional[torch.Tensor] = None  # [N] int32; slot i = layer i's window-miss count this replay
+_MISS_VEC_N: int = 0
+_REPLAY_HOOK_INSTALLED = False
+
+
+def _alloc_miss_slot(device) -> tuple:
+    """Reserve this layer's slot in the shared miss-vector; returns (index, the [1] view decide writes)."""
+    global _MISS_VEC, _MISS_VEC_N
+    if _MISS_VEC is None:
+        _MISS_VEC = torch.zeros(512, dtype=torch.int32, device=device)
+    idx = _MISS_VEC_N
+    _MISS_VEC_N += 1
+    return idx, _MISS_VEC[idx : idx + 1]
+
+
+def _post_replay_refill_all() -> bool:
+    """Post-replay hook (registered with the cuda-graph backend). One scalar D2H over the shared miss-vector
+    short-circuits the no-miss case; only an actual miss-step pays the per-layer count read + staging."""
+    if _MISS_VEC is None or _MISS_VEC_N == 0:
+        return False
+    total = int(_MISS_VEC[:_MISS_VEC_N].sum().item())  # one sync; no-miss steps stop here
+    if total == 0:
+        return False
+    counts = _MISS_VEC[:_MISS_VEC_N].tolist()
+    staged = False
+    for p in _REPLAY_PAGERS:
+        cn = counts[p._miss_idx]
+        if cn > 0 and p._refill_after_replay(cn):
+            staged = True
+    if staged:
+        torch.cuda.synchronize()  # one device sync for all layers' staging, then replay again
+        return True
+    return False
+
+
+def _register_replay_pager(p: "PagedExpertStore") -> None:
+    global _REPLAY_HOOK_INSTALLED
+    if p not in _REPLAY_PAGERS:
+        _REPLAY_PAGERS.append(p)
+    if not _REPLAY_HOOK_INSTALLED:
+        from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+            set_post_replay_hook,
+        )
+
+        set_post_replay_hook(_post_replay_refill_all)
+        _REPLAY_HOOK_INSTALLED = True
+
+
 class PagedExpertStore:
     """Per-step residency decision over the K-slot pool; delegates backing + page-in to an ``ExpertStore``
     and the eviction choice to a ``ResidencyPolicy``.
@@ -71,6 +126,13 @@ class PagedExpertStore:
         self._slot_expert_d = self._slot_lastuse_d = self._freq_d = None
         self._step_ctr_d = self._src_d = self._dst_d = self._n_out_d = None
         self._topk_i32 = None
+        # Windowed (bounded) captured path — set up by setup_ondevice when the store is a WindowedExpertStore:
+        # static hot/cold membership maps the decide_bounded kernel reads, the cold (deferred-miss) plan
+        # buffers, the needed[] mask, and this layer's slot in the shared replay-twice miss-vector.
+        self._windowed = False
+        self._log2hot_d = self._log2cold_d = None
+        self._cold_log_d = self._cold_dst_d = self._needed_d = self._cold_n_d = None
+        self._miss_idx = -1
 
     # --- backing delegated to the store (exposed on the pager for the fill code + back-compat) ---
     @property
@@ -142,13 +204,17 @@ class PagedExpertStore:
         from sglang.jit_kernel.paged_experts_decide import paged_experts_host_devptr
 
         assert self.pin_host, "on-device gather needs a pinned store (UVA)"
+        # Windowed store (>pin-ceiling fallback): only the hot window is pinned/UVA-gatherable — the gather
+        # reads host_hot; cold experts are staged out-of-graph by the replay-twice refill.
+        windowed = hasattr(self.store, "host_hot")
         for name, sz in self.item_bytes.items():
             if sz % 16 != 0:
                 raise RuntimeError(
                     f"[paged-experts] on-device gather needs 16-byte-aligned per-expert blocks; "
                     f"{name!r} is {sz} B. Use --disable-cuda-graph (eager transfer_kv path)."
                 )
-            self.store_devptr[name] = paged_experts_host_devptr(self.host[name])
+            src = self.store.host_hot[name] if windowed else self.host[name]
+            self.store_devptr[name] = paged_experts_host_devptr(src)
 
         dev = self.device
         i32 = torch.int32
@@ -161,6 +227,23 @@ class PagedExpertStore:
         self._n_out_d = torch.zeros(1, dtype=i32, device=dev)
         # expert_slot and idx are the same buffer the forward remap reads (logical_to_gpu_index_cuda).
         self.ondevice = True
+        if windowed:
+            self._setup_window_ondevice()
+
+    def _setup_window_ondevice(self) -> None:
+        """Device state for the captured windowed (bounded) path: the static hot/cold membership maps the
+        decide_bounded kernel reads, the deferred-cold plan buffers + needed[] mask, and this layer's slot
+        in the shared replay-twice miss-vector (registers the post-replay hook on first call)."""
+        dev, i32 = self.device, torch.int32
+        self._windowed = True
+        # log2hot[e] = hot-block index (or -1 if cold); log2cold[e] = cold-block index (or -1 if hot).
+        self._log2hot_d = self.store.hot_pos.to(dtype=i32, device=dev)
+        self._log2cold_d = self.store.cold_pos.to(dtype=i32, device=dev)
+        self._cold_log_d = torch.zeros(self.K, dtype=i32, device=dev)
+        self._cold_dst_d = torch.zeros(self.K, dtype=i32, device=dev)
+        self._needed_d = torch.zeros(self.K, dtype=i32, device=dev)
+        self._miss_idx, self._cold_n_d = _alloc_miss_slot(dev)
+        _register_replay_pager(self)
 
     def _prep_topk_ondevice(self, topk_ids: torch.Tensor) -> None:
         """Copy the router's topk ids into the persistent int32 buffer the kernels read (casts int64 ->
@@ -212,6 +295,68 @@ class PagedExpertStore:
             l2g,
         )
         self._gather_planned_ondevice()
+
+    def decide_and_page_bounded_ondevice(self, topk_ids: torch.Tensor) -> None:
+        """Capture-safe windowed keep-warm (the >pin-ceiling fallback). ``decide_bounded`` splits the plan by
+        window membership: window hits gather in-graph from the pinned ``host_hot`` (capture-safe); cold
+        (window-missing) experts are deferred — their logical ids land in ``_cold_log_d`` and they stay
+        masked this replay — for the post-replay refill to stage and converge. Requires distinct active <= K.
+        """
+        from sglang.jit_kernel.paged_experts_decide import paged_experts_decide_bounded
+
+        self._prep_topk_ondevice(topk_ids)
+        l2g = self.logical_to_gpu_index_cuda  # serves as both expert_slot and idx
+        paged_experts_decide_bounded(
+            self._topk_i32,
+            self._step_ctr_d,
+            self._slot_expert_d,
+            l2g,
+            self._slot_lastuse_d,
+            self._freq_d,
+            False,  # LRU
+            True,  # defer_cold: replay-twice (pageable-RAM cold tier, not gatherable in-graph)
+            self._log2hot_d,
+            self._log2cold_d,
+            self._src_d,
+            self._dst_d,
+            self._n_out_d,
+            self._cold_log_d,
+            self._cold_dst_d,
+            self._cold_n_d,
+            l2g,
+            self._needed_d,
+        )
+        self._gather_planned_ondevice()  # window hits only; cold misses deferred to _refill_after_replay
+
+    def _refill_after_replay(self, cn: int) -> bool:
+        """Post-replay (out-of-graph): stage the ``cn`` deferred cold experts ``host_cold`` -> their GPU
+        slots and mark them resident, so the next replay's ``decide_bounded`` sees them as hits and the loop
+        converges (typically one extra replay). Evicts only slots NOT needed this step (the ``needed[]`` mask
+        decide emits), so a still-needed expert is never displaced. Eager copies; the hook syncs once for all
+        layers before replaying again."""
+        missed = self._cold_log_d[:cn].tolist()  # logical ids (defer mode emits logical ids)
+        needed = self._needed_d.tolist()
+        evictable = [s for s in range(self.K) if not needed[s]]
+        if len(evictable) < cn:
+            logger.error(
+                "[paged-experts] replay-twice: %d cold misses but only %d evictable slots (K=%d) — "
+                "keep-warm invariant (distinct <= K) broken",
+                cn,
+                len(evictable),
+                self.K,
+            )
+            return False
+        l2g = self.logical_to_gpu_index_cuda
+        se = self._slot_expert_d.tolist()
+        for e, slot in zip(missed, evictable):
+            old = se[slot]
+            for name, gpu_param in self.gpu.items():  # eager stage host_cold -> GPU slot (out of graph)
+                gpu_param.data[slot].copy_(self.store.row(name, e), non_blocking=True)
+            if old >= 0:  # update device residency so replay-2's decide sees e resident in `slot`
+                l2g[old] = -1
+            self._slot_expert_d[slot] = e
+            l2g[e] = slot
+        return True
 
     def decide_and_page_wave_ondevice(self, topk_ids: torch.Tensor, wave: int) -> None:
         """One static wave (distinct > K, e.g. prefill): plan + gather the in-wave experts on-device. The
