@@ -19,6 +19,10 @@ def _sa(**overrides):
         moe_a2a_backend="none",
         enable_eplb=False,
         load_format="auto",
+        paged_experts_store="pinned",
+        paged_experts_window_size="0",
+        paged_experts_cold_backing="ram",
+        paged_experts_window_profile=0,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -42,6 +46,27 @@ class TestPagedExpertsGuard(CustomTestCase):
             with self.assertRaises(RuntimeError) as cm:
                 check_paged_experts_compat(_sa(**overrides))
             self.assertIn(fragment, str(cm.exception))
+
+    def test_rejects_incoherent_window_config(self):
+        # window options that would be silently ignored are rejected with an actionable message
+        for overrides, fragment in [
+            (dict(paged_experts_window_size="32", paged_experts_store="paged"), "window-size"),
+            (dict(paged_experts_cold_backing="disk"), "cold-backing"),  # window-size defaults to 0
+            (dict(paged_experts_window_profile=100), "window-profile"),  # window-size defaults to 0
+        ]:
+            with self.assertRaises(RuntimeError) as cm:
+                check_paged_experts_compat(_sa(**overrides))
+            self.assertIn(fragment, str(cm.exception))
+
+    def test_valid_window_config_passes(self):
+        # a windowed + disk + profile config on the pinned store is coherent
+        check_paged_experts_compat(
+            _sa(
+                paged_experts_window_size="32",
+                paged_experts_cold_backing="disk",
+                paged_experts_window_profile=100,
+            )
+        )  # must not raise
 
     def test_aggregates_multiple_problems(self):
         with self.assertRaises(RuntimeError) as cm:

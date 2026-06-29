@@ -59,6 +59,33 @@ host to GPU each step — which shapes its performance profile (see [Performance
   brief gaps and tends to win when expert routing is skewed. The choice trades nothing but hit rate, so
   it is workload-dependent; `lru` is a safe default.
 
+The next three parameters are the **pinned-window fallback** — they let Paged Experts serve (and capture)
+stores too large to fully page-lock, up to stores larger than host RAM. See
+[Pinned-window fallback](#pinned-window-fallback-for-un-pinnable-and-larger-than-ram-stores).
+
+- **`--paged-experts-window-size {0,N,auto}`**: For `--paged-experts-store pinned`, how much of the store
+  to page-lock. `0` (default) page-locks every expert — today's behaviour, which requires the whole store
+  to fit the host's page-lock ceiling. An integer `N` page-locks only the `W = N` **hot** experts (a
+  pinned *window*) and keeps the `E - W` **cold** experts in a cheaper tier, so a store that exceeds the
+  page-lock ceiling can still be served — and, under CUDA graphs, captured. (`auto` greedy-pin-until-fail
+  is not yet wired; use an explicit `N`.)
+
+- **`--paged-experts-cold-backing {ram,disk}`**: Where the windowed cold tail lives. `ram` (default) keeps
+  it in pageable host RAM, so the *whole* store must still fit RAM. `disk` memory-maps it to a file
+  (page-cache-bounded), so the store may **exceed host RAM** — a model bigger than memory still serves,
+  with cold misses read from disk on demand. Pair with `--paged-experts-cold-dir` pointing at real disk.
+
+- **`--paged-experts-cold-dir DIR`**: Directory for the `disk` cold tier. Must be a real disk with room for
+  the cold tail (**not** a tmpfs such as `/tmp`, which would put it back in RAM). Empty (default) uses the
+  system temp dir. The backing file is unlinked immediately, so nothing is left behind on shutdown.
+
+- **`--paged-experts-window-profile N`**: Freq-ranked window. With a window set and CUDA graphs on, profile
+  the first `N` decode tokens (the on-device decision already counts per-expert routing), then once re-pin
+  each layer's **hottest** `W` experts so the cold tail is the *least*-routed experts. `0` (default) keeps
+  the static `[0, W)` window. This makes cold misses rare and is most impactful when a miss is expensive
+  (the `disk` cold tier), where it cuts disk reads substantially; on a RAM cold tier its copies are cheap,
+  so the gain is small. A few hundred tokens of profiling is plenty.
+
 The following standard arguments interact with Paged Experts and are worth setting deliberately:
 
 - **`--disable-cuda-graph`**: Currently required (the per-step paging decision is not CUDA-graph
@@ -105,6 +132,41 @@ Tuning guidance:
   need has the same effect.
 - A larger resident fraction `K/E` reduces the number of page-ins per step, so prefer the largest `K` that
   fits within your latency and KV budget.
+
+## Pinned-window fallback (for un-pinnable and larger-than-RAM stores)
+
+The default store page-locks all `E` experts, so it requires the whole expert table to fit the host's
+page-lock ceiling (under WSL, roughly half of system RAM). The **pinned-window fallback** lifts that limit
+in two steps, forming a memory ladder:
+
+| store fits… | configuration | cold tier |
+|---|---|---|
+| the page-lock ceiling | `--paged-experts-window-size 0` (default) | — (all pinned) |
+| host RAM, but not the pin ceiling | `--paged-experts-window-size W` | pageable RAM |
+| **larger than host RAM** | `--paged-experts-window-size W --paged-experts-cold-backing disk` | disk (mmap) |
+
+With a window of `W < E`, the `W` hot experts are page-locked (`host_hot`) and the `E - W` cold experts
+live in the cheaper tier (`host_cold`). The page-in splits by membership: a needed expert in the window is
+gathered the fast way; a cold one is staged from its tier.
+
+**Why the window matters with CUDA graphs.** The captured decode gathers experts on-device from a
+fixed-address, page-locked source — which the pinned window is, but a pageable/disk cold tier is not. So a
+cold miss cannot be served inside the graph. Paged Experts handles this with **replay-twice**: the captured
+`decide` records cold misses to a device miss-vector and leaves them masked for that replay; a post-replay
+hook (out of graph) stages the missed experts into their slots and replays the *same* graph again, until no
+miss remains (typically one extra replay). The captured region is forward-only — KV writes and sampling
+live outside it — so the discarded first replay cannot corrupt state. This decouples the *capturable* model
+size from the page-lockable size: with `--paged-experts-cold-backing disk` a model **larger than host RAM**
+serves, captured and coherent, with cold misses faulting from disk.
+
+**Freq-ranked window.** The window's value depends on the cold tail being *rarely routed*. The static
+window pins experts `[0, W)`; `--paged-experts-window-profile N` instead profiles the first `N` tokens and
+re-pins each layer's hottest `W`, so the cold tail becomes the least-routed experts and cold misses become
+rare. This matters most for the `disk` cold tier, where each avoided miss saves a disk read.
+
+> **Note.** Cold misses on the `disk` tier are disk-bandwidth-bound, so single-stream throughput on a
+> larger-than-RAM store is modest — the value is the *capability* (serving a model bigger than RAM) and,
+> with a freq-ranked window, keeping the disk-read rate low. Fast local storage (NVMe) is recommended.
 
 ## System Design
 
