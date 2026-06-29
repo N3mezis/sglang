@@ -359,12 +359,9 @@ def _fill_gptq_marlin_from_checkpoint(
     }
     for name in store.gpu:
         t = marlin[name].contiguous().cpu()
-        assert tuple(t.shape) == tuple(store.host[name].shape), (
-            name,
-            t.shape,
-            store.host[name].shape,
-        )
-        store.host[name].copy_(t)
+        expected = (store.E, *store.gpu[name].shape[1:])
+        assert tuple(t.shape) == expected, (name, t.shape, expected)
+        store.fill_tensor(name, t)
 
 
 def _fill_bf16_from_checkpoint(
@@ -376,7 +373,7 @@ def _fill_bf16_from_checkpoint(
     snap = _snapshot_dir(model_path)
     wmap = _weight_map(snap)
     pre = f"model.layers.{layer_idx}.mlp.experts."
-    dt = store.host["w13_weight"].dtype
+    dt = store.gpu["w13_weight"].dtype
     by_shard: Dict[str, list] = {}
     for e in range(store.E):
         for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -386,10 +383,10 @@ def _fill_bf16_from_checkpoint(
             for e, proj in items:
                 t = f.get_tensor(f"{pre}{e}.{proj}.weight").to(dt)
                 if proj == "down_proj":
-                    store.host["w2_weight"][e].copy_(t)
+                    store.row("w2_weight", e).copy_(t)
                     continue
                 # w13 packs gate (first half of dim 0) then up (second half)
-                row = store.host["w13_weight"][e]
+                row = store.row("w13_weight", e)
                 half = row.shape[0] // 2
                 if proj == "gate_proj":
                     row[:half].copy_(t)
@@ -410,6 +407,7 @@ def setup_pager(method, layer) -> PagedExpertStore:
         method.num_resident,
         dev,
         pin_host=getattr(method, "pin_host", True),
+        window_W=getattr(method, "window", 0),
     )
 
     layer_idx = getattr(layer, "layer_id", getattr(layer, "layer_idx", 0))
