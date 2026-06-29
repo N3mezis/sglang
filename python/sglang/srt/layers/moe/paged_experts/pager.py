@@ -611,6 +611,8 @@ def setup_pager(method, layer) -> PagedExpertStore:
         dev,
         pin_host=getattr(method, "pin_host", True),
         window_W=getattr(method, "window", 0),
+        cold_backing=getattr(method, "cold_backing", "ram"),
+        cold_dir=getattr(method, "cold_dir", None),
     )
 
     layer_idx = getattr(layer, "layer_id", getattr(layer, "layer_idx", 0))

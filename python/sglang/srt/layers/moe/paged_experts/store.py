@@ -17,13 +17,42 @@ Future tiers (disk-mmap, compressed) are additional ``ExpertStore`` subclasses â
 
 from __future__ import annotations
 
+import logging
+import math
+import mmap
+import os
+import tempfile
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 # packed-quant scaffolding the fused-MoE kernel never reads on the paged path
 _NONPAGED_SUFFIXES = ("_g_idx", "_g_idx_sort_indices", "_weight_shape")
+
+
+def _alloc_disk_mmap(cold_dir: Optional[str], dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    """A host tensor backed by a MAP_SHARED file on disk (P4 cold tier) â€” RAM use is bounded by the OS page
+    cache (clean pages evict back to the file under pressure), so a store far larger than RAM still loads.
+    The file is unlinked immediately: the inode lives only as long as the mapping (auto-cleaned on free), so
+    no stale multi-GB files are left behind. ``cold_dir`` must be on a real disk with room for the cold tier
+    (NOT a tmpfs like /tmp, which would defeat the point); falls back to the system temp dir."""
+    n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
+    d = cold_dir or tempfile.gettempdir()
+    os.makedirs(d, exist_ok=True)
+    fd, path = tempfile.mkstemp(dir=d, suffix=".paged_experts_cold")
+    try:
+        os.ftruncate(fd, n_bytes)
+        os.unlink(path)  # anonymous-on-disk: the inode persists while mmap'd, freed on munmap
+        mm = mmap.mmap(
+            fd, n_bytes, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE
+        )
+    finally:
+        os.close(fd)  # the mapping keeps the inode alive after the fd is closed
+    # torch.frombuffer keeps mm alive inside the tensor storage (munmap fires when the tensor is freed)
+    return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
 
 
 def discover_paged_params(layer, num_slots: int) -> Dict[str, torch.Tensor]:
@@ -154,23 +183,38 @@ class WindowedExpertStore(ExpertStore):
     pinned = True  # the hot window is page-locked; the cold tail is pageable by design
 
     def __init__(
-        self, layer, num_experts_E: int, num_resident_K: int, device, *, window_W: int
+        self,
+        layer,
+        num_experts_E: int,
+        num_resident_K: int,
+        device,
+        *,
+        window_W: int,
+        cold_backing: str = "ram",
+        cold_dir: Optional[str] = None,
     ):
         self.E = num_experts_E
         self.K = num_resident_K
         self.device = device
         self.W = max(0, min(int(window_W), num_experts_E))
+        self.cold_backing = cold_backing  # "ram" (pageable) | "disk" (mmap'd file, page-cache-bounded)
         self.gpu = discover_paged_params(layer, num_resident_K)
         assert self.gpu, "no per-expert params found on layer"
         self.host_hot: Dict[str, torch.Tensor] = {}  # [W, *shape] PINNED (transfer_kv / UVA gather)
-        self.host_cold: Dict[str, torch.Tensor] = {}  # [E-W, *shape] PAGEABLE (indexed copy / staged)
+        self.host_cold: Dict[str, torch.Tensor] = {}  # [E-W, *shape] cold tier (RAM pageable | disk mmap)
         self.item_bytes: Dict[str, int] = {}
+        on_disk = cold_backing == "disk"
         for name, p in self.gpu.items():
             self.host_hot[name] = torch.empty(
                 (self.W, *p.shape[1:]), dtype=p.dtype, device="cpu", pin_memory=True
             )
-            self.host_cold[name] = torch.empty(
-                (self.E - self.W, *p.shape[1:]), dtype=p.dtype, device="cpu", pin_memory=False
+            cold_dims = (self.E - self.W, *p.shape[1:])
+            # disk: a >RAM cold tier mmap'd to a file (page-cache-bounded) so the store can exceed RAM;
+            # ram: a plain pageable tensor (the cold tier must fit RAM).
+            self.host_cold[name] = (
+                _alloc_disk_mmap(cold_dir, cold_dims, p.dtype)
+                if on_disk
+                else torch.empty(cold_dims, dtype=p.dtype, device="cpu", pin_memory=False)
             )
             self.item_bytes[name] = p[0].numel() * p.element_size()
             # the hot tier feeds transfer_kv -> same 8-byte alignment requirement as the pinned store
@@ -276,13 +320,22 @@ def make_expert_store(
     *,
     pin_host: bool,
     window_W: int = 0,
+    cold_backing: str = "ram",
+    cold_dir: Optional[str] = None,
 ) -> ExpertStore:
     """Build the host expert store. ``window_W > 0`` and ``< E`` (with ``pin_host``) selects the windowed
-    fallback (pinned hot window + pageable cold tail) for stores that exceed the page-lock ceiling; else
-    pinned (fast ``transfer_kv``) or pageable (plain indexed copy)."""
+    fallback (pinned hot window + cold tail) for stores that exceed the page-lock ceiling; else pinned (fast
+    ``transfer_kv``) or pageable (plain indexed copy). ``cold_backing='disk'`` mmaps the windowed cold tier
+    to a file (page-cache-bounded) so the store may exceed RAM (P4)."""
     if pin_host and 0 < window_W < num_experts_E:
         return WindowedExpertStore(
-            layer, num_experts_E, num_resident_K, device, window_W=window_W
+            layer,
+            num_experts_E,
+            num_resident_K,
+            device,
+            window_W=window_W,
+            cold_backing=cold_backing,
+            cold_dir=cold_dir,
         )
     cls = PinnedExpertStore if pin_host else PageableExpertStore
     return cls(layer, num_experts_E, num_resident_K, device)

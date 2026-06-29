@@ -13,7 +13,7 @@ lazily so this module loads without them). K sizing is ``sizing.compute_num_resi
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -130,6 +130,8 @@ def _make_method_class():
             use_ondevice: bool = False,
             eviction: str = "lru",
             window: int = 0,
+            cold_backing: str = "ram",
+            cold_dir: Optional[str] = None,
         ):
             self.base_method = base_method
             self.E = num_experts_E
@@ -139,6 +141,10 @@ def _make_method_class():
             # Pinned-window fallback: 0 = full pin (every expert page-locked); 0 < window < E pins only the
             # W hot experts and keeps the E-W cold tail pageable, for stores past the page-lock ceiling.
             self.window = window
+            # Windowed cold-tier backing: "ram" (pageable, must fit RAM) | "disk" (mmap'd file, P4 — lets
+            # the store exceed RAM). cold_dir is the disk location for the "disk" tier.
+            self.cold_backing = cold_backing
+            self.cold_dir = cold_dir
             # Decode placement: captured (on-device decide + UVA gather, needs a pinned store) when CUDA
             # graphs are on, else eager host; the captured variant is windowed (replay-twice) when a window
             # is set. The bool + window resolve to a Placement strategy (placement.py).
@@ -231,6 +237,8 @@ def make_for_layer(
     window = _resolve_window_size(
         getattr(server_args, "paged_experts_window_size", "0"), E, pin_host=bool(pin_host)
     )
+    cold_backing = getattr(server_args, "paged_experts_cold_backing", "ram")
+    cold_dir = getattr(server_args, "paged_experts_cold_dir", "") or None
     return _make_method_class()(
         base_method,
         E,
@@ -239,6 +247,8 @@ def make_for_layer(
         use_ondevice=use_ondevice,
         eviction=eviction,
         window=window,
+        cold_backing=cold_backing,
+        cold_dir=cold_dir,
     )
 
 
