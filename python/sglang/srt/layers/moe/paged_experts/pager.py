@@ -38,6 +38,40 @@ _MISS_VEC: Optional[torch.Tensor] = None  # [N] int32; slot i = layer i's window
 _MISS_VEC_N: int = 0
 _REPLAY_HOOK_INSTALLED = False
 
+# P3 freq-ranked window: profile the first N decode tokens (decide_bounded accumulates per-expert use counts
+# on-device), then re-pin the hottest W experts per layer once, out-of-graph. 0 = off (static [0,W) window).
+_PROFILE_TOKENS: int = 0
+_profile_count: int = 0
+_profile_done: bool = False
+
+
+def set_window_profile_tokens(n: int) -> None:
+    """Set the freq-ranked-window profiling horizon (``--paged-experts-window-profile``); 0 disables it."""
+    global _PROFILE_TOKENS
+    _PROFILE_TOKENS = max(0, int(n))
+
+
+def _maybe_profile_refresh() -> None:
+    """Called once per decode token (at replay convergence, out-of-graph). After the profiling horizon,
+    re-pin every windowed layer's hottest W experts once."""
+    global _profile_count, _profile_done
+    if _profile_done or _PROFILE_TOKENS <= 0 or not _REPLAY_PAGERS:
+        return
+    _profile_count += 1
+    if _profile_count < _PROFILE_TOKENS:
+        return
+    for p in _REPLAY_PAGERS:
+        try:
+            p.refresh_window_freq()
+        except Exception as e:
+            logger.error("[paged-experts] freq-window refresh failed: %s", e)
+    _profile_done = True
+    logger.info(
+        "[paged-experts] freq-ranked window: re-pinned hottest W on %d layer(s) after %d tokens",
+        len(_REPLAY_PAGERS),
+        _profile_count,
+    )
+
 
 def _alloc_miss_slot(device) -> tuple:
     """Reserve this layer's slot in the shared miss-vector; returns (index, the [1] view decide writes)."""
@@ -56,6 +90,7 @@ def _post_replay_refill_all() -> bool:
         return False
     total = int(_MISS_VEC[:_MISS_VEC_N].sum().item())  # one sync; no-miss steps stop here
     if total == 0:
+        _maybe_profile_refresh()  # token converged (no misses) -> count it toward the profiling horizon
         return False
     counts = _MISS_VEC[:_MISS_VEC_N].tolist()
     staged = False
@@ -66,6 +101,7 @@ def _post_replay_refill_all() -> bool:
     if staged:
         torch.cuda.synchronize()  # one device sync for all layers' staging, then replay again
         return True
+    _maybe_profile_refresh()  # token converged after staging -> count it toward the profiling horizon
     return False
 
 
@@ -244,6 +280,12 @@ class PagedExpertStore:
         self._needed_d = torch.zeros(self.K, dtype=i32, device=dev)
         self._miss_idx, self._cold_n_d = _alloc_miss_slot(dev)
         _register_replay_pager(self)
+        # P3: arm freq-ranked-window profiling from --paged-experts-window-profile (0 = static window).
+        from sglang.srt.server_args import get_global_server_args
+
+        set_window_profile_tokens(
+            int(getattr(get_global_server_args(), "paged_experts_window_profile", 0) or 0)
+        )
 
     def _prep_topk_ondevice(self, topk_ids: torch.Tensor) -> None:
         """Copy the router's topk ids into the persistent int32 buffer the kernels read (casts int64 ->
@@ -357,6 +399,22 @@ class PagedExpertStore:
             self._slot_expert_d[slot] = e
             l2g[e] = slot
         return True
+
+    def refresh_window_freq(self) -> None:
+        """P3 freq-ranked window: re-pin the hottest W experts (by the on-device use counts ``decide_bounded``
+        accumulated during profiling) so the cold tail is the *least*-routed experts -> window-misses become
+        rare -> few replay-twice rounds. Runs once, out-of-graph, between tokens; refreshes the membership
+        maps in place (fixed address -> the captured graph reads the new split on its next replay). The GPU
+        slots keep their expert-indexed data, so only the page-in source tier moves (no residency reset)."""
+        if not self._windowed:
+            return
+        freq = self._freq_d.tolist()  # per-expert routing count over the profiling window (one-time D2H)
+        hot = sorted(range(self.E), key=lambda e: freq[e], reverse=True)[: self.store.W]
+        self.store.set_window_membership(hot)
+        # refresh the device membership maps IN PLACE (same buffers the captured decide_bounded reads)
+        self._log2hot_d.copy_(self.store.hot_pos.to(dtype=torch.int32, device=self.device))
+        self._log2cold_d.copy_(self.store.cold_pos.to(dtype=torch.int32, device=self.device))
+        self._freq_d.zero_()
 
     def decide_and_page_wave_ondevice(self, topk_ids: torch.Tensor, wave: int) -> None:
         """One static wave (distinct > K, e.g. prefill): plan + gather the in-wave experts on-device. The

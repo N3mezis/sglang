@@ -204,6 +204,39 @@ class WindowedExpertStore(ExpertStore):
         self.host_hot[name].copy_(full[: self.W])
         self.host_cold[name].copy_(full[self.W :])
 
+    def set_window_membership(self, hot_experts) -> None:
+        """Re-pin the window to hold ``hot_experts`` (the top-W by routing frequency) instead of the static
+        ``[0, W)`` — the P3 freq-ranked window. Permutes the host_hot/host_cold contents and rebuilds
+        ``hot_pos``/``cold_pos`` so the cold tail becomes the *least*-routed experts (rare window-misses ->
+        few replay-twice rounds). Runs once, out-of-graph, after a short profiling period; the GPU slots
+        keep their (expert-indexed) data unchanged, so only the page-in *source* tier moves."""
+        hot = list(hot_experts)[: self.W]
+        assert len(set(hot)) == len(hot), "hot set has duplicates"
+        hot_set = set(int(e) for e in hot)
+        cold = [e for e in range(self.E) if e not in hot_set]
+        new_hot_pos = torch.full((self.E,), -1, dtype=torch.int64)
+        new_cold_pos = torch.full((self.E,), -1, dtype=torch.int64)
+        for i, e in enumerate(hot):
+            new_hot_pos[int(e)] = i
+        for i, e in enumerate(cold):
+            new_cold_pos[e] = i
+        for name in self.gpu:
+            # Gather every expert's current data (via the OLD maps), then re-split into the new tiers. The
+            # transient [E,*] buffer is one layer's experts — freed after; only paid once at the refresh.
+            full = torch.empty(
+                (self.E, *self.host_hot[name].shape[1:]),
+                dtype=self.host_hot[name].dtype,
+                device="cpu",
+            )
+            for e in range(self.E):
+                full[e].copy_(self.row(name, e))
+            for i, e in enumerate(hot):
+                self.host_hot[name][i].copy_(full[int(e)])
+            for i, e in enumerate(cold):
+                self.host_cold[name][i].copy_(full[e])
+        self.hot_pos = new_hot_pos
+        self.cold_pos = new_cold_pos
+
     def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
         if src_experts.numel() == 0:
             return

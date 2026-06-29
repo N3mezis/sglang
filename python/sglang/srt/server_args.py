@@ -1826,6 +1826,13 @@ class ServerArgs:
         "(e.g. an unquantized model on a small-RAM box, or WSL where the page-locked pool is ~half RAM). "
         "'auto' (greedy-pin-until-fail) is not yet wired.",
     ] = "0"
+    paged_experts_window_profile: A[
+        int,
+        "Freq-ranked window (with --paged-experts-window-size W, captured): profile the first N decode "
+        "tokens, then re-pin the hottest W experts per layer once so the pageable cold tail is the "
+        "least-routed experts — making captured window-misses (and their replay-twice rounds) rare. "
+        "0 (default) keeps the static [0, W) window. A few hundred tokens is plenty.",
+    ] = 0
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn
