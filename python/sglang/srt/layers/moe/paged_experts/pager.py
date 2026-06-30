@@ -76,15 +76,35 @@ def _maybe_profile_refresh() -> None:
 _BCG_HOOK_INSTALLED = False
 
 
+def _bcg_prefetch_next_step() -> None:
+    """Temporal cold-tier prefetch, fired at the step boundary. Each windowed layer recorded the cold experts
+    it missed THIS step (``_last_cold_ids``); decode routing is temporally stable, so the NEXT step will miss
+    ≈ the same set. Issue one deep MADV_WILLNEED batch across ALL layers' misses now, so the kernel reads the
+    whole token's cold working set in parallel (high queue depth -> near disk bandwidth) overlapping the next
+    step's compute — instead of the ~0.5 thinly-spread faults per layer at warm steady state, which can't
+    build a queue and run at random-read latency. No-op for the RAM cold tier / non-disk stores."""
+    for p in _REPLAY_PAGERS:
+        ids = getattr(p, "_last_cold_ids", None)
+        if not ids:
+            continue
+        store = getattr(p, "store", None)
+        if store is not None and hasattr(store, "prefetch_cold"):
+            store.prefetch_cold(ids)
+
+
 def _bcg_post_step() -> None:
-    """BCG freq-window driver, fired once per decode step at the breakable backend's post-replay boundary
-    (after the full forward + all eager breaks complete, before the next step). This is the ONLY safe place
-    to re-pin: ``refresh_window_freq`` -> ``set_window_membership`` rewrites the pinned ``host_hot`` store in
-    place, and that store is read by the captured UVA gather. Doing it mid-step (e.g. at a layer's break)
-    races the in-flight gathers of the later layers and corrupts their output. Here no captured gather is in
-    flight; we still synchronize first so the step's async gathers are done before host_hot is permuted."""
+    """BCG per-step boundary callback, fired once after the full forward + all eager breaks complete and
+    before the next step. Does two things, in this order:
+
+    1. Temporal prefetch (every step): kick async read-ahead of the next step's likely cold working set.
+    2. Freq-window re-pin (until the horizon): this is the ONLY safe place to re-pin — ``refresh_window_freq``
+       -> ``set_window_membership`` rewrites the pinned ``host_hot`` store in place, which the captured UVA
+       gather reads. Mid-step (at a layer's break) it would race the later layers' in-flight gathers and
+       corrupt output. Here no captured gather is in flight; we synchronize first so the step's async gathers
+       finish before host_hot is permuted."""
+    _bcg_prefetch_next_step()  # every step, async — overlaps the next step's compute
     if _profile_done or _PROFILE_TOKENS <= 0:
-        return  # nothing left to do once re-pinned (no per-step cost after the horizon)
+        return  # re-pin already done (or disabled); prefetch above is the only per-step work
     torch.cuda.synchronize()  # the step's captured gathers must finish before host_hot is rewritten
     _maybe_profile_refresh()
 
@@ -414,14 +434,18 @@ class PagedExpertStore:
         but inline (one D2H for the count, plus the staging copies)."""
         cn = int(self._cold_n_d.item())
         if cn > 0:
+            cold_ids = self._cold_log_d[:cn].tolist()
+            self._last_cold_ids = cold_ids  # recorded for the next-step temporal prefetch (see _bcg_post_step)
             self._refill_after_replay(
                 cn,
-                self._cold_log_d[:cn].tolist(),
+                cold_ids,
                 self._needed_d.tolist(),
                 self._slot_expert_d.tolist(),
             )
+        else:
+            self._last_cold_ids = []
         # Freq-window driver: install the per-step boundary hook on the breakable backend on first use. The
-        # actual re-pin runs there (between steps), NOT here mid-step — see _bcg_post_step.
+        # actual re-pin + the temporal prefetch run there (between steps), NOT here mid-step — see _bcg_post_step.
         _ensure_bcg_post_step_hook()
 
     def _refill_after_replay(self, cn: int, cold_log, needed, se) -> bool:
