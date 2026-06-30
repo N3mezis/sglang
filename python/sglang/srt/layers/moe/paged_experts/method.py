@@ -13,11 +13,12 @@ lazily so this module loads without them). K sizing is ``sizing.compute_num_resi
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
 from sglang.srt.layers.moe.paged_experts.guard import check_paged_experts_compat
+from sglang.srt.layers.moe.paged_experts.placement import make_placement
 from sglang.srt.layers.moe.paged_experts.sizing import (
     compute_num_resident_experts,
     kv_reserve_bytes_mha,
@@ -126,8 +127,11 @@ def _make_method_class():
             num_experts_E: int,
             num_resident_K: int,
             pin_host: bool = True,
+            use_ondevice: bool = False,
             eviction: str = "lru",
             window: int = 0,
+            cold_backing: str = "ram",
+            cold_dir: Optional[str] = None,
         ):
             self.base_method = base_method
             self.E = num_experts_E
@@ -137,6 +141,15 @@ def _make_method_class():
             # Pinned-window fallback: 0 = full pin (every expert page-locked); 0 < window < E pins only the
             # W hot experts and keeps the E-W cold tail pageable, for stores past the page-lock ceiling.
             self.window = window
+            # Windowed cold-tier backing: "ram" (pageable, must fit RAM) | "disk" (mmap'd file, P4 — lets
+            # the store exceed RAM). cold_dir is the disk location for the "disk" tier.
+            self.cold_backing = cold_backing
+            self.cold_dir = cold_dir
+            # Decode placement: captured (on-device decide + UVA gather, needs a pinned store) when CUDA
+            # graphs are on, else eager host; the captured variant is windowed (replay-twice) when a window
+            # is set. The bool + window resolve to a Placement strategy (placement.py).
+            self.use_ondevice = use_ondevice and pin_host
+            self._placement = make_placement(self.use_ondevice, windowed=window > 0)
             self._pager = None
             # Initial residents = experts 0..K-1 in slots 0..K-1; the pager re-seeds + pages the rest.
             self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
@@ -217,14 +230,27 @@ def make_for_layer(
         K = int(num_resident)
     if pin_host is None:
         pin_host = getattr(server_args, "paged_experts_store", "pinned") != "paged"
+    # Use the on-device (capturable) decode path unless CUDA graphs are disabled. With graphs off it's the
+    # eager kernel-free path (host decide + transfer_kv); with graphs on the decode step is captured.
+    use_ondevice = not bool(getattr(server_args, "disable_cuda_graph", False))
     eviction = getattr(server_args, "paged_experts_eviction", "lru")
     window = _resolve_window_size(
         getattr(server_args, "paged_experts_window_size", "0"),
         E,
         pin_host=bool(pin_host),
     )
+    cold_backing = getattr(server_args, "paged_experts_cold_backing", "ram")
+    cold_dir = getattr(server_args, "paged_experts_cold_dir", "") or None
     return _make_method_class()(
-        base_method, E, K, pin_host=bool(pin_host), eviction=eviction, window=window
+        base_method,
+        E,
+        K,
+        pin_host=bool(pin_host),
+        use_ondevice=use_ondevice,
+        eviction=eviction,
+        window=window,
+        cold_backing=cold_backing,
+        cold_dir=cold_dir,
     )
 
 

@@ -1,7 +1,7 @@
-"""Paged-experts forward (eager).
+"""Paged-experts forward.
 
-Per decode step, the active experts are paged into the K-slot pool and the real fused-MoE GEMM runs over
-it. Two regimes:
+Per step the active experts are paged into the K-slot pool and the real fused-MoE GEMM runs over it, in
+two regimes:
 
 * ``distinct active experts <= K``: keep-warm. Page only the misses (resident experts are reused across
   steps), remap, one GEMM.
@@ -10,8 +10,11 @@ it. Two regimes:
   wave, runs the GEMM, and the per-wave partials are **summed**. Each active expert is in exactly one wave
   and out-of-wave experts are masked to weight 0, so the sum equals the full MoE output (lossless).
 
-Routing stays E-wide; only the table is K. (The captured fast path will replace the host-side decision
-with static-wave masking; same GEMM.)
+*Where* the decision + page-in run — host (eager) or on the GPU inside the captured decode graph — is a
+``Placement`` strategy (``placement.py``); ``paged_apply`` just dispatches to it. The shared building
+blocks (``mask_and_remap_expert_ids``, ``_gemm_hidden``, and the two wave helpers) live here.
+
+Routing stays E-wide; only the table is K.
 """
 
 from __future__ import annotations
@@ -76,29 +79,27 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
     return out
 
 
-def paged_apply(method, layer, dispatch_output):
-    """Orchestrate the page-in + GEMM and wrap the result for the combiner."""
-    from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
+def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
+    """On-device static-wave path (distinct > K, e.g. prefill): ceil(E/K) waves, each planned+gathered
+    on-device, GEMM'd and summed. No host sync. Resyncs the keep-warm state to the last wave so a
+    following decode step is consistent. Lossless (each active expert is served in exactly one wave).
+    """
     pager = method._pager
-    topk_ids = dispatch_output.topk_output.topk_ids
-    distinct = pager.distinct_active(topk_ids)
-
-    if len(distinct) <= pager.K:
-        src, dst = pager.decide_keep_warm(topk_ids, distinct=distinct)
-        pager.page_in(src, dst)
+    nwaves = (pager.E + pager.K - 1) // pager.K
+    out = None
+    for w in range(nwaves):
+        pager.decide_and_page_wave_ondevice(topk_ids, w)
         remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
-        hidden = _gemm_hidden(method, layer, dispatch_output, remap, clone_hidden=False)
-    else:
-        hidden = _wave_apply(method, layer, dispatch_output, topk_ids, distinct)
+        partial = _gemm_hidden(method, layer, dispatch_output, remap, clone_hidden=True)
+        out = partial if out is None else out + partial
+    pager.resync_residency_ondevice(nwaves - 1)
+    return out
 
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(
-            "paged_apply L%s: topk=%s distinct=%d K=%d (%s)",
-            getattr(layer, "layer_id", "?"),
-            tuple(topk_ids.shape),
-            len(distinct),
-            pager.K,
-            "wave" if len(distinct) > pager.K else "keep-warm",
-        )
-    return StandardCombineInput(hidden_states=hidden)
+
+def paged_apply(method, layer, dispatch_output):
+    """Dispatch the step to the method's decode placement (eager host vs captured on-device).
+
+    The placement (``method._placement``) owns the decide + page-in flow; both end in ``_gemm_hidden``
+    over the K-slot pool. See ``placement.py``.
+    """
+    return method._placement.apply(method, layer, dispatch_output)

@@ -30,6 +30,13 @@ def check_paged_experts_compat(server_args: Any) -> None:
     dp = getattr(server_args, "dp_size", 1) or 1
     a2a = getattr(server_args, "moe_a2a_backend", None)
     load_format = str(getattr(server_args, "load_format", "") or "")
+    store = str(getattr(server_args, "paged_experts_store", "pinned") or "pinned")
+    window = str(getattr(server_args, "paged_experts_window_size", "0") or "0")
+    window_on = window not in ("0", "")  # an explicit N (or "auto")
+    cold_backing = str(
+        getattr(server_args, "paged_experts_cold_backing", "ram") or "ram"
+    )
+    profile = int(getattr(server_args, "paged_experts_window_profile", 0) or 0)
 
     problems = []
     if tp > 1:
@@ -68,6 +75,24 @@ def check_paged_experts_compat(server_args: Any) -> None:
         problems.append(
             "--load-format dummy is incompatible: the host expert store reads REAL weights. Use a real "
             "checkpoint."
+        )
+    # Pinned-window fallback coherence: reject configs where a window option would be silently ignored.
+    if window_on and store != "pinned":
+        problems.append(
+            f"--paged-experts-window-size {window} requires --paged-experts-store pinned: the window "
+            "page-locks the hot block, but the 'paged' store pins nothing, so the window would be "
+            "ignored. Use --paged-experts-store pinned, or --paged-experts-window-size 0."
+        )
+    if cold_backing != "ram" and not window_on:
+        problems.append(
+            f"--paged-experts-cold-backing {cold_backing} requires a window "
+            "(--paged-experts-window-size N>0): the cold tier exists only in the windowed store; the "
+            "full-pin store has no cold tail to back. Set a window, or use --paged-experts-cold-backing ram."
+        )
+    if profile > 0 and not window_on:
+        problems.append(
+            f"--paged-experts-window-profile {profile} requires a window "
+            "(--paged-experts-window-size N>0): without a window there is no cold tail to re-rank."
         )
 
     if problems:

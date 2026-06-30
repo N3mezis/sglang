@@ -1834,6 +1834,25 @@ class ServerArgs:
         "(e.g. an unquantized model on a small-RAM box, or WSL where the page-locked pool is ~half RAM). "
         "'auto' (greedy-pin-until-fail) is not yet wired.",
     ] = "0"
+    paged_experts_window_profile: A[
+        int,
+        "Freq-ranked window (with --paged-experts-window-size W, captured): profile the first N decode "
+        "tokens, then re-pin the hottest W experts per layer once so the pageable cold tail is the "
+        "least-routed experts — making captured window-misses (and their replay-twice rounds) rare. "
+        "0 (default) keeps the static [0, W) window. A few hundred tokens is plenty.",
+    ] = 0
+    paged_experts_cold_backing: A[
+        str,
+        "Backing for the windowed cold tail (with --paged-experts-window-size W). 'ram' (default) keeps it "
+        "in pageable host RAM — so the whole store must fit RAM. 'disk' mmaps it to a file (page-cache-"
+        "bounded), letting the store exceed RAM (a model bigger than host memory still serves; cold misses "
+        "read from disk via the replay-twice path). Pair with --paged-experts-cold-dir on a real disk.",
+    ] = "ram"
+    paged_experts_cold_dir: A[
+        str,
+        "Directory for the --paged-experts-cold-backing disk cold tier. Must be a real disk with room for "
+        "the cold tail (NOT a tmpfs like /tmp). Empty (default) uses the system temp dir.",
+    ] = ""
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn

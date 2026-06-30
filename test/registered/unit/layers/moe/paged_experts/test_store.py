@@ -135,6 +135,64 @@ class TestWindowedExpertStore(CustomTestCase):
                 (store.gpu[name].data[2] == 8.0).all().item()
             )  # expert 7 (cold)
 
+    def test_set_window_membership_repins_hottest(self):
+        # P3 freq-ranked window: re-pin an arbitrary hot set; the data must follow each expert (row(e) still
+        # returns expert e's bytes) and the maps must reflect the new hot/cold split.
+        E, K, W, dev = 8, 4, 5, "cuda"
+        store = WindowedExpertStore(_layer(K, dev), E, K, dev, window_W=W)
+        for name in store.gpu:
+            full = torch.stack(
+                [torch.full(store.gpu[name].shape[1:], float(e + 1)) for e in range(E)]
+            )
+            store.fill_tensor(name, full)
+        # pick a hot set that is NOT [0, W): hottest = 7,6,5,4,3 (so 0,1,2 become cold)
+        new_hot = [7, 6, 5, 4, 3]
+        store.set_window_membership(new_hot)
+        for i, e in enumerate(new_hot):
+            self.assertTrue(store.is_hot(e))
+            self.assertEqual(int(store.hot_pos[e]), i)
+        for e in (0, 1, 2):
+            self.assertFalse(store.is_hot(e))
+        # data integrity: every expert's bytes are intact and reachable through the new maps
+        for name in store.gpu:
+            for e in range(E):
+                self.assertTrue((store.row(name, e) == float(e + 1)).all().item())
+
+    def test_disk_cold_backing(self):
+        # P4: the cold tail is mmap'd to a file (not pinned RAM); the hot window stays pinned, and the
+        # fill/row round-trip works the same (writes/reads go through the disk-backed mapping).
+        E, K, W, dev = 8, 4, 5, "cuda"
+        store = WindowedExpertStore(
+            _layer(K, dev), E, K, dev, window_W=W, cold_backing="disk"
+        )
+        for name in store.gpu:
+            self.assertTrue(
+                store.host_hot[name].is_pinned()
+            )  # hot window still page-locked
+            self.assertFalse(
+                store.host_cold[name].is_pinned()
+            )  # cold tail is the disk mmap
+            full = torch.randn((E, *store.gpu[name].shape[1:]))
+            store.fill_tensor(name, full)
+            for e in range(E):
+                self.assertTrue(torch.equal(store.row(name, e).cpu(), full[e]))
+        # the disk store also serves a real page-in (hot + cold), like the RAM path
+        for name in store.gpu:
+            full = torch.stack(
+                [torch.full(store.gpu[name].shape[1:], float(e + 1)) for e in range(E)]
+            )
+            store.fill_tensor(name, full)
+        store.page_in(
+            torch.tensor([1, 6], dtype=torch.int64, device=dev),
+            torch.tensor([0, 3], dtype=torch.int64, device=dev),
+        )
+        torch.cuda.synchronize()
+        for name in store.gpu:
+            self.assertTrue((store.gpu[name].data[0] == 2.0).all().item())  # hot
+            self.assertTrue(
+                (store.gpu[name].data[3] == 7.0).all().item()
+            )  # cold (from disk mmap)
+
 
 if __name__ == "__main__":
     unittest.main()
