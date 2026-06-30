@@ -449,6 +449,11 @@ class PagedExpertStore:
         l2g = self.logical_to_gpu_index_cuda
         slots = evictable[:n]
         ids = list(missed[:n])
+        # Disk cold tier: kick parallel read-ahead for all of this layer's cold rows up front (MADV_WILLNEED),
+        # so the gather below doesn't serialize on one page fault at a time. No-op for the RAM tier.
+        store = getattr(self, "store", None)
+        if store is not None and hasattr(store, "prefetch_cold"):
+            store.prefetch_cold(ids)
         # Batch staging into ONE index_copy_ per tensor (vs n separate copy_ launches): host-gather the cold
         # rows, then a single host->device scatter into the victim slots.
         slots_dev = torch.tensor(slots, dtype=torch.int64, device=self.device)
