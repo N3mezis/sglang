@@ -33,14 +33,15 @@ logger = logging.getLogger(__name__)
 _NONPAGED_SUFFIXES = ("_g_idx", "_g_idx_sort_indices", "_weight_shape")
 
 
-def _alloc_disk_mmap(
-    cold_dir: Optional[str], dims: tuple, dtype: torch.dtype
-) -> torch.Tensor:
+def _alloc_disk_mmap(cold_dir: Optional[str], dims: tuple, dtype: torch.dtype):
     """A host tensor backed by a MAP_SHARED file on disk (P4 cold tier) — RAM use is bounded by the OS page
     cache (clean pages evict back to the file under pressure), so a store far larger than RAM still loads.
     The file is unlinked immediately: the inode lives only as long as the mapping (auto-cleaned on free), so
     no stale multi-GB files are left behind. ``cold_dir`` must be on a real disk with room for the cold tier
     (NOT a tmpfs like /tmp, which would defeat the point); falls back to the system temp dir.
+
+    Returns ``(tensor, mm)`` — the ``mmap`` object is returned too so callers can issue ``madvise`` read-ahead
+    hints (the gather otherwise faults one page at a time, serially; see ``WindowedExpertStore.prefetch_cold``).
     """
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
     d = cold_dir or tempfile.gettempdir()
@@ -57,7 +58,8 @@ def _alloc_disk_mmap(
     finally:
         os.close(fd)  # the mapping keeps the inode alive after the fd is closed
     # torch.frombuffer keeps mm alive inside the tensor storage (munmap fires when the tensor is freed)
-    return torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    t = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
+    return t, mm
 
 
 def discover_paged_params(layer, num_slots: int) -> Dict[str, torch.Tensor]:
@@ -215,6 +217,9 @@ class WindowedExpertStore(ExpertStore):
             {}
         )  # [E-W, *shape] cold tier (RAM pageable | disk mmap)
         self.item_bytes: Dict[str, int] = {}
+        self._cold_mm: Dict[str, "mmap.mmap"] = (
+            {}
+        )  # disk tier mmap objects, for madvise read-ahead hints
         on_disk = cold_backing == "disk"
         for name, p in self.gpu.items():
             self.host_hot[name] = torch.empty(
@@ -223,13 +228,14 @@ class WindowedExpertStore(ExpertStore):
             cold_dims = (self.E - self.W, *p.shape[1:])
             # disk: a >RAM cold tier mmap'd to a file (page-cache-bounded) so the store can exceed RAM;
             # ram: a plain pageable tensor (the cold tier must fit RAM).
-            self.host_cold[name] = (
-                _alloc_disk_mmap(cold_dir, cold_dims, p.dtype)
-                if on_disk
-                else torch.empty(
+            if on_disk:
+                self.host_cold[name], self._cold_mm[name] = _alloc_disk_mmap(
+                    cold_dir, cold_dims, p.dtype
+                )
+            else:
+                self.host_cold[name] = torch.empty(
                     cold_dims, dtype=p.dtype, device="cpu", pin_memory=False
                 )
-            )
             self.item_bytes[name] = p[0].numel() * p.element_size()
             # the hot tier feeds transfer_kv -> same 8-byte alignment requirement as the pinned store
             # (see ExpertStore.__init__). The pageable cold tier has none.
@@ -245,6 +251,29 @@ class WindowedExpertStore(ExpertStore):
         self.cold_pos = torch.full((self.E,), -1, dtype=torch.int64)
         self.hot_pos[: self.W] = torch.arange(self.W, dtype=torch.int64)
         self.cold_pos[self.W :] = torch.arange(self.E - self.W, dtype=torch.int64)
+
+    def prefetch_cold(self, experts) -> None:
+        """Issue MADV_WILLNEED for the disk-mmap rows of ``experts`` so the kernel does parallel async
+        read-ahead (high queue depth) instead of the serial one-page-fault-at-a-time the gather would do.
+        No-op unless the cold tier is disk-backed. madvise needs a page-aligned start, so we round the row
+        offset down to a page and extend the length to cover the row."""
+        if not self._cold_mm:
+            return
+        page = mmap.PAGESIZE
+        for name, mm in self._cold_mm.items():
+            stride = self.item_bytes[name]
+            size = len(mm)
+            for e in experts:
+                cp = int(self.cold_pos[e])
+                if cp < 0:
+                    continue
+                off = cp * stride
+                start = (off // page) * page
+                length = min(off + stride, size) - start
+                try:
+                    mm.madvise(mmap.MADV_WILLNEED, start, length)
+                except (OSError, ValueError):
+                    pass  # best-effort hint; never fatal
 
     def is_hot(self, e: int) -> bool:
         return bool(self.hot_pos[e] >= 0)

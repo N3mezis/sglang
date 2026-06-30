@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Dict, Optional
 
 import torch
@@ -25,6 +26,22 @@ from sglang.srt.layers.moe.paged_experts.policy import (
 from sglang.srt.layers.moe.paged_experts.store import ExpertStore, make_expert_store
 
 logger = logging.getLogger(__name__)
+
+# Env-gated decode profiler (PE_PROFILE=1): accumulate per-token break-path timings to find the warm-regime
+# overhead. Off by default (negligible perf_counter cost when on; zero when off).
+_PROF = {
+    "on": bool(int(os.environ.get("PE_PROFILE", "0") or 0)),
+    "item": 0.0,  # per-layer self._cold_n_d.item() sync stalls (summed over layers, per token)
+    "refill": 0.0,  # staging total (= tolist + gather + h2d + python)
+    "tolist": 0.0,  # _needed_d/_slot_expert_d .tolist() D2H syncs
+    "gather": 0.0,  # host-side torch.stack([row(e)...]) (incl mmap faults)
+    "h2d": 0.0,  # .to(device) + index_copy_ + slots_dev
+    "tok": 0.0,  # wall between post-step calls (≈ one token)
+    "overlap": 0.0,  # Jaccard of a layer's cold-miss set vs its previous token's (temporal predictability)
+    "overlap_n": 0,
+    "n": 0,
+    "last": None,
+}
 
 
 # --- Replay-twice registry (captured pinned-window fallback) -------------------------------------------
@@ -73,6 +90,119 @@ def _maybe_profile_refresh() -> None:
         len(_REPLAY_PAGERS),
         _profile_count,
     )
+
+
+_BCG_HOOK_INSTALLED = False
+
+
+# Shared pinned staging buffer for cold page-in, reused across ALL layers (staging is sequential, so one
+# buffer per (param-name, row-shape) suffices). The cold tier is pageable/disk-mmap, and a .to(device) from
+# pageable memory is silently synchronous + slow (~3 GB/s); gathering the rows into a pinned buffer first
+# makes the H2D ~3x faster. Shared (not per-layer) so it adds ~tens of MB pinned, not GBs — staying under
+# the page-lock ceiling that the window already pushes against.
+_STAGE_PIN: Dict = {}
+
+
+def _stage_pin_buf(name: str, k: int, row_shape, dtype) -> torch.Tensor:
+    key = (name, tuple(row_shape), dtype)
+    buf = _STAGE_PIN.get(key)
+    if buf is None or buf.shape[0] < k:
+        buf = torch.empty((k, *row_shape), dtype=dtype, device="cpu", pin_memory=True)
+        _STAGE_PIN[key] = buf
+    return buf
+
+
+def _bcg_prefetch_next_step() -> None:
+    """Temporal cold-tier prefetch, fired at the step boundary. Each windowed layer recorded the cold experts
+    it missed THIS step (``_last_cold_ids``); decode routing is temporally stable, so the NEXT step will miss
+    ≈ the same set. Issue one deep MADV_WILLNEED batch across ALL layers' misses now, so the kernel reads the
+    whole token's cold working set in parallel (high queue depth -> near disk bandwidth) overlapping the next
+    step's compute — instead of the ~0.5 thinly-spread faults per layer at warm steady state, which can't
+    build a queue and run at random-read latency. No-op for the RAM cold tier / non-disk stores.
+    """
+    for p in _REPLAY_PAGERS:
+        ids = getattr(p, "_last_cold_ids", None)
+        if _PROF["on"]:
+            # Measure temporal predictability: Jaccard(this token's misses, previous token's) per layer.
+            prev = getattr(p, "_prev_cold_ids", None)
+            if ids and prev:
+                a, b = set(ids), set(prev)
+                _PROF["overlap"] += len(a & b) / len(a | b)
+                _PROF["overlap_n"] += 1
+            p._prev_cold_ids = list(ids) if ids else []
+        if not ids:
+            continue
+        store = getattr(p, "store", None)
+        if store is not None and hasattr(store, "prefetch_cold"):
+            store.prefetch_cold(ids)
+
+
+def _bcg_post_step() -> None:
+    """BCG per-step boundary callback, fired once after the full forward + all eager breaks complete and
+    before the next step. Does two things, in this order:
+
+    1. Temporal prefetch (every step): kick async read-ahead of the next step's likely cold working set.
+    2. Freq-window re-pin (until the horizon): this is the ONLY safe place to re-pin — ``refresh_window_freq``
+       -> ``set_window_membership`` rewrites the pinned ``host_hot`` store in place, which the captured UVA
+       gather reads. Mid-step (at a layer's break) it would race the later layers' in-flight gathers and
+       corrupt output. Here no captured gather is in flight; we synchronize first so the step's async gathers
+       finish before host_hot is permuted."""
+    _bcg_prefetch_next_step()  # every step, async — overlaps the next step's compute
+    if _PROF["on"]:
+        _now = time.perf_counter()
+        if _PROF["last"] is not None:
+            _PROF["tok"] += _now - _PROF["last"]
+            _PROF["n"] += 1
+            if _PROF["n"] >= 40:
+                k = _PROF["n"]
+                m = lambda key: _PROF[key] / k * 1e3
+                tok, it, rf = m("tok"), m("item"), m("refill")
+                jac = (
+                    _PROF["overlap"] / _PROF["overlap_n"] if _PROF["overlap_n"] else 0.0
+                )
+                logger.info(
+                    "[pe-prof] token=%.1fms | item-sync=%.1fms | refill=%.1fms [tolist=%.1f gather=%.1f h2d=%.1f] "
+                    "| other=%.1fms | cold-miss Jaccard(t,t-1)=%.2f (avg/%d tok)",
+                    tok,
+                    it,
+                    rf,
+                    m("tolist"),
+                    m("gather"),
+                    m("h2d"),
+                    tok - it - rf,
+                    jac,
+                    k,
+                )
+                for key in (
+                    "tok",
+                    "item",
+                    "refill",
+                    "tolist",
+                    "gather",
+                    "h2d",
+                    "overlap",
+                ):
+                    _PROF[key] = 0.0
+                _PROF["n"] = _PROF["overlap_n"] = 0
+        _PROF["last"] = _now
+    if _profile_done or _PROFILE_TOKENS <= 0:
+        return  # re-pin already done (or disabled); prefetch above is the only per-step work
+    torch.cuda.synchronize()  # the step's captured gathers must finish before host_hot is rewritten
+    _maybe_profile_refresh()
+
+
+def _ensure_bcg_post_step_hook() -> None:
+    """Install the per-step boundary hook on the breakable backend the first time the BCG break path runs
+    (we only know decode is breakable once a break actually executes)."""
+    global _BCG_HOOK_INSTALLED
+    if _BCG_HOOK_INSTALLED:
+        return
+    from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+        set_post_replay_hook as _set_bcg_hook,
+    )
+
+    _set_bcg_hook(_bcg_post_step)
+    _BCG_HOOK_INSTALLED = True
 
 
 def _alloc_miss_slot(device) -> tuple:
@@ -387,6 +517,35 @@ class PagedExpertStore:
         )
         self._gather_planned_ondevice()  # window hits only; cold misses deferred to _refill_after_replay
 
+    def stage_cold_at_break(self) -> None:
+        """BCG break-and-page-in: stage THIS step's deferred cold experts at an in-layer eager break
+        (between decide and the expert GEMM), instead of deferring to a post-replay refill. Runs eager
+        every replay; reads this layer's cold-miss count + plan and refills directly — so the GEMM segment
+        sees the cold experts resident with NO second full-graph replay. Reuses the replay-twice refill,
+        but inline (one D2H for the count, plus the staging copies)."""
+        _prof = _PROF["on"]
+        _t0 = time.perf_counter() if _prof else 0.0
+        cn = int(self._cold_n_d.item())
+        if _prof:
+            _t1 = time.perf_counter()
+            _PROF["item"] += _t1 - _t0
+        if cn > 0:
+            cold_ids = self._cold_log_d[:cn].tolist()
+            self._last_cold_ids = cold_ids  # recorded for the next-step temporal prefetch (see _bcg_post_step)
+            _ta = time.perf_counter() if _prof else 0.0
+            needed = self._needed_d.tolist()
+            se = self._slot_expert_d.tolist()
+            if _prof:
+                _PROF["tolist"] += time.perf_counter() - _ta
+            self._refill_after_replay(cn, cold_ids, needed, se)
+        else:
+            self._last_cold_ids = []
+        if _prof:
+            _PROF["refill"] += time.perf_counter() - _t1
+        # Freq-window driver: install the per-step boundary hook on the breakable backend on first use. The
+        # actual re-pin + the temporal prefetch run there (between steps), NOT here mid-step — see _bcg_post_step.
+        _ensure_bcg_post_step_hook()
+
     def _refill_after_replay(self, cn: int, cold_log, needed, se) -> bool:
         """Post-replay (out-of-graph): stage the deferred cold experts ``host_cold`` -> their GPU slots and
         mark them resident, so the next replay's ``decide_bounded`` sees them as hits and the loop converges.
@@ -415,16 +574,30 @@ class PagedExpertStore:
         l2g = self.logical_to_gpu_index_cuda
         slots = evictable[:n]
         ids = list(missed[:n])
+        # Disk cold tier: kick parallel read-ahead for all of this layer's cold rows up front (MADV_WILLNEED),
+        # so the gather below doesn't serialize on one page fault at a time. No-op for the RAM tier.
+        store = getattr(self, "store", None)
+        if store is not None and hasattr(store, "prefetch_cold"):
+            store.prefetch_cold(ids)
         # Batch staging into ONE index_copy_ per tensor (vs n separate copy_ launches): host-gather the cold
         # rows, then a single host->device scatter into the victim slots.
         slots_dev = torch.tensor(slots, dtype=torch.int64, device=self.device)
         for name, gpu_param in self.gpu.items():
-            rows = torch.stack(
-                [self.store.row(name, e) for e in ids]
-            )  # [n, *shape] from host_cold
-            gpu_param.data.index_copy_(
-                0, slots_dev, rows.to(gpu_param.device, non_blocking=True)
-            )
+            _tg = time.perf_counter() if _PROF["on"] else 0.0
+            # Gather the cold rows into a PINNED buffer (vs torch.stack -> pageable), so the H2D below is a
+            # fast pinned transfer instead of a slow synchronous pageable one.
+            buf = _stage_pin_buf(name, self.K, gpu_param.shape[1:], gpu_param.dtype)
+            for i, e in enumerate(ids):
+                buf[i].copy_(self.store.row(name, e))
+            if _PROF["on"]:
+                _th = time.perf_counter()
+                _PROF["gather"] += _th - _tg
+            # Blocking: the shared pinned buf is reused by the next layer, so the H2D must complete before
+            # it can be overwritten. Pinned blocking H2D is still ~3x the pageable rate, and there's no
+            # compute here to overlap anyway.
+            gpu_param.data.index_copy_(0, slots_dev, buf[:n].to(gpu_param.device))
+            if _PROF["on"]:
+                _PROF["h2d"] += time.perf_counter() - _th
         for e, slot in zip(
             ids, slots
         ):  # update device residency so replay-2's decide sees e resident

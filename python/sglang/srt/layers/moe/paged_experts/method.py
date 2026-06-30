@@ -132,6 +132,7 @@ def _make_method_class():
             window: int = 0,
             cold_backing: str = "ram",
             cold_dir: Optional[str] = None,
+            breakable_decode: bool = False,
         ):
             self.base_method = base_method
             self.E = num_experts_E
@@ -149,7 +150,11 @@ def _make_method_class():
             # graphs are on, else eager host; the captured variant is windowed (replay-twice) when a window
             # is set. The bool + window resolve to a Placement strategy (placement.py).
             self.use_ondevice = use_ondevice and pin_host
-            self._placement = make_placement(self.use_ondevice, windowed=window > 0)
+            self._placement = make_placement(
+                self.use_ondevice,
+                windowed=window > 0,
+                breakable_decode=breakable_decode,
+            )
             self._pager = None
             # Initial residents = experts 0..K-1 in slots 0..K-1; the pager re-seeds + pages the rest.
             self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
@@ -241,6 +246,13 @@ def make_for_layer(
     )
     cold_backing = getattr(server_args, "paged_experts_cold_backing", "ram")
     cold_dir = getattr(server_args, "paged_experts_cold_dir", "") or None
+    # Windowed decode under the breakable backend -> BCG break-and-page-in (no replay-twice). Read the
+    # resolved decode-phase backend (convenience flag, else the cuda_graph_config phase).
+    _bd = getattr(server_args, "cuda_graph_backend_decode", None)
+    if _bd is None:
+        _cfg = getattr(server_args, "cuda_graph_config", None)
+        _bd = getattr(getattr(_cfg, "decode", None), "backend", None) if _cfg else None
+    breakable_decode = _bd == "breakable"
     return _make_method_class()(
         base_method,
         E,
@@ -251,6 +263,7 @@ def make_for_layer(
         window=window,
         cold_backing=cold_backing,
         cold_dir=cold_dir,
+        breakable_decode=breakable_decode,
     )
 
 
