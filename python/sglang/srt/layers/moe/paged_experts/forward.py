@@ -210,19 +210,26 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
         base = b * half if banked else 0
         if rolling and i + 1 < len(groups):
             store.prefetch_cold(groups[i + 1])  # keep the disk one wave ahead
-        src = torch.tensor(group, dtype=torch.int64, device=dev)
-        dst = torch.arange(base, base + len(group), dtype=torch.int64, device=dev)
         if banked:
             # staging buffers for bank b are free once wave i-2's H2D drained (CPU wait: the gather
             # below writes them from the CPU side)
             ev_h2d[b].synchronize()
             with torch.cuda.stream(ts):
+                # the plan tensors MUST be created on ts: an arange enqueued on the compute stream is
+                # not synchronized with ts, and the transfer kernels reading a not-yet-materialized
+                # dst was a real (intermittent, load-dependent) illegal-memory-access
+                src = torch.tensor(group, dtype=torch.int64, device=dev)
+                dst = torch.arange(
+                    base, base + len(group), dtype=torch.int64, device=dev
+                )
                 # bank b's slots are free once wave i-2's GEMM finished reading them
                 ts.wait_event(ev_gemm[b])
                 pager.page_in(src, dst, stage_bank=b, async_h2d=True, src_host=group)
                 ev_h2d[b].record(ts)
             cs.wait_event(ev_h2d[b])
         else:
+            src = torch.tensor(group, dtype=torch.int64, device=dev)
+            dst = torch.arange(base, base + len(group), dtype=torch.int64, device=dev)
             pager.page_in(src, dst, src_host=group)
         l2g.fill_(-1)
         l2g[src] = dst.to(torch.int32)
