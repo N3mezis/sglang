@@ -274,6 +274,10 @@ def reset_sizing_state() -> None:
     _moe_geometry.cache_clear()
     resolve_num_resident_experts.cache_clear()
     resolve_window_experts.cache_clear()
+    # the repack-cache digest folds in shard mtimes — recompute after a reload (updated checkpoint)
+    from sglang.srt.layers.moe.paged_experts.pager import _store_cache_dir
+
+    _store_cache_dir.cache_clear()
     try:
         _PRE_LOAD_FREE_BYTES = torch.cuda.mem_get_info()[0]
     except Exception:
@@ -375,8 +379,10 @@ def _make_method_class():
                     windowed=self.window > 0,
                     breakable_decode=self._breakable_decode,
                 )
-                if self.window > 0 and self.use_ondevice:
-                    _clamp_capture_bs_to_keep_warm(self.num_resident)
+                if self.use_ondevice:
+                    _shape_capture_bs_to_keep_warm(
+                        self.num_resident, windowed=self.window > 0
+                    )
             from sglang.srt.layers.moe.paged_experts.pager import setup_pager
 
             self._pager = setup_pager(self, layer)
@@ -505,35 +511,55 @@ def _pin_is_capped() -> bool:
         return False
 
 
-def _clamp_capture_bs_to_keep_warm(K: int) -> None:
-    """Windowed stores cannot serve a captured step whose ``bs*top_k`` exceeds ``K`` — the distinct>K
-    fallback is a host-driven wave, uncapturable, so capture at such sizes used to fail at startup with
-    an error telling the user to lower ``--cuda-graph-max-bs`` themselves. The bound is fully known the
-    moment K and the window resolve (post-load, before graph capture), so clamp the decode capture list
-    here instead. Full-pin stores are deliberately NOT clamped: their wave path is capture-safe, and a
-    captured wave still beats uncaptured decode (they keep the one-time cliff warning).
+def _shape_capture_bs_to_keep_warm(K: int, windowed: bool) -> None:
+    """Shape the decode capture batch list around the keep-warm bound ``bs*top_k <= K``, known the
+    moment K and the window resolve (post-load, before graph capture).
+
+    Windowed stores: HARD clamp to ``K//top_k`` regardless of user settings — the distinct>K fallback
+    is a host-driven wave, uncapturable, and capture at such sizes used to fail at startup.
+
+    Full-pin stores: captured waves past the bound work but cost ``ceil(E/K)`` GEMMs per layer — a
+    measured 2.7x throughput cliff right above the bound (int4-30B: 373 tok/s captured at bs=8 vs 139
+    at bs=16). When the user did NOT set an explicit capture list, shape the default: clamp to the
+    bound and make sure the bound itself is a capture bucket (bs up to ``K//top_k`` then pads to a
+    captured graph instead of falling off). An explicit ``--cuda-graph-max-bs-decode`` /
+    ``--cuda-graph-bs-decode`` is respected (the one-time wave-cliff warning still fires).
     """
     from sglang.srt.server_args import get_global_server_args
 
+    sa = get_global_server_args()
     _, htc, _, _ = _moe_geometry()
     top_k = getattr(htc, "num_experts_per_tok", 8) or 8
     cap = max(1, K // top_k)
+    user_set = (
+        getattr(sa, "cuda_graph_max_bs_decode", None) is not None
+        or getattr(sa, "cuda_graph_bs_decode", None) is not None
+    )
+    if not windowed and user_set:
+        return  # full-pin + explicit setting: the user chose their operating point
     try:
-        decode_cfg = get_global_server_args().cuda_graph_config.decode
+        decode_cfg = sa.cuda_graph_config.decode
         old_bs = list(decode_cfg.bs)
-        new_bs = [b for b in old_bs if b <= cap] or [cap]
+        new_bs = [b for b in old_bs if b <= cap]
+        if not windowed and cap not in new_bs:
+            new_bs.append(
+                cap
+            )  # capture the bound itself: bs up to K//top_k stays captured
+        new_bs = sorted(set(new_bs)) or [cap]
         if new_bs != old_bs:
             decode_cfg.bs = new_bs
             logger.info(
-                "[paged-experts] windowed keep-warm bound (bs*top_k <= K=%d): decode capture batch "
-                "sizes clamped to <=%d (K//top_k); larger batches serve through the uncaptured path",
+                "[paged-experts] keep-warm bound (bs*top_k <= K=%d): decode capture batch sizes "
+                "-> %s (cap K//top_k=%d); larger batches serve through the %s path",
                 K,
+                new_bs,
                 cap,
+                "uncaptured wave" if windowed else "uncaptured",
             )
     except Exception as e:
         logger.warning(
-            "[paged-experts] could not clamp decode capture batch sizes (%s); capture at "
-            "bs*top_k > K=%d will be rejected at startup",
+            "[paged-experts] could not shape decode capture batch sizes (%s); the keep-warm bound "
+            "K=%d applies at runtime",
             e,
             K,
         )
