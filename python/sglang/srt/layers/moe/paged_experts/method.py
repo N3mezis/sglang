@@ -486,6 +486,9 @@ _PIN_PROBE_DECAY = 0.85
 # Headroom left un-pinned on top of the window: post-build pinned consumers (per-layer staging buffers,
 # the BCG doorbell, token-transfer buffers) draw from the same OS pin budget.
 _PIN_PROBE_HEADROOM = 1.0e9
+# Pageable RAM kept free when greedily full-pinning the whole store (no cold tail to house — this covers
+# the serving process itself: tokenizer, host-side runtime, page cache for logs/checkpoint reads).
+_FULL_PIN_RAM_RESERVE = 8.0e9
 
 
 def _pin_is_capped() -> bool:
@@ -563,11 +566,14 @@ def _probe_pin_ceiling(target_bytes: int, floor_bytes: int) -> int:
     ceiling. Falls back to ``floor_bytes`` (the pre-probe conservative cap) on any failure, so sizing is
     never worse than the guess it replaces."""
     import ctypes
+    import math
 
     rt = _cudart_handle()
     if rt is None:
         return floor_bytes
-    size = int(target_bytes)
+    # ceil, not truncate: the store size is fractional (per-expert estimate), and losing even one byte
+    # here sizes the window to E-1 instead of a full pin
+    size = int(math.ceil(target_bytes))
     floor = int(floor_bytes)
     while size > floor:
         ptr = ctypes.c_void_p()
@@ -609,15 +615,26 @@ def resolve_window_experts(num_experts_E: int) -> int:
         else _AUTO_WINDOW_HOST_FRACTION
     )
     avail = _PRE_LOAD_HOST_AVAIL or _host_available_bytes()
-    budget = avail * frac
+    frac_budget = avail * frac
+    budget = frac_budget
     store_bytes = per_el * moe_layers * num_experts_E
+    # GREEDY FULL PIN: the host fraction exists to reserve pageable RAM for the cold tail — a fully
+    # pinned store has none, so when the whole store fits MemAvailable minus a process reserve, grow
+    # the budget to the store and let the ceiling probe verify it (floored at the fraction, so sizing
+    # is never worse than before). Converts mid-size "windowed" stores (e.g. a 30 GB fp8 store on a
+    # 50 GB box) to full pin: streaming prefill applies and the cold tier disappears from decode.
+    if frac_budget < store_bytes <= avail - _FULL_PIN_RAM_RESERVE:
+        budget = float(store_bytes)
     probed = False
-    if _pin_is_capped():
-        try:
-            total_vram = torch.cuda.mem_get_info()[1]
-        except Exception:
-            total_vram = 0
-        floor = min(budget, total_vram * _AUTO_WINDOW_VRAM_FRACTION)
+    if _pin_is_capped() or budget > frac_budget:
+        if _pin_is_capped():
+            try:
+                total_vram = torch.cuda.mem_get_info()[1]
+            except Exception:
+                total_vram = 0
+            floor = min(frac_budget, total_vram * _AUTO_WINDOW_VRAM_FRACTION)
+        else:
+            floor = frac_budget  # native Linux: never end below today's fraction
         # never need to pin more than the store itself (+ headroom for post-build pinned consumers)
         target = min(budget, store_bytes)
         if target > floor:
