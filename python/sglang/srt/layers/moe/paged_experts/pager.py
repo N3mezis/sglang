@@ -468,6 +468,62 @@ class ExpertPager:
                 return None
         return ctx
 
+    def scratch_fill_resident_aware(self, bufs: Dict[str, torch.Tensor]) -> bool:
+        """Fill the scratch pool for the streaming prefill from TWO sources: experts resident in this
+        layer's K-slot pool are copied device-to-device (~15x the PCIe rate; pool rows are exact copies
+        of their store rows — page-in never mutates), and only the complement streams from the pinned
+        host store. The split is planned ON DEVICE from the live residency map (``scratch_split``): the
+        host mirror is stale after captured decode replays, and reading the device map back would stall
+        the CPU on the transfer stream. Both plans execute via ``gather_multi`` (address-agnostic copy;
+        the D2D pass gets plain device pool pointers instead of UVA host pointers). Returns ``False``
+        when the on-device machinery isn't set up (caller falls back to ``store.read_full``).
+        """
+        if not self.ondevice or self._gm_stores is None:
+            return False
+        from sglang.jit_kernel.paged_experts_decide import (
+            paged_experts_gather_multi,
+            paged_experts_scratch_split,
+        )
+
+        plans = getattr(self, "_scratch_plans", None)
+        if plans is None:
+            mk = lambda n: torch.zeros(n, dtype=torch.int32, device=self.device)
+            plans = (mk(self.E), mk(self.E), mk(1), mk(self.E), mk(self.E), mk(1))
+            self._scratch_plans = plans
+        base_cache = getattr(self, "_scratch_dst_bases", None)
+        if base_cache is None:
+            base_cache = {}
+            self._scratch_dst_bases = base_cache
+        # keyed per bank buffer-set (two banks, distinct pointers); the buffers are persistent, so
+        # their base pointers are stable. Order must match the pool/store descriptor tensors (built
+        # from the same store.gpu iteration order).
+        dst_bases = base_cache.get(id(bufs))
+        if dst_bases is None:
+            dst_bases = torch.tensor(
+                [bufs[name].data_ptr() for name in self.store.gpu],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            base_cache[id(bufs)] = dst_bases
+        res_src, res_dst, res_n, h2d_src, h2d_dst, h2d_n = plans
+        paged_experts_scratch_split(
+            self.logical_to_gpu_index_cuda,
+            res_src,
+            res_dst,
+            res_n,
+            h2d_src,
+            h2d_dst,
+            h2d_n,
+        )
+        # complement from the pinned host store (UVA bases), residents from the pool (device bases)
+        paged_experts_gather_multi(
+            self._gm_stores, dst_bases, self._gm_e16s, h2d_src, h2d_dst, h2d_n
+        )
+        paged_experts_gather_multi(
+            self._gm_slots, dst_bases, self._gm_e16s, res_src, res_dst, res_n
+        )
+        return True
+
     def wave_ctx(self):
         """Shared state for the double-buffered (banked) wave path: ONE transfer stream, two event pairs
         (h2d-done / gemm-done per bank), and two per-bank idx buffers so wave w+1's decide cannot race

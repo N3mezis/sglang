@@ -77,7 +77,9 @@ def _scratch_fill(pager, bufs, bank, ts, ev_ready, ev_gemm) -> None:
     ev_ready.synchronize()
     with torch.cuda.stream(ts):
         ts.wait_event(ev_gemm)
-        pager.store.read_full(bufs, stage_key=bank)
+        # resident-aware: D2D the K residents out of the layer's own pool, stream only the complement
+        if not pager.scratch_fill_resident_aware(bufs):
+            pager.store.read_full(bufs, stage_key=bank)
         ev_ready.record(ts)
 
 

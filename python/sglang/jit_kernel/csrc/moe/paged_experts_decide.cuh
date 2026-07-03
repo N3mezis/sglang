@@ -615,6 +615,76 @@ void scatter_multi(
       static_cast<int>(n));
 }
 
+// Split the streaming-prefill scratch fill by the LIVE residency map: experts resident in the K-slot
+// pool are fetched device-to-device from their slot (an exact copy of the store row — page-in never
+// mutates), everything else streams from the host store. Both plans execute via gather_multi (the copy
+// kernel is address-agnostic; pool bases are plain device pointers). Counts stay on-device: no host
+// sync, so the plan is correct even right after captured decode replays (whose decide kernels mutate
+// only the device map).
+__global__ void scratch_split_kernel(
+    const int32_t* l2g,  // [E] logical expert -> pool slot (-1 = not resident); the LIVE device map
+    int E,
+    int32_t* res_src,                     // [E] out: pool slot to read (device-to-device plan)
+    int32_t* res_dst,                     // [E] out: expert row in scratch
+    int32_t* res_n,                       // [1] out
+    int32_t* h2d_src,                     // [E] out: expert row in the host store (host-to-device plan)
+    int32_t* h2d_dst,                     // [E] out: expert row in scratch
+    int32_t* h2d_n) {                     // [1] out
+  if (blockIdx.x || threadIdx.x) return;  // E is small; a serial lane keeps the plan ordered
+  int nr = 0, nh = 0;
+  for (int e = 0; e < E; ++e) {
+    const int s = l2g[e];
+    if (s >= 0) {
+      res_src[nr] = s;
+      res_dst[nr] = e;
+      ++nr;
+    } else {
+      h2d_src[nh] = e;
+      h2d_dst[nh] = e;
+      ++nh;
+    }
+  }
+  *res_n = nr;
+  *h2d_n = nh;
+}
+
+void scratch_split(
+    tvm::ffi::TensorView l2g,
+    tvm::ffi::TensorView res_src,
+    tvm::ffi::TensorView res_dst,
+    tvm::ffi::TensorView res_n,
+    tvm::ffi::TensorView h2d_src,
+    tvm::ffi::TensorView h2d_dst,
+    tvm::ffi::TensorView h2d_n) {
+  using namespace host;
+
+  SymbolicSize E = {"num_experts"}, One = {"one"};
+  SymbolicDevice device_;
+  device_.set_options<kDLCUDA>();
+  TensorMatcher({E})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(l2g)
+      .verify(res_src)
+      .verify(res_dst)
+      .verify(h2d_src)
+      .verify(h2d_dst);
+  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(res_n).verify(h2d_n);
+  const int e = static_cast<int>(E.unwrap());
+  const DLDevice device = device_.unwrap();
+
+  LaunchKernel(1, 32, device)(
+      scratch_split_kernel,
+      static_cast<const int32_t*>(l2g.data_ptr()),
+      e,
+      static_cast<int32_t*>(res_src.data_ptr()),
+      static_cast<int32_t*>(res_dst.data_ptr()),
+      static_cast<int32_t*>(res_n.data_ptr()),
+      static_cast<int32_t*>(h2d_src.data_ptr()),
+      static_cast<int32_t*>(h2d_dst.data_ptr()),
+      static_cast<int32_t*>(h2d_n.data_ptr()));
+}
+
 void remap_mask(
     tvm::ffi::TensorView topk,
     tvm::ffi::TensorView idx,

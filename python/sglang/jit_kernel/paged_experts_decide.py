@@ -24,9 +24,28 @@ def _jit_paged_experts_decide_module() -> Module:
             ("gather_multi", "gather_multi"),
             ("scatter_multi", "scatter_multi"),
             ("remap_mask", "remap_mask"),
+            ("scratch_split", "scratch_split"),
             ("host_devptr", "host_devptr"),
         ],
     )
+
+
+def paged_experts_scratch_split(
+    l2g: torch.Tensor,
+    res_src: torch.Tensor,
+    res_dst: torch.Tensor,
+    res_n: torch.Tensor,
+    h2d_src: torch.Tensor,
+    h2d_dst: torch.Tensor,
+    h2d_n: torch.Tensor,
+) -> None:
+    """Split the streaming-prefill scratch fill by the LIVE residency map ``l2g`` ([E] int32 CUDA,
+    -1 = not resident): a device-to-device plan (pool slot -> scratch expert row) for residents and a
+    host-to-device plan (store row -> scratch expert row) for the rest. Counts land on-device — no host
+    sync, so the plan is correct right after captured decode replays. All plan tensors are [E] int32
+    CUDA; counts [1] int32 CUDA."""
+    module = _jit_paged_experts_decide_module()
+    module.scratch_split(l2g, res_src, res_dst, res_n, h2d_src, h2d_dst, h2d_n)
 
 
 def paged_experts_decide(

@@ -21,6 +21,7 @@ from sglang.jit_kernel.paged_experts_decide import (
     paged_experts_host_devptr,
     paged_experts_remap_mask,
     paged_experts_scatter_multi,
+    paged_experts_scratch_split,
 )
 
 
@@ -701,3 +702,47 @@ def test_scatter_multi_matches_reference():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@requires_cuda
+def test_scratch_split_and_d2d_gather():
+    """The streaming-prefill split: residents plan a device-to-device copy (pool slot -> scratch
+    expert row), the complement a host-to-device copy — and gather_multi executes BOTH (its copy is
+    address-agnostic: pool device pointers for D2D, UVA host pointers for H2D). End state: scratch
+    holds every expert's store row exactly."""
+    E, K = 16, 6
+    l2g_host = [-1] * E
+    for slot, e in enumerate([3, 9, 0, 14, 7, 11]):  # pool slot -> expert
+        l2g_host[e] = slot
+    l2g = _i32(l2g_host)
+    mk = lambda n: torch.zeros(n, dtype=torch.int32, device="cuda")
+    res_src, res_dst, res_n = mk(E), mk(E), mk(1)
+    h2d_src, h2d_dst, h2d_n = mk(E), mk(E), mk(1)
+    paged_experts_scratch_split(l2g, res_src, res_dst, res_n, h2d_src, h2d_dst, h2d_n)
+    torch.cuda.synchronize()
+    nr, nh = int(res_n.item()), int(h2d_n.item())
+    assert nr == K and nh == E - K
+    # reference: expert order, residents to their slots
+    r_res = [(l2g_host[e], e) for e in range(E) if l2g_host[e] >= 0]
+    r_h2d = [(e, e) for e in range(E) if l2g_host[e] < 0]
+    assert list(zip(res_src[:nr].tolist(), res_dst[:nr].tolist())) == r_res
+    assert list(zip(h2d_src[:nh].tolist(), h2d_dst[:nh].tolist())) == r_h2d
+
+    # execute both plans with gather_multi; scratch must equal the store row-for-row
+    torch.manual_seed(7)
+    host = torch.rand(E, 64, dtype=torch.float32, pin_memory=True)  # e16 = 16
+    pool = torch.zeros(K, 64, dtype=torch.float32, device="cuda")
+    for e in range(E):  # pool holds exact store-row copies (as page_in guarantees)
+        if l2g_host[e] >= 0:
+            pool[l2g_host[e]].copy_(host[e])
+    scratch = torch.zeros(E, 64, dtype=torch.float32, device="cuda")
+    e16s = torch.tensor([64 * 4 // 16], dtype=torch.int64, device="cuda")
+    store_base = torch.tensor(
+        [paged_experts_host_devptr(host)], dtype=torch.int64, device="cuda"
+    )
+    pool_base = torch.tensor([pool.data_ptr()], dtype=torch.int64, device="cuda")
+    scratch_base = torch.tensor([scratch.data_ptr()], dtype=torch.int64, device="cuda")
+    paged_experts_gather_multi(store_base, scratch_base, e16s, h2d_src, h2d_dst, h2d_n)
+    paged_experts_gather_multi(pool_base, scratch_base, e16s, res_src, res_dst, res_n)
+    torch.cuda.synchronize()
+    assert torch.equal(scratch.cpu(), host), "scratch != store after split fill"
