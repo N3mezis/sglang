@@ -47,8 +47,7 @@ host to GPU each step — which shapes its performance profile (see [Performance
 - **`--paged-experts-store {pinned,paged}`**: The host expert store kind. `pinned` (default) page-locks
   the store and pages it with the fast transfer kernel. `paged` uses a non-pinned store instead — use it
   only when the pinned store would exceed the host's page-locked memory limit (e.g. an unquantized model
-  on a small-RAM box, or under WSL2, where page-locked memory maps into a GPU-visible aperture bounded by
-  device memory rather than host RAM).
+  on a small-RAM box, or under WSL2, which caps total page-locked memory below host RAM).
   The `paged` store pages via a plain indexed copy, which is correct but noticeably slower than `pinned`.
 
 - **`--paged-experts-kv-reserve-gb`**: KV-cache headroom (GB) to reserve when auto-sizing K
@@ -66,8 +65,9 @@ host to GPU each step — which shapes its performance profile (see [Performance
 
 The next two parameters concern the **pinned-window fallback** — how Paged Experts serves stores too
 large to fully page-lock, up to stores larger than host RAM. Both the window *size* (every expert is
-page-locked when the whole store fits the pin budget — half of available host memory, additionally capped
-near total VRAM on WSL2, where pinning maps into a GPU-visible aperture; otherwise the largest window that
+page-locked when the whole store fits the pin budget — half of available host memory; on WSL2, which caps
+total page-locked memory below host RAM at a box-dependent bound, the budget is verified against the
+*measured* pin ceiling by probing real pinned allocations at startup; otherwise the largest window that
 fits the budget) and *which* experts it holds (the most-routed, ranked by profiling the first 128 decode
 tokens) are chosen **automatically** — there are no window knobs. These two tune only *where* the cold
 tail lives.

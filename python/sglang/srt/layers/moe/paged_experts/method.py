@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from typing import Any, Optional
 
 import torch
@@ -226,7 +227,7 @@ def _make_method_class():
             pin_host: bool = True,
             use_ondevice: bool = False,
             eviction: str = "lru",
-            window: int = 0,
+            window: Optional[int] = 0,
             cold_backing: str = "ram",
             cold_dir: Optional[str] = None,
             breakable_decode: bool = False,
@@ -238,6 +239,8 @@ def _make_method_class():
             self.eviction = eviction
             # Pinned-window fallback: 0 = full pin (every expert page-locked); 0 < window < E pins only the
             # W hot experts and keeps the E-W cold tail pageable, for stores past the page-lock ceiling.
+            # ``None`` = deferred: resolved (with the page-lock ceiling probe) in
+            # process_weights_after_loading, after the weight loader's own pinned use has settled.
             self.window = window
             # Windowed cold-tier backing: "ram" (pageable, must fit RAM) | "disk" (mmap'd file, P4 — lets
             # the store exceed RAM). cold_dir is the disk location for the "disk" tier.
@@ -245,12 +248,18 @@ def _make_method_class():
             self.cold_dir = cold_dir
             # Decode placement: captured (on-device decide + UVA gather, needs a pinned store) when CUDA
             # graphs are on, else eager host; the captured variant is windowed (replay-twice) when a window
-            # is set. The bool + window resolve to a Placement strategy (placement.py).
+            # is set. The bool + window resolve to a Placement strategy (placement.py) — deferred alongside
+            # a deferred window.
             self.use_ondevice = use_ondevice and pin_host
-            self._placement = make_placement(
-                self.use_ondevice,
-                windowed=window > 0,
-                breakable_decode=breakable_decode,
+            self._breakable_decode = breakable_decode
+            self._placement = (
+                make_placement(
+                    self.use_ondevice,
+                    windowed=window > 0,
+                    breakable_decode=breakable_decode,
+                )
+                if window is not None
+                else None
             )
             self._pager = None
 
@@ -290,6 +299,15 @@ def _make_method_class():
         def process_weights_after_loading(self, layer):
             if hasattr(self.base_method, "process_weights_after_loading"):
                 self.base_method.process_weights_after_loading(layer)
+            if self.window is None:
+                # Deferred window sizing: the ceiling probe runs here, after the loader — cached, so the
+                # first layer resolves it and every layer shares the same W.
+                self.window = resolve_window_experts(self.E)
+                self._placement = make_placement(
+                    self.use_ondevice,
+                    windowed=self.window > 0,
+                    breakable_decode=self._breakable_decode,
+                )
             from sglang.srt.layers.moe.paged_experts.pager import setup_pager
 
             self._pager = setup_pager(self, layer)
@@ -361,7 +379,10 @@ def make_for_layer(
     eviction = getattr(server_args, "paged_experts_eviction", "lru")
     # The pinned window is sized automatically (the largest window that fits — page-locking every expert
     # when the whole store fits); there is no user knob. A pageable store pins nothing, so it has no window.
-    window = resolve_window_experts(E) if bool(pin_host) else 0
+    # ``None`` defers resolution to process_weights_after_loading: the page-lock ceiling probe must run
+    # AFTER the weight loader, whose allocations count against the same OS pin budget (WSL2) — a pre-load
+    # probe measures headroom the loaded server no longer has.
+    window = None if bool(pin_host) else 0
     cold_backing = getattr(server_args, "paged_experts_cold_backing", "ram")
     cold_dir = getattr(server_args, "paged_experts_cold_dir", "") or None
     # Windowed decode under the breakable backend -> BCG break-and-page-in (no replay-twice).
@@ -384,16 +405,21 @@ def make_for_layer(
 # of the process needs pageable RAM (a RAM cold tier holds E-W experts; a disk cold tier needs page cache;
 # plus activations and general overhead), and on WSL the page-lock pool is itself capped below RAM.
 _AUTO_WINDOW_HOST_FRACTION = 0.5
-# On platforms where page-locking is VRAM-coupled (see ``_pin_is_vram_coupled``), the pinned window also
-# consumes a GPU-accessible aperture ~ board memory, so cap the budget by this fraction of total VRAM.
+# Probe-ladder floor on pin-capped platforms, as a fraction of total VRAM: the ladder never probes below
+# this, so sizing is never more conservative than a known-safe bound even if every probe rung fails.
 _AUTO_WINDOW_VRAM_FRACTION = 0.9
+# Probe-ladder decay: each failed rung retries at this fraction of the previous attempt.
+_PIN_PROBE_DECAY = 0.85
+# Headroom left un-pinned on top of the window: post-build pinned consumers (per-layer staging buffers,
+# the BCG doorbell, token-transfer buffers) draw from the same OS pin budget.
+_PIN_PROBE_HEADROOM = 1.0e9
 
 
-def _pin_is_vram_coupled() -> bool:
-    """True where ``cudaHostRegister`` maps page-locked host memory into a GPU-accessible aperture that is
-    bounded by device memory rather than host RAM — notably WSL2 (its dxgkrnl GPU-paravirt layer), where
-    a window larger than VRAM fails to page-lock even with host RAM to spare. On native Linux pinning is
-    host-only, so this is False and the window is bounded by host RAM alone.
+def _pin_is_capped() -> bool:
+    """True where the OS caps total page-locked memory below host RAM — notably WSL2, whose dxgkrnl
+    GPU-paravirt layer bounds pinned allocations well below ``MemAvailable`` (the bound varies by box and
+    driver: measured ~1.7x board memory on an 8 GB-VRAM laptop, ~2x on a 16 GB desktop). On native Linux
+    pinning is host-only, so this is False and the window is bounded by host RAM alone.
     """
     try:
         with open("/proc/version") as f:
@@ -403,29 +429,85 @@ def _pin_is_vram_coupled() -> bool:
         return False
 
 
+def _cudart_handle():
+    """ctypes handle to the CUDA runtime torch itself loaded (bundled libcudart), for raw
+    ``cudaHostAlloc``/``cudaFreeHost`` — torch's pinned allocator caches freed blocks, which would leave a
+    probe-sized block resident and double the pin footprint when the real store allocates.
+    """
+    import ctypes
+    import glob
+
+    for cand in glob.glob(
+        os.path.join(os.path.dirname(torch.__file__), "lib", "libcudart*so*")
+    ) + ["libcudart.so"]:
+        try:
+            return ctypes.CDLL(cand)
+        except OSError:
+            continue
+    return None
+
+
+def _probe_pin_ceiling(target_bytes: int, floor_bytes: int) -> int:
+    """Largest page-lockable size <= ``target_bytes``, measured by real ``cudaHostAlloc`` attempts (freed
+    immediately) on a descending ladder down to ``floor_bytes``. On pin-capped platforms (WSL2) the true
+    ceiling varies by box and driver, and guessing it low forces windowed mode on boxes that could full-pin
+    the store (~2x decode cost), so measure instead of guessing. The common case — target fits — costs one
+    transient pin pass at startup; a failed rung costs the time the allocator spends before hitting the
+    ceiling. Falls back to ``floor_bytes`` (the pre-probe conservative cap) on any failure, so sizing is
+    never worse than the guess it replaces."""
+    import ctypes
+
+    rt = _cudart_handle()
+    if rt is None:
+        return floor_bytes
+    size = int(target_bytes)
+    floor = int(floor_bytes)
+    while size > floor:
+        ptr = ctypes.c_void_p()
+        try:
+            rc = rt.cudaHostAlloc(ctypes.byref(ptr), ctypes.c_size_t(size), 0)
+        except Exception:
+            return floor
+        logger.info(
+            "[paged-experts] pin probe: cudaHostAlloc(%.2fGB) -> rc=%d", size / 1e9, rc
+        )
+        if rc == 0:
+            rt.cudaFreeHost(ptr)
+            return size
+        size = int(size * _PIN_PROBE_DECAY)
+    logger.info("[paged-experts] pin probe: fell through to floor %.2fGB", floor / 1e9)
+    return floor
+
+
 @functools.lru_cache(maxsize=None)
 def resolve_window_experts(num_experts_E: int) -> int:
     """Size the pinned window ``W`` for the pinned store: page-lock the largest hot window that fits the pin
     budget, and ``0`` (full pin) when the whole store fits. The budget is
-    ``MemAvailable * _AUTO_WINDOW_HOST_FRACTION``, additionally capped by ``total_vram *
-    _AUTO_WINDOW_VRAM_FRACTION`` where pinning is VRAM-coupled (WSL). Mirrors ``resolve_num_resident_experts``
-    — reads geometry off ``ModelConfig`` and calls the pure ``compute_window_experts``. Sizing is automatic;
-    there is no user-facing window knob. Cached: every MoE layer resolves the same W.
+    ``MemAvailable * _AUTO_WINDOW_HOST_FRACTION``; where the OS caps page-locking below host RAM (WSL2, see
+    ``_pin_is_capped``) the budget is verified against the *measured* pin ceiling (``_probe_pin_ceiling``)
+    rather than a guessed fraction of VRAM. Mirrors ``resolve_num_resident_experts`` — reads geometry off
+    ``ModelConfig`` and calls the pure ``compute_window_experts``. Sizing is automatic; there is no
+    user-facing window knob. Cached: every MoE layer resolves the same W.
     """
     _, _, moe_layers, per_el = _moe_geometry()
 
     avail = _PRE_LOAD_HOST_AVAIL or _host_available_bytes()
     budget = avail * _AUTO_WINDOW_HOST_FRACTION
-    vram_capped = False
-    if _pin_is_vram_coupled():
+    store_bytes = per_el * moe_layers * num_experts_E
+    probed = False
+    if _pin_is_capped():
         try:
             total_vram = torch.cuda.mem_get_info()[1]
         except Exception:
             total_vram = 0
-        if total_vram:
-            vram_cap = total_vram * _AUTO_WINDOW_VRAM_FRACTION
-            if vram_cap < budget:
-                budget, vram_capped = vram_cap, True
+        floor = min(budget, total_vram * _AUTO_WINDOW_VRAM_FRACTION)
+        # never need to pin more than the store itself (+ headroom for post-build pinned consumers)
+        target = min(budget, store_bytes)
+        if target > floor:
+            got = _probe_pin_ceiling(target + _PIN_PROBE_HEADROOM, floor)
+            budget, probed = max(floor, got - _PIN_PROBE_HEADROOM), True
+        else:
+            budget = target
     w = compute_window_experts(
         pin_budget_bytes=budget,
         moe_layers=moe_layers,
@@ -440,7 +522,7 @@ def resolve_window_experts(num_experts_E: int) -> int:
         "full pin — whole store fits" if w == 0 else "windowed",
         avail / 1e9,
         budget / 1e9,
-        " (VRAM-capped)" if vram_capped else "",
+        " (pin-probed)" if probed else "",
         per_el / 1e6,
         moe_layers,
     )

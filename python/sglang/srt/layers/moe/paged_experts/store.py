@@ -17,6 +17,7 @@ Future tiers (disk-mmap, compressed) are additional ``ExpertStore`` subclasses â
 
 from __future__ import annotations
 
+import logging
 import math
 import mmap
 import os
@@ -25,6 +26,42 @@ from abc import ABC, abstractmethod
 from typing import Dict, Optional
 
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
+    """Pinned host tensor allocated via raw ``cudaHostAlloc`` instead of torch's pinned allocator.
+
+    On WSL2 the two hit DIFFERENT page-lock ceilings: torch's pinned path fails ~12 GB below what raw
+    ``cudaHostAlloc`` can pin (measured 19.8 vs 32 GB on a 50 GB-RAM box), which both wastes window
+    budget and desynchronizes the store from the sizing probe (which must measure the same ceiling the
+    store will hit). The buffer is freed via ``cudaFreeHost`` when the tensor is garbage-collected.
+    Falls back to ``torch.empty(pin_memory=True)`` if the CUDA runtime is unreachable.
+    """
+    import ctypes
+    import weakref
+
+    from sglang.srt.layers.moe.paged_experts.method import _cudart_handle
+
+    rt = _cudart_handle()
+    nbytes = int(math.prod(shape)) * dtype.itemsize
+    if rt is None or nbytes == 0:
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    ptr = ctypes.c_void_p()
+    if rt.cudaHostAlloc(ctypes.byref(ptr), ctypes.c_size_t(nbytes), 0) != 0:
+        raise RuntimeError(
+            f"[paged-experts] cudaHostAlloc({nbytes / 1e9:.2f} GB) for the pinned expert store "
+            "failed (OS page-lock ceiling). The auto window should have sized under it; if you set "
+            "--paged-experts-num-resident or run other pinned-memory workloads, lower them, or use "
+            "--paged-experts-store paged."
+        )
+    # torch.frombuffer keeps ``buf`` alive as long as the tensor's storage, so the finalizer on ``buf``
+    # frees the pinned block only after every view of the storage is gone.
+    buf = (ctypes.c_uint8 * nbytes).from_address(ptr.value)
+    weakref.finalize(buf, rt.cudaFreeHost, ctypes.c_void_p(ptr.value))
+    return torch.frombuffer(buf, dtype=torch.uint8).view(dtype).reshape(shape)
+
 
 # packed-quant scaffolding the fused-MoE kernel never reads on the paged path
 _NONPAGED_SUFFIXES = ("_g_idx", "_g_idx_sort_indices", "_weight_shape")
@@ -133,11 +170,11 @@ class ExpertStore(ABC):
         self.host: Dict[str, torch.Tensor] = {}
         self.item_bytes: Dict[str, int] = {}
         for name, p in self.gpu.items():
-            self.host[name] = torch.empty(
-                (self.E, *p.shape[1:]),
-                dtype=p.dtype,
-                device="cpu",
-                pin_memory=self.pinned,
+            shape = (self.E, *p.shape[1:])
+            self.host[name] = (
+                _pinned_empty(shape, p.dtype)
+                if self.pinned
+                else torch.empty(shape, dtype=p.dtype, device="cpu", pin_memory=False)
             )
             self.item_bytes[name] = p[0].numel() * p.element_size()
             # transfer_kv_per_layer_mla requires the per-expert block to be 8-byte aligned. Real weight
@@ -257,9 +294,7 @@ class WindowedExpertStore(ExpertStore):
         )  # disk tier mmap objects, for madvise read-ahead hints
         on_disk = cold_backing == "disk"
         for name, p in self.gpu.items():
-            self.host_hot[name] = torch.empty(
-                (self.W, *p.shape[1:]), dtype=p.dtype, device="cpu", pin_memory=True
-            )
+            self.host_hot[name] = _pinned_empty((self.W, *p.shape[1:]), p.dtype)
             cold_dims = (self.E - self.W, *p.shape[1:])
             # disk: a >RAM cold tier mmap'd to a file (page-cache-bounded) so the store can exceed RAM;
             # ram: a plain pageable tensor (the cold tier must fit RAM).
