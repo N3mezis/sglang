@@ -207,6 +207,17 @@ class ExpertStore(ABC):
         buffer/slot reuse with events); stores without staging may ignore what they don't use.
         """
 
+    def read_full(
+        self, targets: Dict[str, torch.Tensor], *, stage_key: int = 0
+    ) -> None:
+        """Copy the ENTIRE store (all E experts, expert order) into ``targets[name]`` (``[E, *slot]``
+        device tensors) — the streaming-prefill scratch fill. One contiguous async H2D per tensor for
+        the single-buffer stores; the windowed store overrides with its hot/cold split. ``stage_key``
+        selects an independent staging-buffer set where staging is used (the caller sequences reuse
+        with events)."""
+        for name, host in self.host.items():
+            targets[name].copy_(host, non_blocking=self.pinned)
+
     # --- checkpoint-fill accessors (store-layout-agnostic; used by ``pager.setup_pager``) ---
     # A single ``[E, *]`` host buffer here; ``WindowedExpertStore`` overrides both to route an expert into
     # its hot/cold tier, so the fill code never special-cases the store layout.
@@ -409,6 +420,47 @@ class WindowedExpertStore(ExpertStore):
                 mm.madvise(mmap.MADV_WILLNEED, 0, len(mm))
             except (OSError, ValueError):
                 pass
+
+    def read_full(
+        self, targets: Dict[str, torch.Tensor], *, stage_key: int = 0
+    ) -> None:
+        """Windowed read-all for the streaming-prefill scratch fill: hot rows via ``transfer_kv`` from
+        the pinned window (expert-ordered destinations), cold rows staged through a pinned buffer.
+        Issued on the caller's current stream; no trailing sync (the caller sequences with events).
+        """
+        hot_mask = self.hot_pos >= 0
+        hot_experts = torch.nonzero(hot_mask, as_tuple=False).flatten()
+        dev = next(iter(targets.values())).device
+        if hot_experts.numel():
+            from sgl_kernel import transfer_kv_per_layer_mla
+
+            src_rows = self.hot_pos[hot_experts].to(dev)
+            dst_rows = hot_experts.to(dev)
+            for name in self.gpu:
+                transfer_kv_per_layer_mla(
+                    src=self.host_hot[name],
+                    dst=targets[name],
+                    src_indices=src_rows,
+                    dst_indices=dst_rows,
+                    item_size=self.item_bytes[name],
+                )
+        cold_experts = [int(e) for e in torch.nonzero(~hot_mask).flatten().tolist()]
+        if cold_experts:
+            if not getattr(self, "_step_prefetched", False):
+                self.prefetch_cold(cold_experts)
+            cold_rows = [int(self.cold_pos[e]) for e in cold_experts]
+            n = len(cold_rows)
+            for name in self.gpu:
+                buf = _stage_pin_buf(
+                    f"{name}#rf{stage_key}",
+                    n,
+                    self.host_hot[name].shape[1:],
+                    self.host_hot[name].dtype,
+                )
+                for i, r in enumerate(cold_rows):
+                    buf[i].copy_(self.host_cold[name][r])
+                for i, e in enumerate(cold_experts):
+                    targets[name][e].copy_(buf[i], non_blocking=True)
 
     def is_hot(self, e: int) -> bool:
         return bool(self.hot_pos[e] >= 0)

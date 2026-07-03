@@ -69,6 +69,78 @@ def _gemm_hidden_fused(
     return out.hidden_states if hasattr(out, "hidden_states") else out
 
 
+def _scratch_fill(pager, bufs, bank, ts, ev_ready, ev_gemm) -> None:
+    """Enqueue a full-store read into scratch bank ``bank`` on the transfer stream. The bank is free
+    once the GEMM that last read it (two layers ago) completed; the staging pin buffers (windowed cold
+    rows) are free once this bank's previous fill drained (CPU wait — the gather writes them host-side).
+    """
+    ev_ready.synchronize()
+    with torch.cuda.stream(ts):
+        ts.wait_event(ev_gemm)
+        pager.store.read_full(bufs, stage_key=bank)
+        ev_ready.record(ts)
+
+
+def _scratch_prefill_apply(method, layer, dispatch_output, topk_ids, distinct=None):
+    """Streaming prefill: run this layer's MoE as ONE vanilla E-wide fused-MoE pass out of a full-E
+    scratch pool instead of ``ceil(E/K)`` masked waves through the K-slot pool.
+
+    Two global scratch banks ping-pong across layers: while this layer's GEMM computes out of bank
+    ``layer_ord & 1``, the NEXT layer's whole expert set streams into the other bank on the transfer
+    stream — cross-layer overlap with none of the residency hazards of pre-paging the K-slot pool
+    (scratch is not serving state; the K slots and every residency map stay untouched, so decode
+    resumes warm after prefill). The layer's paged params are swapped to the scratch views only for
+    the duration of the base-method call (every supported backend derives its expert count from the
+    weight shapes), and ``topk_ids`` pass through UNREMAPPED — bit-identical math to a fully-resident
+    serve. Returns the hidden output, or ``None`` when the scratch pool is unavailable (caller falls
+    back to the wave path).
+    """
+    pager = method._pager
+    if torch.cuda.is_current_stream_capturing():
+        return None
+    if distinct is not None and len(distinct) < (6 * pager.E) // 10:
+        return None  # sparse big batch: waves move fewer bytes
+    store = pager.store
+    if getattr(store, "host", None) is None or not store.pinned:
+        # full-pin stores only: any cold tier (windowed RAM or disk) needs a per-layer CPU-side
+        # staging gather in read_full, which stalls the pipeline on the CPU — measured net-negative
+        # (fp8-30B windowed: 1019 -> ~600 tok/s prefill). Windowed stores keep the wave path.
+        return None
+    ctx = pager.scratch_ctx()
+    if ctx is None:
+        return None
+    bufs, ev_ready, ev_gemm = ctx
+    bank = getattr(pager, "_layer_ord", 0) & 1
+    ts = pager.wave_ctx()[0]
+    cs = torch.cuda.current_stream()
+    if not getattr(pager, "_scratch_prefilled", False):
+        ts.wait_stream(cs)  # first fill of the pass: order behind enqueued compute
+        _scratch_fill(pager, bufs[bank], bank, ts, ev_ready[bank], ev_gemm[bank])
+    pager._scratch_prefilled = False
+    cs.wait_event(ev_ready[bank])
+    gpu = pager.store.gpu
+    saved = {name: p.data for name, p in gpu.items()}
+    try:
+        for name, p in gpu.items():
+            p.data = bufs[bank][name]
+        hidden = _gemm_hidden(
+            method, layer, dispatch_output, topk_ids, clone_hidden=False
+        )
+    finally:
+        for name, p in gpu.items():
+            p.data = saved[name]
+    ev_gemm[bank].record(cs)
+    # stream the NEXT layer's experts into the other bank while its attention runs
+    from sglang.srt.layers.moe.paged_experts.pager import next_layer_pager
+
+    nxt = next_layer_pager(pager)
+    if nxt is not None and nxt.scratch_ctx() is not None:
+        nbank = getattr(nxt, "_layer_ord", 0) & 1
+        _scratch_fill(nxt, bufs[nbank], nbank, ts, ev_ready[nbank], ev_gemm[nbank])
+        nxt._scratch_prefilled = True
+    return hidden
+
+
 def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct):
     """Serve > K distinct experts in waves; sum the per-wave partials (lossless).
 
@@ -80,6 +152,11 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
     (h2d-done). Each active expert is still served in exactly one wave, so the partial-sum stays
     lossless.
     """
+    hidden = _scratch_prefill_apply(
+        method, layer, dispatch_output, topk_ids, distinct=distinct
+    )
+    if hidden is not None:
+        return hidden
     pager = method._pager
     K, E, dev = pager.K, pager.E, pager.device
     store = pager.store
@@ -176,6 +253,9 @@ def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
     current remap). Under capture the serial full-K wave path runs unchanged — the cross-stream event
     choreography is not worth capturing.
     """
+    hidden = _scratch_prefill_apply(method, layer, dispatch_output, topk_ids)
+    if hidden is not None:
+        return hidden
     pager = method._pager
     E, K = pager.E, pager.K
     half = K // 2

@@ -57,6 +57,9 @@ _REPLAY_PAGERS: list = []
 # Shared double-buffered wave context per device: (transfer_stream, ev_h2d[2], ev_gemm[2], idx_banks[2]).
 # Global because the staging pin buffers it sequences are shared across layers (see ``wave_ctx``).
 _WAVE_CTX: Dict = {}
+# Streaming-prefill scratch pools per device: two full-E per-layer expert buffers ping-ponged across
+# layers (see ``scratch_ctx``). ``False`` = allocation failed once; stay on the wave path.
+_SCRATCH_CTX: Dict = {}
 _MISS_VEC: Optional[torch.Tensor] = (
     None  # [N] int32; slot i = layer i's window-miss count this replay
 )
@@ -419,6 +422,51 @@ class ExpertPager:
             async_h2d=async_h2d,
             src_host=src_host,
         )
+
+    def scratch_ctx(self):
+        """Streaming-prefill scratch pools: TWO full-``[E, *slot]`` buffer sets (one per paged tensor),
+        ping-ponged across layers — while layer i's vanilla E-wide GEMM computes out of one set, the
+        transfer stream fills the other with layer i+1's whole expert set. GLOBAL per device (every MoE
+        layer has identical per-expert shapes in the supported models; verified per call). Returns
+        ``(bufs[2], ev_ready[2], ev_gemm[2])`` or ``None`` (allocation failed / shape mismatch — the
+        caller falls back to the wave path)."""
+        global _SCRATCH_CTX
+        key = torch.device(self.device).index or 0
+        ctx = _SCRATCH_CTX.get(key)
+        if ctx is None:
+            try:
+                bufs = tuple(
+                    {
+                        name: torch.empty(
+                            (self.E, *p.shape[1:]), dtype=p.dtype, device=self.device
+                        )
+                        for name, p in self.store.gpu.items()
+                    }
+                    for _ in range(2)
+                )
+                ctx = (
+                    bufs,
+                    (torch.cuda.Event(), torch.cuda.Event()),
+                    (torch.cuda.Event(), torch.cuda.Event()),
+                )
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(
+                    "[paged-experts] streaming-prefill scratch (2x full-E layer set) does not fit "
+                    "free VRAM — prefill stays on the wave path"
+                )
+                ctx = False
+            _SCRATCH_CTX[key] = ctx
+        if ctx is False:
+            return None
+        # per-call shape guard: a layer whose paged tensors differ (names or shapes) can't use the pool
+        ref = ctx[0][0]
+        if len(ref) != len(self.store.gpu):
+            return None
+        for name, p in self.store.gpu.items():
+            t = ref.get(name)
+            if t is None or t.shape != (self.E, *p.shape[1:]) or t.dtype != p.dtype:
+                return None
+        return ctx
 
     def wave_ctx(self):
         """Shared state for the double-buffered (banked) wave path: ONE transfer stream, two event pairs
