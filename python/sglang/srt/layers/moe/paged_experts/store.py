@@ -50,6 +50,9 @@ def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
         return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
     ptr = ctypes.c_void_p()
     if rt.cudaHostAlloc(ctypes.byref(ptr), ctypes.c_size_t(nbytes), 0) != 0:
+        from sglang.srt.layers.moe.paged_experts.method import _pin_ceiling_cache_reset
+
+        _pin_ceiling_cache_reset()  # the cached ceiling no longer holds; re-measure next boot
         raise RuntimeError(
             f"[paged-experts] cudaHostAlloc({nbytes / 1e9:.2f} GB) for the pinned expert store "
             "failed (OS page-lock ceiling). The auto window should have sized under it; if you set "

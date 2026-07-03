@@ -557,6 +557,90 @@ def _cudart_handle():
     return None
 
 
+def _pin_ceiling_cache_path() -> str:
+    root = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+    return os.path.join(root, "paged_experts_cache", "pin_ceiling.json")
+
+
+def _pin_ceiling_cache_key() -> str:
+    """The page-lock ceiling is a property of the box + OS build (not of the model or current load):
+    key on MemTotal and the kernel version string so a RAM change or WSL update re-measures.
+    """
+    import hashlib
+
+    memtotal = 0
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    memtotal = int(line.split()[1])
+                    break
+    except Exception:
+        pass
+    try:
+        with open("/proc/version") as f:
+            ver = f.read().strip()
+    except Exception:
+        ver = "?"
+    return f"{memtotal}:{hashlib.sha256(ver.encode()).hexdigest()[:12]}"
+
+
+def _pin_ceiling_cache_load() -> dict:
+    import json
+
+    try:
+        with open(_pin_ceiling_cache_path()) as f:
+            return json.load(f).get(_pin_ceiling_cache_key(), {})
+    except Exception:
+        return {}
+
+
+def _pin_ceiling_cache_store(
+    ok: Optional[int] = None, fail: Optional[int] = None
+) -> None:
+    import json
+
+    path = _pin_ceiling_cache_path()
+    key = _pin_ceiling_cache_key()
+    try:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+        ent = data.get(key, {})
+        if ok is not None:
+            ent["ok"] = max(int(ent.get("ok", 0)), int(ok))
+        if fail is not None:
+            ent["fail"] = min(int(ent.get("fail", 1 << 62)), int(fail))
+        data[key] = ent
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass  # cache is an optimization; never fatal
+
+
+def _pin_ceiling_cache_reset() -> None:
+    """Drop this box's cached ceiling (called when a real pinned allocation fails despite the cache —
+    the box state changed; next boot re-measures)."""
+    import json
+
+    path = _pin_ceiling_cache_path()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        data.pop(_pin_ceiling_cache_key(), None)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def _probe_pin_ceiling(target_bytes: int, floor_bytes: int) -> int:
     """Largest page-lockable size <= ``target_bytes``, measured by real ``cudaHostAlloc`` attempts (freed
     immediately) on a descending ladder down to ``floor_bytes``. On pin-capped platforms (WSL2) the true
@@ -575,6 +659,20 @@ def _probe_pin_ceiling(target_bytes: int, floor_bytes: int) -> int:
     # here sizes the window to E-1 instead of a full pin
     size = int(math.ceil(target_bytes))
     floor = int(floor_bytes)
+    # The ceiling is a box property — a cached measurement skips the probe entirely (a 30 GB pin pass
+    # costs ~30-60 s per boot) when a previous boot already verified at least this much, and starts the
+    # ladder below a size known to fail.
+    cached = _pin_ceiling_cache_load()
+    if size <= int(cached.get("ok", 0)):
+        logger.info(
+            "[paged-experts] pin probe: %.2fGB covered by cached ceiling (>=%.2fGB verified) — skipped",
+            size / 1e9,
+            cached["ok"] / 1e9,
+        )
+        return size
+    known_fail = int(cached.get("fail", 0))
+    if known_fail and size >= known_fail:
+        size = min(size, int(known_fail * _PIN_PROBE_DECAY))
     while size > floor:
         ptr = ctypes.c_void_p()
         try:
@@ -586,7 +684,9 @@ def _probe_pin_ceiling(target_bytes: int, floor_bytes: int) -> int:
         )
         if rc == 0:
             rt.cudaFreeHost(ptr)
+            _pin_ceiling_cache_store(ok=size)
             return size
+        _pin_ceiling_cache_store(fail=size)
         size = int(size * _PIN_PROBE_DECAY)
     logger.info("[paged-experts] pin probe: fell through to floor %.2fGB", floor / 1e9)
     return floor
