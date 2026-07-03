@@ -58,6 +58,62 @@ from sglang.srt.layers.moe.paged_experts.store import (  # noqa: E402
 _PRE_LOAD_HOST_AVAIL = _host_available_bytes()
 
 
+# On top of the exact non-expert weight bytes: the serving runtime's own device allocations that land
+# before KV profiling (loader workspaces, quant repack buffers, allocator fragmentation). Weights are
+# exact, so this covers only the runtime. Sized ~2x the runtime need actually observed: configs whose
+# estimated reserve happened to sit ~0.2 GB above their true non-expert weights booted reliably.
+_NONEXPERT_RUNTIME_RESERVE = 0.5e9
+
+
+def _nonexpert_weight_bytes_from_checkpoint(model_path: str) -> Optional[int]:
+    """EXACT non-expert weight bytes, summed from the checkpoint's safetensors headers (8-byte length
+    prefix + JSON; ``data_offsets`` give exact per-tensor sizes — no tensor data is read). Routed
+    experts are the ``.experts.`` tensors; ``.shared_experts.`` deliberately does not match — shared
+    experts stay resident, so they count as non-expert. Returns ``None`` when the checkpoint isn't a
+    locally available safetensors layout (caller falls back to the config estimate)."""
+    import glob
+    import json
+    import struct
+
+    folder = model_path
+    if not os.path.isdir(folder):
+        try:
+            from huggingface_hub import snapshot_download
+
+            folder = snapshot_download(
+                model_path, local_files_only=True, allow_patterns=["*.safetensors*"]
+            )
+        except Exception:
+            return None
+    files = sorted(glob.glob(os.path.join(folder, "*.safetensors")))
+    if not files:
+        return None
+    index = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.exists(index):
+        # a partially cached checkpoint would silently undercount — require every indexed shard
+        try:
+            with open(index) as f:
+                need = set(json.load(f)["weight_map"].values())
+            if not need.issubset({os.path.basename(p) for p in files}):
+                return None
+        except Exception:
+            return None
+    total = 0
+    try:
+        for path in files:
+            with open(path, "rb") as f:
+                (hdr_len,) = struct.unpack("<Q", f.read(8))
+                header = json.loads(f.read(hdr_len))
+            for name, entry in header.items():
+                if name == "__metadata__" or ".experts." in name:
+                    continue
+                begin, end = entry["data_offsets"]
+                total += end - begin
+    except Exception:
+        return None
+    return total
+
+
 def _quant_source(mc, htc):
     """The config object carrying ``quantization_config``. VL checkpoints (e.g. Qwen3.5/3.6 MoE) put it
     on the TOP-level config while ``hf_text_config`` is the nested text config — reading only the text
@@ -156,20 +212,29 @@ def resolve_num_resident_experts(
         # (the documented knob for hybrid concurrency) — don't stack the automatic reserve on top.
         kv_reserve += mamba_per_req * _HYBRID_STATE_SLOTS
 
-    # Non-expert weights: the fixed default underestimates big-vocab / VL checkpoints (a 248k untied
-    # vocab is ~2 GB of embeddings + lm_head alone). Estimate the dominant variable term from config,
-    # floored at the passed default so smaller models keep their K.
-    vocab = getattr(htc, "vocab_size", 0) or 0
-    tied = bool(getattr(htc, "tie_word_embeddings", False))
-    embed_bytes = vocab * htc.hidden_size * 2 * (1 if tied else 2)
-    # 2.0 GB base: attention/dense weights + the serving runtime's own allocations (workspaces,
-    # capture pools) — sized so auto-K boots at default --mem-fraction-static across models.
-    _NONEXPERT_BASE = 2.0e9
-    if getattr(mc.hf_config, "vision_config", None) is not None:
-        embed_bytes += int(
-            1.0e9
-        )  # VL checkpoints load a vision tower + projector alongside the text model
-    nonexpert_bytes = max(nonexpert_reserve_gb * 1e9, _NONEXPERT_BASE + embed_bytes)
+    # Non-expert weights: read EXACTLY from the checkpoint's safetensors headers when available —
+    # embeddings, lm_head, attention/dense/shared-expert weights, vision towers, at their true
+    # (possibly quantized) sizes — plus a runtime reserve for the serving process's own allocations
+    # (workspaces, capture pools). Falls back to a config estimate when the checkpoint isn't locally
+    # readable; both floored at the passed default so smaller models keep their K.
+    exact = _nonexpert_weight_bytes_from_checkpoint(sa.model_path)
+    if exact is not None:
+        nonexpert_bytes = max(
+            nonexpert_reserve_gb * 1e9, exact + _NONEXPERT_RUNTIME_RESERVE
+        )
+    else:
+        # The fixed base underestimates big-vocab / VL checkpoints (a 248k untied vocab is ~2 GB of
+        # embeddings + lm_head alone) — estimate the dominant variable term from config. The 2.0 GB
+        # base covers attention/dense weights + the runtime reserve.
+        vocab = getattr(htc, "vocab_size", 0) or 0
+        tied = bool(getattr(htc, "tie_word_embeddings", False))
+        embed_bytes = vocab * htc.hidden_size * 2 * (1 if tied else 2)
+        _NONEXPERT_BASE = 2.0e9
+        if getattr(mc.hf_config, "vision_config", None) is not None:
+            embed_bytes += int(
+                1.0e9
+            )  # VL checkpoints load a vision tower + projector alongside the text model
+        nonexpert_bytes = max(nonexpert_reserve_gb * 1e9, _NONEXPERT_BASE + embed_bytes)
 
     free = _PRE_LOAD_FREE_BYTES or torch.cuda.mem_get_info()[0]
     top_k = getattr(htc, "num_experts_per_tok", 8) or 8
@@ -186,12 +251,14 @@ def resolve_num_resident_experts(
     )
     logger.info(
         "[paged-experts] resident K=%d/%d (%d%%): free=%.2fGB mem_fraction=%.3f "
-        "KV_reserve=%.2fGB per_expert=%.2fMB moe_layers=%d",
+        "nonexpert=%.2fGB(%s) KV_reserve=%.2fGB per_expert=%.2fMB moe_layers=%d",
         k,
         num_experts_E,
         k * 100 // num_experts_E,
         free / 1e9,
         mem_frac,
+        nonexpert_bytes / 1e9,
+        "exact+reserve" if exact is not None else "estimated",
         kv_reserve / 1e9,
         per_el / 1e6,
         moe_layers,
@@ -308,6 +375,8 @@ def _make_method_class():
                     windowed=self.window > 0,
                     breakable_decode=self._breakable_decode,
                 )
+                if self.window > 0 and self.use_ondevice:
+                    _clamp_capture_bs_to_keep_warm(self.num_resident)
             from sglang.srt.layers.moe.paged_experts.pager import setup_pager
 
             self._pager = setup_pager(self, layer)
@@ -405,6 +474,10 @@ def make_for_layer(
 # of the process needs pageable RAM (a RAM cold tier holds E-W experts; a disk cold tier needs page cache;
 # plus activations and general overhead), and on WSL the page-lock pool is itself capped below RAM.
 _AUTO_WINDOW_HOST_FRACTION = 0.5
+# With a DISK cold tier the cold tail lives in the page cache (clean pages evict under pressure), not in
+# pageable RAM, so the window may claim a larger share — the leftover only needs to cover page cache for
+# the cold working set + process overhead. The pin-ceiling probe still bounds the result.
+_AUTO_WINDOW_HOST_FRACTION_DISK = 0.75
 # Probe-ladder floor on pin-capped platforms, as a fraction of total VRAM: the ladder never probes below
 # this, so sizing is never more conservative than a known-safe bound even if every probe rung fails.
 _AUTO_WINDOW_VRAM_FRACTION = 0.9
@@ -427,6 +500,40 @@ def _pin_is_capped() -> bool:
         return "microsoft" in v or "wsl" in v
     except Exception:
         return False
+
+
+def _clamp_capture_bs_to_keep_warm(K: int) -> None:
+    """Windowed stores cannot serve a captured step whose ``bs*top_k`` exceeds ``K`` — the distinct>K
+    fallback is a host-driven wave, uncapturable, so capture at such sizes used to fail at startup with
+    an error telling the user to lower ``--cuda-graph-max-bs`` themselves. The bound is fully known the
+    moment K and the window resolve (post-load, before graph capture), so clamp the decode capture list
+    here instead. Full-pin stores are deliberately NOT clamped: their wave path is capture-safe, and a
+    captured wave still beats uncaptured decode (they keep the one-time cliff warning).
+    """
+    from sglang.srt.server_args import get_global_server_args
+
+    _, htc, _, _ = _moe_geometry()
+    top_k = getattr(htc, "num_experts_per_tok", 8) or 8
+    cap = max(1, K // top_k)
+    try:
+        decode_cfg = get_global_server_args().cuda_graph_config.decode
+        old_bs = list(decode_cfg.bs)
+        new_bs = [b for b in old_bs if b <= cap] or [cap]
+        if new_bs != old_bs:
+            decode_cfg.bs = new_bs
+            logger.info(
+                "[paged-experts] windowed keep-warm bound (bs*top_k <= K=%d): decode capture batch "
+                "sizes clamped to <=%d (K//top_k); larger batches serve through the uncaptured path",
+                K,
+                cap,
+            )
+    except Exception as e:
+        logger.warning(
+            "[paged-experts] could not clamp decode capture batch sizes (%s); capture at "
+            "bs*top_k > K=%d will be rejected at startup",
+            e,
+            K,
+        )
 
 
 def _cudart_handle():
@@ -489,10 +596,20 @@ def resolve_window_experts(num_experts_E: int) -> int:
     ``ModelConfig`` and calls the pure ``compute_window_experts``. Sizing is automatic; there is no
     user-facing window knob. Cached: every MoE layer resolves the same W.
     """
+    from sglang.srt.server_args import get_global_server_args
+
     _, _, moe_layers, per_el = _moe_geometry()
 
+    cold_backing = getattr(
+        get_global_server_args(), "paged_experts_cold_backing", "ram"
+    )
+    frac = (
+        _AUTO_WINDOW_HOST_FRACTION_DISK
+        if cold_backing == "disk"
+        else _AUTO_WINDOW_HOST_FRACTION
+    )
     avail = _PRE_LOAD_HOST_AVAIL or _host_available_bytes()
-    budget = avail * _AUTO_WINDOW_HOST_FRACTION
+    budget = avail * frac
     store_bytes = per_el * moe_layers * num_experts_E
     probed = False
     if _pin_is_capped():
