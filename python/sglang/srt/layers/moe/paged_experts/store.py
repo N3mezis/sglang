@@ -89,18 +89,26 @@ def _alloc_disk_mmap(cold_dir: Optional[str], dims: tuple, dtype: torch.dtype):
     no stale multi-GB files are left behind. ``cold_dir`` must be on a real disk with room for the cold tier
     (NOT a tmpfs like /tmp, which would defeat the point); falls back to the system temp dir.
 
-    Returns ``(tensor, mm)`` — the ``mmap`` object is returned too so callers can issue ``madvise`` read-ahead
-    hints (the gather otherwise faults one page at a time, serially; see ``WindowedExpertStore.prefetch_cold``).
+    Returns ``(tensor, mm, fd_direct)`` — the ``mmap`` object for ``madvise`` read-ahead hints, and an
+    O_DIRECT descriptor (or None) for page-cache-bypassing cold reads.
     """
     n_bytes = math.prod(dims) * torch.empty([], dtype=dtype).element_size()
     d = cold_dir or tempfile.gettempdir()
     os.makedirs(d, exist_ok=True)
     fd, path = tempfile.mkstemp(dir=d, suffix=".paged_experts_cold")
+    fd_direct = None
     try:
         os.ftruncate(fd, n_bytes)
+        # a second, O_DIRECT descriptor (opened while the path still exists) lets cold reads bypass
+        # the page cache entirely — no fault storm, no disk->cache->staging double copy. None when the
+        # filesystem refuses O_DIRECT; readers fall back to the mmap.
+        try:
+            fd_direct = os.open(path, os.O_RDONLY | os.O_DIRECT)
+        except (OSError, AttributeError):
+            fd_direct = None
         os.unlink(
             path
-        )  # anonymous-on-disk: the inode persists while mmap'd, freed on munmap
+        )  # anonymous-on-disk: the inode persists while mmap'd/open, freed on close
         mm = mmap.mmap(
             fd, n_bytes, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE
         )
@@ -115,7 +123,7 @@ def _alloc_disk_mmap(cold_dir: Optional[str], dims: tuple, dtype: torch.dtype):
         os.close(fd)  # the mapping keeps the inode alive after the fd is closed
     # torch.frombuffer keeps mm alive inside the tensor storage (munmap fires when the tensor is freed)
     t = torch.frombuffer(mm, dtype=dtype, count=math.prod(dims)).reshape(dims)
-    return t, mm
+    return t, mm, fd_direct
 
 
 # --- shared staging machinery for cold-tier page-ins -----------------------------------------------
@@ -127,12 +135,29 @@ def _alloc_disk_mmap(cold_dir: Optional[str], dims: tuple, dtype: torch.dtype):
 # on warm memcpys; the fault parallelism was the winnable part and prefetch already claims it).
 _STAGE_PIN: Dict = {}
 
+# Small worker pool for O_DIRECT cold reads: each pread blocks in the kernel (GIL released), so a few
+# threads build the queue depth the NVMe needs (~QD8 measured ~2x the single-stream rate on this class
+# of disk). Distinct from the refuted "thread the warm memcpys" idea - these are true blocking reads.
+_ODIRECT_POOL = None
+
+
+def _odirect_pool():
+    global _ODIRECT_POOL
+    if _ODIRECT_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        _ODIRECT_POOL = ThreadPoolExecutor(
+            max_workers=6, thread_name_prefix="pe-odirect"
+        )
+    return _ODIRECT_POOL
+
 
 def _stage_pin_buf(name: str, k: int, row_shape, dtype) -> torch.Tensor:
     key = (name, tuple(row_shape), dtype)
     buf = _STAGE_PIN.get(key)
     if buf is None or buf.shape[0] < k:
-        buf = torch.empty((k, *row_shape), dtype=dtype, device="cpu", pin_memory=True)
+        # _pinned_empty: page-aligned base (cudaHostAlloc), which O_DIRECT reads into rows require
+        buf = _pinned_empty((k, *row_shape), dtype)
         _STAGE_PIN[key] = buf
     return buf
 
@@ -337,6 +362,9 @@ class WindowedExpertStore(ExpertStore):
         self._cold_mm: Dict[str, mmap.mmap] = (
             {}
         )  # disk tier mmap objects, for madvise read-ahead hints
+        self._cold_fd: Dict[str, Optional[int]] = (
+            {}
+        )  # disk tier O_DIRECT fds (None = mmap only)
         on_disk = cold_backing == "disk"
         for name, p in self.gpu.items():
             self.host_hot[name] = _pinned_empty((self.W, *p.shape[1:]), p.dtype)
@@ -344,9 +372,11 @@ class WindowedExpertStore(ExpertStore):
             # disk: a >RAM cold tier mmap'd to a file (page-cache-bounded) so the store can exceed RAM;
             # ram: a plain pageable tensor (the cold tier must fit RAM).
             if on_disk:
-                self.host_cold[name], self._cold_mm[name] = _alloc_disk_mmap(
-                    cold_dir, cold_dims, p.dtype
-                )
+                (
+                    self.host_cold[name],
+                    self._cold_mm[name],
+                    self._cold_fd[name],
+                ) = _alloc_disk_mmap(cold_dir, cold_dims, p.dtype)
             else:
                 self.host_cold[name] = torch.empty(
                     cold_dims, dtype=p.dtype, device="cpu", pin_memory=False
@@ -367,12 +397,67 @@ class WindowedExpertStore(ExpertStore):
         self.hot_pos[: self.W] = torch.arange(self.W, dtype=torch.int64)
         self.cold_pos[self.W :] = torch.arange(self.E - self.W, dtype=torch.int64)
 
-    def prefetch_cold(self, experts) -> None:
+    def cold_direct_all(self) -> bool:
+        """True when every paged tensor's cold rows can be read O_DIRECT (fd available, block-aligned
+        rows) — the page-in paths then bypass the page cache, and WILLNEED read-ahead would only pull
+        pages nobody will fault."""
+        if (
+            os.environ.get("SGLANG_PAGED_EXPERTS_ODIRECT", "1") == "0"
+            or not self._cold_fd
+        ):
+            return False
+        return all(
+            self._cold_fd.get(name) is not None and self.item_bytes[name] % 4096 == 0
+            for name in self.gpu
+        )
+
+    def _read_cold_rows_direct(self, name: str, cold_rows, buf: torch.Tensor) -> bool:
+        """O_DIRECT preads of the cold rows straight into the pinned staging rows ``buf[0..n)`` —
+        page-cache bypass (no fault storm, no double copy), queue depth from a small thread pool
+        (preads block in the kernel and release the GIL). Returns False on any precondition/IO failure;
+        the caller falls back to the mmap copy loop."""
+        import ctypes
+
+        fd = self._cold_fd.get(name)
+        nbytes = self.item_bytes[name]
+        if (
+            fd is None
+            or os.environ.get("SGLANG_PAGED_EXPERTS_ODIRECT", "1") == "0"
+            or nbytes % 4096
+            or buf.data_ptr() % 4096
+        ):
+            return False
+        stride = buf[0].numel() * buf.element_size()
+        if stride != nbytes or not buf.is_contiguous():
+            return False
+        base = buf.data_ptr()
+
+        def _rd(i_r):
+            i, r = i_r
+            mv = (ctypes.c_char * nbytes).from_address(base + i * stride)
+            return os.preadv(fd, [mv], r * nbytes) == nbytes
+
+        try:
+            if not all(_odirect_pool().map(_rd, list(enumerate(cold_rows)))):
+                raise OSError("short read")
+            return True
+        except OSError as e:
+            logger.warning(
+                "[paged-experts] O_DIRECT cold read failed for %s (%s) — mmap fallback",
+                name,
+                e,
+            )
+            self._cold_fd[name] = None
+            return False
+
+    def prefetch_cold(self, experts, force: bool = False) -> None:
         """Issue MADV_WILLNEED for the disk-mmap rows of ``experts`` so the kernel does parallel async
         read-ahead (high queue depth) instead of the serial one-page-fault-at-a-time the gather would do.
         No-op unless the cold tier is disk-backed. madvise needs a page-aligned start, so we round the row
         offset down to a page and extend the length to cover the row."""
-        if not self._cold_mm:
+        # O_DIRECT page-ins never fault, so read-ahead would pull pages nobody reads — but callers
+        # that still read via the mmap (decode refills, window re-pins) pass force=True
+        if not self._cold_mm or (self.cold_direct_all() and not force):
             return
         page = mmap.PAGESIZE
         # Hoist row resolution and coalesce adjacent/overlapping page ranges into one madvise each:
@@ -460,8 +545,9 @@ class WindowedExpertStore(ExpertStore):
                     self.host_hot[name].shape[1:],
                     self.host_hot[name].dtype,
                 )
-                for i, r in enumerate(cold_rows):
-                    buf[i].copy_(self.host_cold[name][r])
+                if not self._read_cold_rows_direct(name, cold_rows, buf):
+                    for i, r in enumerate(cold_rows):
+                        buf[i].copy_(self.host_cold[name][r])
                 for i, e in enumerate(cold_experts):
                     targets[name][e].copy_(buf[i], non_blocking=True)
 
@@ -504,8 +590,9 @@ class WindowedExpertStore(ExpertStore):
         ), "window size W is fixed; tier moves must pair up"
         if not promoted:
             return  # membership unchanged
-        # Disk cold tier: queue read-ahead for the promoted rows so the swap below faults them in parallel.
-        self.prefetch_cold(promoted)
+        # Disk cold tier: queue read-ahead for the promoted rows so the swap below faults them in
+        # parallel (force: the swap reads via the mmap even when page-ins go O_DIRECT).
+        self.prefetch_cold(promoted, force=True)
         pairs = [
             (p, d, int(self.hot_pos[d]), int(self.cold_pos[p]))
             for p, d in zip(promoted, demoted)
@@ -584,8 +671,9 @@ class WindowedExpertStore(ExpertStore):
                     gpu_param.shape[1:],
                     gpu_param.dtype,
                 )
-                for i, r in enumerate(cold_rows):
-                    buf[i].copy_(self.host_cold[name][r])
+                if not self._read_cold_rows_direct(name, cold_rows, buf):
+                    for i, r in enumerate(cold_rows):
+                        buf[i].copy_(self.host_cold[name][r])
                 for i, s in enumerate(cold_dst):
                     gpu_param.data[s].copy_(buf[i], non_blocking=True)
             if not async_h2d:

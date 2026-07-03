@@ -153,7 +153,8 @@ def _prefetch_next_step() -> None:
         p._last_cold_ids = []
         store = getattr(p, "store", None)
         if store is not None and hasattr(store, "prefetch_cold"):
-            store.prefetch_cold(ids)
+            # force: the decode refill reads these rows via the mmap, not O_DIRECT
+            store.prefetch_cold(ids, force=True)
 
 
 def _bcg_post_step() -> None:
@@ -1296,8 +1297,11 @@ def _store_cache_dir(model_path: str) -> Optional[str]:
                 with open(fp, "rb") as f:
                     h.update(f.read())
         for fp in sorted(glob.glob(os.path.join(folder, "*.safetensors"))):
+            st = os.stat(fp)
+            # size AND mtime: an updated checkpoint (e.g. an RL loop rewriting shards in place) keeps
+            # names/shapes/sizes — without the mtime the digest would collide and serve stale experts
             h.update(os.path.basename(fp).encode())
-            h.update(str(os.path.getsize(fp)).encode())
+            h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
     except Exception:
         return None
     root = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
