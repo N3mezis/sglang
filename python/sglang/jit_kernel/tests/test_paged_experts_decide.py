@@ -62,16 +62,16 @@ def _ref_decide(topk, slot_expert, expert_slot, slot_lastuse, freq, step, lfu):
     return src, dst
 
 
-def _ref_wave(topk, E, K, w):
+def _ref_wave(topk, E, K, w, slot_base=0):
     lo, hi = w * K, w * K + K
-    idx = [(e - lo) if lo <= e < hi else -1 for e in range(E)]
+    idx = [(e - lo + slot_base) if lo <= e < hi else -1 for e in range(E)]
     src, dst = [], []
     for e in topk:
         if not (lo <= e < hi):
             continue
         if e not in src:
             src.append(e)
-            dst.append(e - lo)
+            dst.append(e - lo + slot_base)
     return src, dst, idx
 
 
@@ -153,6 +153,25 @@ def test_decide_wave_matches_reference():
     assert sorted(served) == sorted(
         experts
     )  # every active expert served in exactly one wave
+
+    # banked (double-buffered) waves: half-K waves ping-pong between slot banks 0 and K//2 —
+    # dst/idx carry the bank offset, and every active expert is still served in exactly one wave
+    half = K // 2
+    nwaves = (E + half - 1) // half
+    served = []
+    for w in range(nwaves):
+        base = (w & 1) * half
+        paged_experts_decide_wave(
+            topk, E, half, w, src, dst, n_out, idx, slot_base=base
+        )
+        r_src, r_dst, r_idx = _ref_wave(experts, E, half, w, slot_base=base)
+        n = int(n_out.item())
+        assert idx.tolist() == r_idx, f"banked wave {w}: idx"
+        assert src[:n].tolist() == r_src, f"banked wave {w}: src"
+        assert dst[:n].tolist() == r_dst, f"banked wave {w}: dst"
+        assert all(base <= s < base + half for s in dst[:n].tolist())
+        served += src[:n].tolist()
+    assert sorted(served) == sorted(experts)
 
 
 @requires_cuda

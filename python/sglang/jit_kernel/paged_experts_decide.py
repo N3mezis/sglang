@@ -138,20 +138,31 @@ def paged_experts_decide_wave(
     dst: torch.Tensor,
     n_out: torch.Tensor,
     idx: torch.Tensor,
+    slot_base: int = 0,
 ) -> None:
     """On-device static fixed-wave decision for Paged Experts (distinct active experts > K).
 
-    Expert ``e`` has a static home — wave ``floor(e/K)``, slot ``e % K``. For ``wave`` this emits the
-    page-in plan for the distinct in-wave experts present in ``topk`` and writes ``idx`` so out-of-wave
-    experts map to -1 (masked to weight 0). The caller runs ``ceil(num_experts/num_slots)`` waves and sums
-    the per-wave GEMM partials — lossless. No eviction, no state mutation, no host sync (capturable).
+    Expert ``e`` has a static home — wave ``floor(e/K)``, slot ``e % K + slot_base``. For ``wave`` this
+    emits the page-in plan for the distinct in-wave experts present in ``topk`` and writes ``idx`` so
+    out-of-wave experts map to -1 (masked to weight 0). The caller runs ``ceil(num_experts/num_slots)``
+    waves and sums the per-wave GEMM partials — lossless. ``slot_base`` banks the slot pool for
+    double-buffered waves (page bank B while bank A computes). No eviction, no state mutation, no host
+    sync (capturable).
 
-    All tensors are ``int32`` CUDA: ``topk`` ``[topk_n]``, ``src``/``dst`` ``[>=K]``, ``n_out`` ``[1]``,
-    ``idx`` ``[num_experts]``.
+    All tensors are ``int32`` CUDA: ``topk`` ``[topk_n]``, ``src``/``dst`` ``[>=num_slots]``, ``n_out``
+    ``[1]``, ``idx`` ``[num_experts]``.
     """
     module = _jit_paged_experts_decide_module()
     module.decide_wave(
-        topk, int(num_experts), int(num_slots), int(wave), src, dst, n_out, idx
+        topk,
+        int(num_experts),
+        int(num_slots),
+        int(wave),
+        int(slot_base),
+        src,
+        dst,
+        n_out,
+        idx,
     )
 
 

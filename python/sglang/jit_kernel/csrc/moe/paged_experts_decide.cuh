@@ -227,17 +227,28 @@ __global__ void decide_bounded_kernel(
 }
 
 // Static fixed-wave decision (distinct active experts > K, e.g. prefill / batched decode). Expert e has a
-// STATIC home: wave floor(e/K), slot e%K. For wave w this emits the page-in plan for the distinct in-wave
-// experts present in topk (src=e, dst=e-w*K) and writes idx[e] = (e in [w*K, (w+1)*K)) ? e-w*K : -1. The
-// caller runs ceil(E/K) waves; each active expert is served in exactly its wave, so summing the per-wave
-// GEMM partials reconstructs the full MoE output (lossless). No eviction, no state mutation, no host sync.
+// STATIC home: wave floor(e/K), slot e%K + slot_base. For wave w this emits the page-in plan for the
+// distinct in-wave experts present in topk (src=e, dst=e-w*K+slot_base) and writes idx[e] =
+// (e in [w*K, (w+1)*K)) ? e-w*K+slot_base : -1. The caller runs ceil(E/K) waves; each active expert is
+// served in exactly its wave, so summing the per-wave GEMM partials reconstructs the full MoE output
+// (lossless). slot_base banks the slot pool for double-buffered waves: bank B pages on an alternate
+// stream while bank A's GEMM computes. No eviction, no state mutation, no host sync.
 __global__ void decide_wave_kernel(
-    const int32_t* topk, int topk_n, int E, int K, int w, int32_t* src, int32_t* dst, int32_t* n_out, int32_t* idx) {
+    const int32_t* topk,
+    int topk_n,
+    int E,
+    int K,
+    int w,
+    int slot_base,
+    int32_t* src,
+    int32_t* dst,
+    int32_t* n_out,
+    int32_t* idx) {
   if (blockIdx.x || threadIdx.x >= 32) return;
   const int lane = threadIdx.x;
   const int lo = w * K, hi = lo + K;
   for (int e = lane; e < E; e += 32)
-    idx[e] = (e >= lo && e < hi) ? (e - lo) : -1;
+    idx[e] = (e >= lo && e < hi) ? (e - lo + slot_base) : -1;
   if (lane == 0) {
     int n = 0;
     for (int i = 0; i < topk_n; ++i) {
@@ -250,9 +261,9 @@ __global__ void decide_wave_kernel(
           break;
         }
       }
-      if (!seen) {  // distinct in-wave hit -> its home slot
+      if (!seen) {  // distinct in-wave hit -> its home slot (bank-offset)
         src[n] = e;
-        dst[n] = e - lo;
+        dst[n] = e - lo + slot_base;
         ++n;
       }
     }
@@ -479,6 +490,7 @@ void decide_wave(
     int64_t num_experts,
     int64_t num_slots,
     int64_t wave,
+    int64_t slot_base,
     tvm::ffi::TensorView src,
     tvm::ffi::TensorView dst,
     tvm::ffi::TensorView n_out,
@@ -502,6 +514,7 @@ void decide_wave(
       static_cast<int>(num_experts),
       static_cast<int>(num_slots),
       static_cast<int>(wave),
+      static_cast<int>(slot_base),
       static_cast<int32_t*>(src.data_ptr()),
       static_cast<int32_t*>(dst.data_ptr()),
       static_cast<int32_t*>(n_out.data_ptr()),

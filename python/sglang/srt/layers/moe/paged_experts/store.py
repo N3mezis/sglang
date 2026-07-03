@@ -189,11 +189,22 @@ class ExpertStore(ABC):
                 )
 
     @abstractmethod
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
         """Copy ``host[src_experts[i]] -> gpu[dst_slots[i]]`` for every paged tensor.
 
         ``src_experts`` / ``dst_slots`` are device ``int64`` index tensors from the pager's decision; a
-        no-op for an empty plan.
+        no-op for an empty plan. ``stage_bank`` selects an independent staging-buffer set, ``async_h2d``
+        skips any trailing stream sync, and ``src_host`` passes the plan as a host list so the store
+        needs no D2H read-back — the double-buffered wave path's knobs (the caller sequences
+        buffer/slot reuse with events); stores without staging may ignore what they don't use.
         """
 
     # --- checkpoint-fill accessors (store-layout-agnostic; used by ``pager.setup_pager``) ---
@@ -215,7 +226,15 @@ class PinnedExpertStore(ExpertStore):
 
     pinned = True
 
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
         if src_experts.numel() == 0:
             return
         from sgl_kernel import transfer_kv_per_layer_mla
@@ -237,10 +256,22 @@ class PageableExpertStore(ExpertStore):
 
     pinned = False
 
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
         if src_experts.numel() == 0:
             return
-        src_cpu = src_experts.to("cpu")
+        src_cpu = (
+            torch.tensor(src_host, dtype=torch.int64)
+            if src_host is not None
+            else src_experts.to("cpu")
+        )
         for name, gpu_param in self.gpu.items():
             rows = self.host[name].index_select(0, src_cpu).to(gpu_param.device)
             gpu_param.data.index_copy_(0, dst_slots, rows)
@@ -439,10 +470,24 @@ class WindowedExpertStore(ExpertStore):
             self.cold_pos[d] = cold_row
             self.cold_pos[p] = -1
 
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
         if src_experts.numel() == 0:
             return
-        src_cpu = src_experts.to("cpu")
+        # the wave path already holds the plan as a host list — reading it back off the device would
+        # stall the CPU on the stream (a D2H sync per wave, fatal to the double-buffered overlap)
+        src_cpu = (
+            torch.tensor(src_host, dtype=torch.int64)
+            if src_host is not None
+            else src_experts.to("cpu")
+        )
         hot_mask = (
             self.hot_pos[src_cpu] >= 0
         )  # which planned experts live in the pinned window
@@ -475,17 +520,23 @@ class WindowedExpertStore(ExpertStore):
             n = len(cold_rows)
             # Gather into PINNED buffers, then direct async H2D per slot: the old
             # index_select -> pageable .to() -> index_copy_ chain crossed the bytes through a pageable
-            # temp AND copied device->device again.
+            # temp AND copied device->device again. ``stage_bank`` keys an independent buffer set so the
+            # double-buffered wave path can gather wave w+1 while wave w's H2D is still in flight.
             for name, gpu_param in self.gpu.items():
                 buf = _stage_pin_buf(
-                    name, max(self.K, n), gpu_param.shape[1:], gpu_param.dtype
+                    f"{name}#b{stage_bank}" if stage_bank else name,
+                    max(self.K, n),
+                    gpu_param.shape[1:],
+                    gpu_param.dtype,
                 )
                 for i, r in enumerate(cold_rows):
                     buf[i].copy_(self.host_cold[name][r])
                 for i, s in enumerate(cold_dst):
                     gpu_param.data[s].copy_(buf[i], non_blocking=True)
-            # the shared pinned bufs must not be reused (next layer / next wave) while H2D is in flight
-            torch.cuda.current_stream().synchronize()
+            if not async_h2d:
+                # the shared pinned bufs must not be reused (next layer / next wave) while H2D is in
+                # flight; the async caller sequences reuse with events instead
+                torch.cuda.current_stream().synchronize()
 
 
 def make_expert_store(

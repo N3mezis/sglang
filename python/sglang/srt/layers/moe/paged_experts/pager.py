@@ -54,6 +54,9 @@ _PROF = {
 # experts into their GPU slots out-of-graph and we replay the SAME graph again (the residency maps it reads
 # are fixed-address, so the next replay sees them resident). Converges in ~1 extra replay.
 _REPLAY_PAGERS: list = []
+# Shared double-buffered wave context per device: (transfer_stream, ev_h2d[2], ev_gemm[2], idx_banks[2]).
+# Global because the staging pin buffers it sequences are shared across layers (see ``wave_ctx``).
+_WAVE_CTX: Dict = {}
 _MISS_VEC: Optional[torch.Tensor] = (
     None  # [N] int32; slot i = layer i's window-miss count this replay
 )
@@ -396,9 +399,49 @@ class ExpertPager:
     def pin_host(self) -> bool:
         return self.store.pinned
 
-    def page_in(self, src_experts: torch.Tensor, dst_slots: torch.Tensor) -> None:
-        """Page the chosen experts into their slots via the store (transport-specific; a no-op if empty)."""
-        self.store.page_in(src_experts, dst_slots)
+    def page_in(
+        self,
+        src_experts: torch.Tensor,
+        dst_slots: torch.Tensor,
+        *,
+        stage_bank: int = 0,
+        async_h2d: bool = False,
+        src_host: Optional[list] = None,
+    ) -> None:
+        """Page the chosen experts into their slots via the store (transport-specific; a no-op if empty).
+        ``stage_bank``/``async_h2d``/``src_host`` are the double-buffered wave path's knobs: separate
+        staging buffers per bank, no trailing stream sync (the caller sequences buffer reuse with
+        events), and a host-side copy of the plan (no D2H read-back)."""
+        self.store.page_in(
+            src_experts,
+            dst_slots,
+            stage_bank=stage_bank,
+            async_h2d=async_h2d,
+            src_host=src_host,
+        )
+
+    def wave_ctx(self):
+        """Shared state for the double-buffered (banked) wave path: ONE transfer stream, two event pairs
+        (h2d-done / gemm-done per bank), and two per-bank idx buffers so wave w+1's decide cannot race
+        wave w's remap. GLOBAL (per device), not per-pager: the staging pin buffers it guards are shared
+        across layers, so bank reuse must be sequenced across layer boundaries by the same events.
+        """
+        global _WAVE_CTX
+        dev = torch.device(self.device)
+        key = dev.index or 0
+        ctx = _WAVE_CTX.get(key)
+        if ctx is None or ctx[3][0].numel() < self.E:
+            ctx = (
+                torch.cuda.Stream(device=dev),
+                (torch.cuda.Event(), torch.cuda.Event()),
+                (torch.cuda.Event(), torch.cuda.Event()),
+                (
+                    torch.full((self.E,), -1, dtype=torch.int32, device=dev),
+                    torch.full((self.E,), -1, dtype=torch.int32, device=dev),
+                ),
+            )
+            _WAVE_CTX[key] = ctx
+        return ctx
 
     def distinct_active(self, topk_ids: torch.Tensor):
         """Sorted distinct active (>=0) expert ids this step, as a host list (one host sync)."""
@@ -833,10 +876,21 @@ class ExpertPager:
         # hard zero would erase the very frequency history LFU keys on right after the re-pin.
         self._freq_d.copy_(torch.div(self._freq_d, 2, rounding_mode="floor"))
 
-    def decide_and_page_wave_ondevice(self, topk_ids: torch.Tensor, wave: int) -> None:
+    def decide_and_page_wave_ondevice(
+        self,
+        topk_ids: torch.Tensor,
+        wave: int,
+        *,
+        wave_k: Optional[int] = None,
+        slot_base: int = 0,
+        idx_out: Optional[torch.Tensor] = None,
+    ) -> None:
         """One static wave (distinct > K, e.g. prefill): plan + gather the in-wave experts on-device. The
-        caller runs ceil(E/K) waves and sums the per-wave GEMM partials, then calls
-        ``resync_residency_ondevice`` so the keep-warm state matches the slots."""
+        caller runs ceil(E/wave_k) waves and sums the per-wave GEMM partials, then calls
+        ``resync_residency_ondevice`` so the keep-warm state matches the slots. The banked
+        (double-buffered) caller passes ``wave_k = K//2`` with alternating ``slot_base`` and a per-bank
+        ``idx_out`` (so the next wave's decide cannot race this wave's remap); the captured caller uses
+        the defaults (full-K waves into ``logical_to_gpu_index_cuda``)."""
         from sglang.jit_kernel.paged_experts_decide import paged_experts_decide_wave
 
         if wave == 0:
@@ -844,36 +898,40 @@ class ExpertPager:
         paged_experts_decide_wave(
             self._topk_i32,
             self.E,
-            self.K,
+            wave_k if wave_k is not None else self.K,
             wave,
             self._src_d,
             self._dst_d,
             self._n_out_d,
-            self.logical_to_gpu_index_cuda,
+            idx_out if idx_out is not None else self.logical_to_gpu_index_cuda,
+            slot_base=slot_base,
         )
         self._gather_planned_ondevice()
 
-    def resync_residency_ondevice(self, last_wave: int) -> None:
-        """After the wave loop the slots physically hold wave ``last_wave``'s experts. Point the device
-        keep-warm state at that so the next decode step is consistent (``logical_to_gpu_index_cuda`` was
-        already set to this wave by the last ``decide_wave``)."""
-        lo = last_wave * self.K
-        ngrp = min(self.K, self.E - lo)
+    def resync_residency_ondevice(self, lo: int, ngrp: int, slot_base: int = 0) -> None:
+        """After the wave loop, slots ``[slot_base, slot_base+ngrp)`` physically hold experts
+        ``[lo, lo+ngrp)``. Point the device keep-warm state (and the live remap) at that so the next
+        decode step is consistent."""
+        self._slot_expert_d.fill_(-1)
         idx = torch.arange(lo, lo + ngrp, dtype=torch.int32, device=self.device)
-        self._slot_expert_d[:ngrp] = idx
-        if ngrp < self.K:
-            self._slot_expert_d[ngrp:] = -1
+        self._slot_expert_d[slot_base : slot_base + ngrp] = idx
+        l2g = self.logical_to_gpu_index_cuda
+        l2g.fill_(-1)
+        l2g[lo : lo + ngrp] = torch.arange(
+            slot_base, slot_base + ngrp, dtype=torch.int32, device=self.device
+        )
         self._slot_lastuse_d.zero_()
 
-    def set_residency(self, experts) -> None:
-        """Force slot ``i`` to hold ``experts[i]`` and rebuild the maps. Called after the wave path so
-        the next keep-warm step's residency state matches what is physically in the slots.
+    def set_residency(self, experts, base: int = 0) -> None:
+        """Force slot ``base + i`` to hold ``experts[i]`` and rebuild the maps. Called after the wave
+        path so the next keep-warm step's residency state matches what is physically in the slots
+        (``base`` is the last wave's bank offset on the double-buffered path).
         """
         experts = list(experts)
-        self.slot_expert = experts + [-1] * (self.K - len(experts))
+        self.slot_expert = [-1] * base + experts + [-1] * (self.K - base - len(experts))
         self.logical_to_gpu_index.fill_(-1)
         for i, e in enumerate(experts):
-            self.logical_to_gpu_index[e] = i
+            self.logical_to_gpu_index[e] = base + i
         self.logical_to_gpu_index_cuda.copy_(self.logical_to_gpu_index)
         if self.ondevice:
             # Keep the device keep-warm state coherent too: decide/decide_bounded read _slot_expert_d to
