@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import os
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
@@ -141,6 +142,20 @@ class RadixAttention(nn.Module):
                     q, k, v, output, save_kv_cache, self.layer_id, **kwargs
                 )
             return output
+        elif (
+            os.environ.get("SGLANG_DEBUG_EAGER_ATTN", "0") == "1"
+            and is_in_breakable_cuda_graph()
+            and forward_batch.forward_mode.is_decode()
+        ):
+            # DEBUG bisection: run decode attention as an eager break inside the otherwise-captured
+            # decode graph (the designed BCG mechanism, as used for alt-stream models) — splits
+            # "attention captured" from "MoE captured" when hunting graph-content corruption.
+            _fn = eager_on_graph(True)(
+                lambda q_, k_, v_: get_attn_backend().forward(
+                    q_, k_, v_, self, forward_batch, save_kv_cache, **kwargs
+                )
+            )
+            return _fn(q, k, v)
         else:
             return get_attn_backend().forward(
                 q,

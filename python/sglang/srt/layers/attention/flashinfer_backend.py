@@ -231,6 +231,11 @@ def fast_prefill_plan(
     batch_size = len(paged_kv_last_page_len)
 
     total_num_rows = int(qo_indptr_host[-1])
+    if os.environ.get("SGLANG_DEBUG_PLAN_SYNC", "0") == "1":
+        # DEBUG: restore the stock plan's queue-drain semantics. The module plan below rewrites the
+        # wrapper's PINNED int-workspace staging on the CPU and issues an async H2D from it; without a
+        # drain, a deep GPU queue lets the NEXT plan's CPU rewrite race the in-flight copy.
+        torch.cuda.current_stream().synchronize()
     self._qo_indptr_last = total_num_rows
     self._max_q_len = max_q_len
     self._max_kv_len = max_kv_len

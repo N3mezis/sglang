@@ -122,6 +122,8 @@ class CapturedPlacement(Placement):
     needs_ondevice_store = True
 
     def apply(self, method, layer, dispatch_output):
+        import os
+
         from sglang.srt.layers.moe.paged_experts.forward import _ondevice_wave_apply
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -129,8 +131,36 @@ class CapturedPlacement(Placement):
         topk_ids = dispatch_output.topk_output.topk_ids
         keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] <= pager.K
         if keep_warm:
-            pager.decide_and_page_ondevice(topk_ids)
-            hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
+            mode = os.environ.get("SGLANG_PAGED_EXPERTS_EAGER_BREAK", "0")
+            if mode == "2":
+                # DEBUG bisection, finer: only decide+gather (the UVA-reading half) runs as an eager
+                # break; remap+GEMM stay captured alongside flashinfer.
+                from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+                    eager_on_graph,
+                )
+
+                def _decide_eager(topk_ids_):
+                    pager.decide_and_page_ondevice(topk_ids_)
+                    return topk_ids_  # tensor return for the break plumbing
+
+                eager_on_graph(True)(_decide_eager)(topk_ids)
+                hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
+            elif mode == "1":
+                # DEBUG bisection: run the paged MoE as an eager break inside the otherwise-captured
+                # decode graph (breakable backend only) — splits "our captured kernels" from
+                # "flashinfer's captured kernels" when hunting graph-content corruption.
+                from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+                    eager_on_graph,
+                )
+
+                def _moe_eager(topk_ids_):
+                    pager.decide_and_page_ondevice(topk_ids_)
+                    return _keep_warm_gemm(method, layer, dispatch_output, pager)
+
+                hidden = eager_on_graph(True)(_moe_eager)(topk_ids)
+            else:
+                pager.decide_and_page_ondevice(topk_ids)
+                hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
         else:  # distinct can exceed K (prefill / big batch): static waves, summed
             _warn_wave_capture_once(pager, topk_ids)
             hidden = _ondevice_wave_apply(method, layer, dispatch_output, topk_ids)

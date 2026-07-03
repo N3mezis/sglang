@@ -97,9 +97,13 @@ def _scratch_prefill_apply(method, layer, dispatch_output, topk_ids, distinct=No
     serve. Returns the hidden output, or ``None`` when the scratch pool is unavailable (caller falls
     back to the wave path).
     """
+    import os
+
     pager = method._pager
     if torch.cuda.is_current_stream_capturing():
         return None
+    if os.environ.get("SGLANG_PAGED_EXPERTS_SCRATCH", "1") == "0":
+        return None  # kill switch (debug / A-B)
     if distinct is not None and len(distinct) < (6 * pager.E) // 10:
         return None  # sparse big batch: waves move fewer bytes
     store = pager.store
@@ -168,9 +172,12 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
     # waves are transfer-bound with little to hide, and halving the wave size nearly doubles the
     # per-wave fixed costs (masked-GEMM pass + transfer launches) — measured net-negative (fp8-30B:
     # 934 -> 603 tok/s prefill), so those keep serial full-K waves.
+    import os
+
     banked = (
         half > 0
         and bool(getattr(store, "_cold_mm", {}))
+        and os.environ.get("SGLANG_PAGED_EXPERTS_BANKED", "1") != "0"
         and not torch.cuda.is_current_stream_capturing()
     )
     wave_k = half if banked else K
@@ -265,10 +272,16 @@ def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
     hidden = _scratch_prefill_apply(method, layer, dispatch_output, topk_ids)
     if hidden is not None:
         return hidden
+    import os
+
     pager = method._pager
     E, K = pager.E, pager.K
     half = K // 2
-    banked = half > 0 and not torch.cuda.is_current_stream_capturing()
+    banked = (
+        half > 0
+        and os.environ.get("SGLANG_PAGED_EXPERTS_BANKED", "1") != "0"
+        and not torch.cuda.is_current_stream_capturing()
+    )
     if not banked:
         nwaves = (E + K - 1) // K
         out = None
