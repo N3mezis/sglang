@@ -1407,6 +1407,19 @@ class FlashInferIndicesUpdaterDecode:
                 )
             )
 
+        if os.environ.get("SGLANG_DEBUG_PLAN_TRACE") == "1":
+            logger.warning(
+                "[plan-trace] decode plan: wrapper_fixed_bs=%s bs=%s lens=%s stream=%s",
+                getattr(wrapper, "_fixed_batch_size", "?"),
+                bs,
+                (
+                    seq_lens_cpu.tolist()
+                    if seq_lens_cpu is not None
+                    else "(device-only)"
+                ),
+                torch.cuda.current_stream().cuda_stream,
+            )
+
         global global_override_indptr_cpu
         locally_override = False
         if seq_lens_cpu is not None and global_override_indptr_cpu is None:

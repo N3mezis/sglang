@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import os
 import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -913,6 +914,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.deepep_adapter.replay()
 
         if not forward_batch.needs_forward_metadata_init():
+            if os.environ.get("SGLANG_DEBUG_PLAN_TRACE") == "1":
+                logger.warning(
+                    "[plan-trace] PREPLANNED replay: stored bucket=%s raw_bs(now)=%s",
+                    self.bs,
+                    forward_batch.batch_size,
+                )
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
@@ -991,6 +998,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        if os.environ.get("SGLANG_DEBUG_PLAN_TRACE") == "1":
+            logger.warning(
+                "[plan-trace] FULL-PREP replay: bucket=%s raw_bs=%s", bs, raw_bs
+            )
         attn_backend.init_forward_metadata_out_graph(fb_view)
 
         # Store fields
@@ -1031,6 +1042,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 read_done = self.device_module.Event()
                 read_done.record()
                 self.model_runner.war_fastpath_read_done_event = read_done
+            if os.environ.get("SGLANG_DEBUG_PLAN_TRACE") == "1":
+                logger.warning(
+                    "[plan-trace] REPLAY key=%s stream=%s",
+                    self._replay_graph_key,
+                    torch.cuda.current_stream().cuda_stream,
+                )
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
         if isinstance(output, LogitsProcessorOutput):

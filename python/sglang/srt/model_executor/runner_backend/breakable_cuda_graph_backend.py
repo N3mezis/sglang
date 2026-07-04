@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import os
 import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
@@ -139,7 +140,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         size = shape_key.size
         with BreakableCUDAGraphCapture(
             cuda_graph=graph,
-            pool=self._pool,
+            pool=(
+                None
+                if os.environ.get("SGLANG_DEBUG_PRIVATE_GRAPH_POOLS") == "1"
+                else self._pool
+            ),
             stream=self._capture_stream,
         ):
             out = captured_fn()
