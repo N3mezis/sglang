@@ -329,6 +329,23 @@ class FlashInferAttnBackend(AttentionBackend):
                 get_parallel().attn_tp_size
             ),
         )
+        # Tensor-core decode (prefill-kernel path) co-captured with paged-experts
+        # kernels crashes under concurrent mixed prefill/decode load; the CUDA-core
+        # decode path performs equivalently, so prefer it unless explicitly overridden
+        # via SGLANG_FLASHINFER_USE_TENSOR_CORE.
+        if (
+            self.decode_use_tensor_cores
+            and model_runner.server_args.enable_paged_experts
+            and not model_runner.server_args.disable_cuda_graph
+            and not model_runner.server_args.disable_decode_cuda_graph
+            and os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE") is None
+        ):
+            logger.warning(
+                "Disabling flashinfer tensor-core decode: it is unstable when "
+                "captured alongside paged-experts kernels. Set "
+                "SGLANG_FLASHINFER_USE_TENSOR_CORE=true to override."
+            )
+            self.decode_use_tensor_cores = False
         self.max_context_len = model_runner.model_config.context_len
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
