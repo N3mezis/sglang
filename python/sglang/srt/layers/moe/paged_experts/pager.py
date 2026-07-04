@@ -629,6 +629,17 @@ class ExpertPager:
         self._gm_slots = torch.tensor(
             [self.gpu[n].data.data_ptr() for n in names], dtype=torch.int64, device=dev
         )
+        if os.environ.get("SGLANG_DEBUG_PTR_MAP") == "1":
+            logger.warning(
+                "[ptr-map] paged layer=%s pools=%s idx=[0x%x..0x%x]",
+                getattr(self, "layer_id", "?"),
+                {
+                    n: f"0x{self.gpu[n].data.data_ptr():x}+0x{self.gpu[n].data.numel() * self.gpu[n].data.element_size():x}"
+                    for n in names
+                },
+                self._slot_expert_d.data_ptr(),
+                self._n_out_d.data_ptr() + 4,
+            )
         self._gm_e16s = torch.tensor(
             [self.item_bytes[n] // 16 for n in names], dtype=torch.int64, device=dev
         )

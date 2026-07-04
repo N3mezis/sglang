@@ -891,8 +891,33 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
+        if os.environ.get("SGLANG_DEBUG_PTR_MAP") == "1":
+            _r = lambda t: f"0x{t.data_ptr():x}+0x{t.numel() * t.element_size():x}"
+            logger.warning(
+                "[ptr-map] cuda_graph_kv_indices=%s kv_indptr=%s kv_last_page_len=%s",
+                [_r(t) for t in self.cuda_graph_kv_indices],
+                [_r(t) for t in self.kv_indptr],
+                _r(self.kv_last_page_len),
+            )
+            logger.warning(
+                "[ptr-map] float_workspace=%s req_to_token=%s",
+                _r(self.workspace_buffer),
+                _r(self.req_to_token_pool.req_to_token),
+            )
+            kbuf = getattr(self.token_to_kv_pool, "k_buffer", None)
+            vbuf = getattr(self.token_to_kv_pool, "v_buffer", None)
+            if kbuf is not None and vbuf is not None:
+                logger.warning(
+                    "[ptr-map] kv_pool k=[%s..%s] v=[%s..%s] layers=%d",
+                    _r(kbuf[0]),
+                    _r(kbuf[-1]),
+                    _r(vbuf[0]),
+                    _r(vbuf[-1]),
+                    len(kbuf),
+                )
+
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
-        return [
+        wrappers = [
             BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
@@ -905,6 +930,17 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             for i in range(self.num_wrappers)
         ]
+        if os.environ.get("SGLANG_DEBUG_PTR_MAP") == "1":
+            _r = lambda t: f"0x{t.data_ptr():x}+0x{t.numel() * t.element_size():x}"
+            for i, w in enumerate(wrappers):
+                logger.warning(
+                    "[ptr-map] decode_wrapper bs=%d i=%d int_ws=%s pin_int_ws=%s",
+                    bs,
+                    i,
+                    _r(w._int_workspace_buffer),
+                    _r(w._pin_memory_int_workspace_buffer),
+                )
+        return wrappers
 
     def _create_prefill_wrappers(self, bs: int, use_custom_mask: bool = False) -> list:
         # FlashInfer's prefill wrapper decides mask mode based on whether
