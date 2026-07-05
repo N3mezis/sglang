@@ -1073,9 +1073,10 @@ def _weight_map(snap: str) -> Dict[str, str]:
     (small/quantized checkpoints are often one file)."""
     import glob
 
-    idx = os.path.join(snap, "model.safetensors.index.json")
-    if os.path.exists(idx):
-        return json.load(open(idx))["weight_map"]
+    for idx_name in ("model.safetensors.index.json", "consolidated.safetensors.index.json"):
+        idx = os.path.join(snap, idx_name)
+        if os.path.exists(idx):
+            return json.load(open(idx))["weight_map"]
     from safetensors import safe_open
 
     files = glob.glob(os.path.join(snap, "*.safetensors"))
@@ -1092,6 +1093,8 @@ def _experts_prefix(wmap: Dict[str, str], layer_idx: int) -> str:
     for pre in (
         f"model.layers.{layer_idx}.mlp.experts.",
         f"model.language_model.layers.{layer_idx}.mlp.experts.",
+        # Mistral consolidated native layout (Mistral-Small-4 nvfp4): no model./mlp. nesting.
+        f"layers.{layer_idx}.experts.",
     ):
         if any(
             k.startswith(pre) for k in (wmap.keys() if hasattr(wmap, "keys") else wmap)
@@ -1099,8 +1102,18 @@ def _experts_prefix(wmap: Dict[str, str], layer_idx: int) -> str:
             return pre
     raise RuntimeError(
         f"[paged-experts] no expert tensors found for layer {layer_idx} under known prefixes "
-        "(model.layers. / model.language_model.layers.) — unsupported checkpoint layout."
+        "(model.layers. / model.language_model.layers. / layers.) — unsupported checkpoint layout."
     )
+
+
+# proj naming: HF layouts use gate/up/down_proj; Mistral consolidated uses w1/w3/w2.
+def _proj_names(wmap, pre: str) -> tuple:
+    """Return (gate, up, down) proj tensor-name stems present under ``pre`` for expert 0."""
+    keys = wmap.keys() if hasattr(wmap, "keys") else wmap
+    have = {k[len(pre) + 2 :].split(".")[0] for k in keys if k.startswith(pre + "0.")}
+    if {"w1", "w2", "w3"} <= have:
+        return ("w1", "w3", "w2")  # gate, up, down (Mistral)
+    return ("gate_proj", "up_proj", "down_proj")
 
 
 def _fill_gptq_marlin_from_checkpoint(
@@ -1377,6 +1390,100 @@ def _save_store_to_cache(store, cache_dir: Optional[str], layer_idx: int) -> Non
         )
 
 
+def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
+    """NVFP4 (compressed-tensors nvfp4-pack). Packed uint8 weights copy straight into the host store;
+    per-group-of-16 fp8 block scales are swizzled to the cutlass 128x4 layout (matching
+    CompressedTensorsW4A4Nvfp4MoE.process_weights_after_loading, non-trtllm path) and stored as paged
+    tensors. The tiny per-expert global/input scalars can't page (sub-8-byte rows), so this returns the
+    four runtime-relevant ones as a resident full-E table {name: [E] f32}; forward._gemm_hidden scatters
+    them into the K slots each step by the live residency map. w1=gate, w3=up, w2=down.
+    """
+    from safetensors import safe_open
+
+    from sglang.srt.layers.quantization.utils import swizzle_blockscale
+
+    E = store.E
+    assert (
+        store.gpu["w13_weight"].dtype == torch.uint8
+    ), "nvfp4 fill expects uint8 packed weights"
+    snap = _snapshot_dir(model_path)
+    wmap = _weight_map(snap)
+    pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)
+
+    # raw (pre-swizzle) block-scale + global-scale collectors, filled per expert then transformed en masse
+    w13_sc_raw = w2_sc_raw = None
+    z = lambda: torch.empty(E, dtype=torch.float32)
+    w1_wgs, w2_wgs, w1_igs, w3_igs, w2_igs = z(), z(), z(), z(), z()
+
+    by_shard: Dict[str, list] = {}
+    for e in range(E):
+        for proj in (gate, up, down):
+            for suf in (
+                "weight_packed",
+                "weight_scale",
+                "weight_global_scale",
+                "input_global_scale",
+            ):
+                by_shard.setdefault(wmap[f"{pre}{e}.{proj}.{suf}"], []).append(
+                    (e, proj, suf)
+                )
+    for shard, items in by_shard.items():
+        with safe_open(os.path.join(snap, shard), framework="pt") as f:
+            for e, proj, suf in items:
+                t = f.get_tensor(f"{pre}{e}.{proj}.{suf}")
+                is_down = proj == down
+                if suf == "weight_packed":
+                    if is_down:
+                        store.row("w2_weight", e).copy_(t)
+                    else:
+                        row = store.row("w13_weight", e)
+                        half = row.shape[0] // 2
+                        (row[:half] if proj == gate else row[half:]).copy_(t)
+                elif suf == "weight_scale":
+                    if is_down:
+                        if w2_sc_raw is None:
+                            w2_sc_raw = torch.empty((E, *t.shape), dtype=t.dtype)
+                        w2_sc_raw[e].copy_(t)
+                    else:
+                        if w13_sc_raw is None:
+                            w13_sc_raw = torch.empty(
+                                (E, t.shape[0] * 2, t.shape[1]), dtype=t.dtype
+                            )
+                        half = w13_sc_raw.shape[1] // 2
+                        (
+                            w13_sc_raw[e][:half]
+                            if proj == gate
+                            else w13_sc_raw[e][half:]
+                        ).copy_(t)
+                elif suf == "weight_global_scale":
+                    if proj == gate:
+                        w1_wgs[e] = t.flatten()[0]
+                    elif is_down:
+                        w2_wgs[e] = t.flatten()[0]
+                else:  # input_global_scale
+                    dst = w1_igs if proj == gate else (w2_igs if is_down else w3_igs)
+                    dst[e] = t.flatten()[0]
+
+    # swizzle block scales to the cutlass 128x4 layout (same transform the method's PWAL applies)
+    store.fill_tensor("w13_weight_scale", swizzle_blockscale(w13_sc_raw.to(device)).cpu())
+    store.fill_tensor("w2_weight_scale", swizzle_blockscale(w2_sc_raw.to(device)).cpu())
+
+    # derived per-expert scalars (cutlass path): weight_scale_2 = 1/weight_global_scale;
+    # input_scale_quant = min over the (w1,w3) input global scales; g_alphas = (1/input) * weight_scale_2.
+    w1_wgs, w2_wgs = w1_wgs.to(device), w2_wgs.to(device)
+    w1_igs, w3_igs, w2_igs = w1_igs.to(device), w3_igs.to(device), w2_igs.to(device)
+    w13_ws2 = 1.0 / w1_wgs
+    w2_ws2 = 1.0 / w2_wgs
+    w13_iq = torch.minimum(w1_igs, w3_igs)
+    return {
+        "g1_alphas": ((1.0 / w13_iq) * w13_ws2).float(),
+        "g2_alphas": ((1.0 / w2_igs) * w2_ws2).float(),
+        "w13_input_scale_quant": w13_iq.float(),
+        "w2_input_scale_quant": w2_igs.float(),
+    }
+
+
 def setup_pager(method, layer) -> ExpertPager:
     """Build the host store and fill it from the checkpoint (all E experts), then return the pager wrapping
     it. ``method`` carries E, K, and the resident map. gptq-int4 is repacked to marlin at load time; bf16 is
@@ -1415,6 +1522,10 @@ def setup_pager(method, layer) -> ExpertPager:
             "w13_weight_scale_inv" in store.gpu
         ):  # fp8 block-quant (weights + block scales)
             _fill_fp8_block_from_checkpoint(store, model_path, layer_idx)
+        elif "w13_weight_scale" in store.gpu:  # nvfp4 (packed uint8 + swizzled fp8 block scales)
+            method._nvfp4_full_e = _fill_nvfp4_from_checkpoint(
+                store, model_path, layer_idx, dev
+            )
         elif "w13_weight" in store.gpu:  # bf16
             _fill_bf16_from_checkpoint(store, model_path, layer_idx)
         else:

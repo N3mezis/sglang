@@ -66,8 +66,20 @@ def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
     return torch.frombuffer(buf, dtype=torch.uint8).view(dtype).reshape(shape)
 
 
-# packed-quant scaffolding the fused-MoE kernel never reads on the paged path
-_NONPAGED_SUFFIXES = ("_g_idx", "_g_idx_sort_indices", "_weight_shape")
+# packed-quant scaffolding the fused-MoE kernel never reads on the paged path, plus the nvfp4
+# per-expert scalar scales (global/alpha/input-quant): 4-8 B each -> too small for the pinned gather
+# (sub-8/16-byte rows). The four runtime nvfp4 scalars (g*_alphas, w*_input_scale_quant) are refreshed
+# per-step into the K slots from a resident full-E table (see forward._gemm_hidden); the rest are dead
+# after the nvfp4 method's process_weights_after_loading.
+_NONPAGED_SUFFIXES = (
+    "_g_idx",
+    "_g_idx_sort_indices",
+    "_weight_shape",
+    "_global_scale",
+    "_scale_2",
+    "_alphas",
+    "_scale_quant",
+)
 
 
 def _host_available_bytes() -> int:

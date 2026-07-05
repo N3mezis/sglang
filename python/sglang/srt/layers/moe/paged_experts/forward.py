@@ -30,6 +30,22 @@ def mask_and_remap_expert_ids(
     return logical_to_gpu_index[topk_ids]
 
 
+def _refresh_nvfp4_scalars(method, layer):
+    """nvfp4: scatter the resident full-E per-expert scalars (g*_alphas, w*_input_scale_quant) into the
+    K slots by the live residency map, so slot s carries the scalar of whatever logical expert is paged
+    there. The big weights + swizzled block scales page normally; only these sub-8-byte scalars need the
+    per-step refresh (they can't ride the pinned gather). No-op for every other quant method.
+    """
+    fe = getattr(method, "_nvfp4_full_e", None)
+    if fe is None:
+        return
+    l2g = method._pager.logical_to_gpu_index_cuda  # [E] int32: slot of each logical expert, -1 if not
+    resident = l2g >= 0
+    slots = l2g[resident].long()
+    for nm, full in fe.items():
+        getattr(layer, nm).data[slots] = full[resident]
+
+
 def _gemm_hidden(
     method, layer, dispatch_output, remap: torch.Tensor, *, clone_hidden: bool
 ):
@@ -49,6 +65,7 @@ def _gemm_hidden(
         hidden_states=hidden.clone() if clone_hidden else hidden,
         topk_output=topk_output._replace(topk_ids=safe_ids, topk_weights=masked_tw),
     )
+    _refresh_nvfp4_scalars(method, layer)
     out = method.base_method.apply(layer, md)
     return out.hidden_states if hasattr(out, "hidden_states") else out
 
@@ -65,6 +82,7 @@ def _gemm_hidden_fused(
         hidden_states=hidden.clone() if clone_hidden else hidden,
         topk_output=topk_output._replace(topk_ids=safe_ids, topk_weights=masked_tw),
     )
+    _refresh_nvfp4_scalars(method, layer)
     out = method.base_method.apply(layer, md)
     return out.hidden_states if hasattr(out, "hidden_states") else out
 
@@ -104,6 +122,11 @@ def _scratch_prefill_apply(method, layer, dispatch_output, topk_ids, distinct=No
         return None
     if os.environ.get("SGLANG_PAGED_EXPERTS_SCRATCH", "1") == "0":
         return None  # kill switch (debug / A-B)
+    if getattr(method, "_nvfp4_full_e", None) is not None:
+        # nvfp4 scalar params (g*_alphas, w*_input_scale_quant) are K-sized and refreshed by the
+        # K-slot residency map; the E-wide unremapped scratch pass would index them out of range.
+        # Route nvfp4 through the wave path, where the per-wave residency refresh is correct.
+        return None
     if distinct is not None and len(distinct) < (6 * pager.E) // 10:
         return None  # sparse big batch: waves move fewer bytes
     store = pager.store

@@ -382,7 +382,18 @@ def _make_method_class():
 
         def process_weights_after_loading(self, layer):
             if hasattr(self.base_method, "process_weights_after_loading"):
-                self.base_method.process_weights_after_loading(layer)
+                # Base PWALs that build expert-count-sized structures from layer.num_experts (e.g. the
+                # nvfp4 cutlass path's CutlassMoEParams) must see the K-slot count — the weights they run
+                # over are the K-slot pool, not the model's E. create_weights/create_moe_runner already
+                # got K; num_experts is the one attribute still at E. Swap it for the base call only.
+                saved_ne = getattr(layer, "num_experts", None)
+                if saved_ne is not None:
+                    layer.num_experts = self.num_resident
+                try:
+                    self.base_method.process_weights_after_loading(layer)
+                finally:
+                    if saved_ne is not None:
+                        layer.num_experts = saved_ne
             if self.window is None:
                 # Deferred window sizing: the ceiling probe runs here, after the loader — cached, so the
                 # first layer resolves it and every layer shares the same W.
