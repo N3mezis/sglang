@@ -231,7 +231,20 @@ def get_config(
     )
 
     if model_override_args:
-        config.update(model_override_args)
+        # Deep-merge dict-valued overrides into existing sub-config OBJECTS (composite/VLM configs:
+        # e.g. {"text_config": {"num_hidden_layers": 6}}); a plain config.update would REPLACE the
+        # sub-config object with the raw dict and break attribute access downstream. Non-dict values
+        # and keys without an existing config object keep the shallow update semantics.
+        shallow = {}
+        for k, v in model_override_args.items():
+            cur = getattr(config, k, None)
+            if isinstance(v, dict) and cur is not None and not isinstance(cur, dict):
+                for sk, sv in v.items():
+                    setattr(cur, sk, sv)
+            else:
+                shallow[k] = v
+        if shallow:
+            config.update(shallow)
 
     if is_gguf:
         if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
