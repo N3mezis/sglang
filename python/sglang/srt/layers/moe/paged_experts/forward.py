@@ -30,11 +30,17 @@ def mask_and_remap_expert_ids(
     return logical_to_gpu_index[topk_ids]
 
 
-def _refresh_nvfp4_scalars(method, layer):
+def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
     """nvfp4: scatter the resident full-E per-expert scalars (g*_alphas, w*_input_scale_quant) into the
     K slots by the live residency map, so slot s carries the scalar of whatever logical expert is paged
     there. The big weights + swizzled block scales page normally; only these sub-8-byte scalars need the
     per-step refresh (they can't ride the pinned gather). No-op for every other quant method.
+
+    ``logical_to_slot`` overrides the map used by the eager path. The wave path (``_wave_apply``) positions
+    each wave's weights via a LOCAL logical->slot map and leaves ``pager.logical_to_gpu_index_cuda`` stale
+    until ``set_residency`` at the end — so the scalars MUST be scattered by that same local map, else slot
+    s gets the right weight but a DIFFERENT expert's alpha (wrong output magnitude, confident-wrong logits;
+    it is the multi-token verify batch, not single-token decode, that trips this).
     """
     fe = getattr(method, "_nvfp4_full_e", None)
     if fe is None:
@@ -51,7 +57,11 @@ def _refresh_nvfp4_scalars(method, layer):
     else:
         # Eager host path: scatter the resident slots by the logical->slot map. Boolean-mask indexing is
         # fine eager but NOT capturable (data-dependent shape) — hence the fixed gather above under capture.
-        l2g = pager.logical_to_gpu_index_cuda  # [E] int32: slot of each logical expert, -1 if not
+        l2g = (
+            logical_to_slot
+            if logical_to_slot is not None
+            else pager.logical_to_gpu_index_cuda
+        )  # [E] int32: slot of each logical expert, -1 if not
         resident = l2g >= 0
         slots = l2g[resident].long()
         for nm, full in fe.items():
@@ -59,14 +69,21 @@ def _refresh_nvfp4_scalars(method, layer):
 
 
 def _gemm_hidden(
-    method, layer, dispatch_output, remap: torch.Tensor, *, clone_hidden: bool
+    method,
+    layer,
+    dispatch_output,
+    remap: torch.Tensor,
+    *,
+    clone_hidden: bool,
+    logical_to_slot: torch.Tensor = None,
 ):
     """Run the base fused-MoE over the K-slot pool for one (wave's) remap, returning the hidden output.
 
     Zero the routing weight where the expert is masked out (remap == -1) so its contribution is provably
     0, and clamp masked ids -1 -> 0 (slot-0 output x 0 = exact 0; required for marlin's moe_align binning,
     bit-identical for triton). ``clone_hidden`` is set on the wave path, where the same input is reused
-    across waves and the base method may consume it in place.
+    across waves and the base method may consume it in place. ``logical_to_slot`` is the wave's local
+    logical->slot map, threaded to the nvfp4 scalar refresh (see ``_refresh_nvfp4_scalars``).
     """
     topk_output = dispatch_output.topk_output
     tw = topk_output.topk_weights
@@ -77,7 +94,7 @@ def _gemm_hidden(
         hidden_states=hidden.clone() if clone_hidden else hidden,
         topk_output=topk_output._replace(topk_ids=safe_ids, topk_weights=masked_tw),
     )
-    _refresh_nvfp4_scalars(method, layer)
+    _refresh_nvfp4_scalars(method, layer, logical_to_slot=logical_to_slot)
     out = method.base_method.apply(layer, md)
     return out.hidden_states if hasattr(out, "hidden_states") else out
 
@@ -276,7 +293,12 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
         l2g.fill_(-1)
         l2g[src] = dst.to(torch.int32)
         partial = _gemm_hidden(
-            method, layer, dispatch_output, l2g[topk_ids], clone_hidden=True
+            method,
+            layer,
+            dispatch_output,
+            l2g[topk_ids],
+            clone_hidden=True,
+            logical_to_slot=l2g,  # nvfp4: scatter scalars by THIS wave's map, not the stale pager map
         )
         if banked:
             ev_gemm[b].record(cs)
