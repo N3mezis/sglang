@@ -1523,6 +1523,10 @@ def setup_pager(method, layer) -> ExpertPager:
         ):  # fp8 block-quant (weights + block scales)
             _fill_fp8_block_from_checkpoint(store, model_path, layer_idx)
         elif "w13_weight_scale" in store.gpu:  # nvfp4 (packed uint8 + swizzled fp8 block scales)
+            # No store cache here (unlike gptq-marlin): nvfp4's fill transform is just a cheap GPU
+            # block-scale swizzle, and the swizzled store is LARGER than the checkpoint (padded
+            # scales), so a cache hit reads more bytes to save a near-free op — measured net-neutral
+            # on load (168s vs 170s) with a large first-boot write penalty. Refill from checkpoint.
             method._nvfp4_full_e = _fill_nvfp4_from_checkpoint(
                 store, model_path, layer_idx, dev
             )
