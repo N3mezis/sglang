@@ -39,11 +39,23 @@ def _refresh_nvfp4_scalars(method, layer):
     fe = getattr(method, "_nvfp4_full_e", None)
     if fe is None:
         return
-    l2g = method._pager.logical_to_gpu_index_cuda  # [E] int32: slot of each logical expert, -1 if not
-    resident = l2g >= 0
-    slots = l2g[resident].long()
-    for nm, full in fe.items():
-        getattr(layer, nm).data[slots] = full[resident]
+    pager = method._pager
+    s2l = getattr(pager, "_slot_expert_d", None)
+    if s2l is not None:
+        # Captured / on-device path: a FIXED-[K] gather by the slot->logical map (updated in-graph by
+        # the decide kernel) — capture-safe, re-read each replay. Empty slots (-1) clamp to 0; their
+        # GEMM output is masked out downstream, so the borrowed scalar is inert.
+        idx = s2l.clamp(min=0).long()
+        for nm, full in fe.items():
+            getattr(layer, nm).data.copy_(full[idx])
+    else:
+        # Eager host path: scatter the resident slots by the logical->slot map. Boolean-mask indexing is
+        # fine eager but NOT capturable (data-dependent shape) — hence the fixed gather above under capture.
+        l2g = pager.logical_to_gpu_index_cuda  # [E] int32: slot of each logical expert, -1 if not
+        resident = l2g >= 0
+        slots = l2g[resident].long()
+        for nm, full in fe.items():
+            getattr(layer, nm).data[slots] = full[resident]
 
 
 def _gemm_hidden(
