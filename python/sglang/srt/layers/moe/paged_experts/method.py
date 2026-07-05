@@ -140,10 +140,16 @@ def _moe_geometry():
     bits = 16
     qc = getattr(_quant_source(mc, htc), "quantization_config", None)
     if isinstance(qc, dict):
-        if (qc.get("quant_method") or "").lower() == "fp8":
+        qm = (qc.get("quant_method") or "").lower()
+        fmt = (qc.get("format") or "").lower()
+        if qm == "fp8":
             bits = (
                 8  # fp8 configs carry no "bits" key; block scales ride in the 3% margin
             )
+        elif qm == "compressed-tensors" and "nvfp4" in fmt:
+            # 4-bit packed weights + one fp8 block scale per 16 weights (8/16 = 0.5 bit-equiv);
+            # tiny per-expert global scalars are negligible. ~4.5 effective bits/weight.
+            bits = 4.5
         else:
             bits = qc.get("bits") or qc.get("weights", {}).get("num_bits") or 16
     per_el = 3 * htc.moe_intermediate_size * htc.hidden_size * (bits / 8.0) * 1.03
@@ -343,10 +349,17 @@ def _make_method_class():
             params_dtype,
             **extra,
         ):
-            # K-slot table. Weight loading uses FusedMoE's NATIVE expert-parallel remap: num_local_experts
-            # = K -> the default loader fills slots 0..K-1 and skips the rest (no custom loader). Our
-            # forward does its OWN routing remap, so K-local only affects load.
+            # K-slot table. Weight loading uses FusedMoE's NATIVE expert-parallel remap: the loader
+            # fills slots 0..K-1 and skips the rest (they are re-read from the checkpoint into the host
+            # store by the fill). Our forward does its OWN routing remap, so K-local only affects load.
+            # The loader's global->local skip keys off _num_local_routed (see FusedMoE.weight_loader /
+            # _map_global_expert_id_to_local_expert_id), NOT num_local_experts, so shrink BOTH — else
+            # loaders that go through the physical/EP path (e.g. the DeepSeek/Mistral family) index the
+            # full-E global id into the K-slot param and IndexError.
             layer.num_local_experts = self.num_resident
+            if getattr(layer, "_num_local_routed", None) is not None:
+                layer._num_local_routed = self.num_resident
+                layer._num_global_routed = self.num_resident
             self.base_method.create_weights(
                 layer=layer,
                 num_experts=self.num_resident,
