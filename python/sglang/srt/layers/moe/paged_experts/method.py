@@ -754,6 +754,21 @@ def resolve_window_experts(num_experts_E: int) -> int:
     """
     from sglang.srt.server_args import get_global_server_args
 
+    # Debug override: force a windowed store (W hot experts) on checkpoints that would full-pin —
+    # exercises the windowed deferred-staging path (decide_bounded / stage_cold_at_break) on models
+    # small enough to iterate on quickly. 0 < W < E; sizing/ceiling checks are bypassed.
+    _force_w = os.environ.get("SGLANG_PAGED_EXPERTS_FORCE_WINDOW")
+    if _force_w:
+        w = int(_force_w)
+        if 0 < w < num_experts_E:
+            logger.warning(
+                "[paged-experts] DEBUG: forcing windowed store W=%d/%d "
+                "(SGLANG_PAGED_EXPERTS_FORCE_WINDOW)",
+                w,
+                num_experts_E,
+            )
+            return w
+
     _, _, moe_layers, per_el = _moe_geometry()
 
     cold_backing = getattr(
