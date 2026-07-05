@@ -921,10 +921,22 @@ class ExpertPager:
             name: _stage_pin_buf(name, self.K, p.shape[1:], p.dtype)
             for name, p in self.gpu.items()
         }
+        # Cold rows read through the O_DIRECT queue-depth pool (QD ~6) when the store backs cold on
+        # disk — the serial store.row() mmap-fault loop is single-threaded and left the disk at ~40% of
+        # its concurrent ceiling on decode. Per-tensor fallback to the mmap copy (RAM-windowed stores,
+        # unaligned rows, or IO failure), mirroring store.page_in.
+        cp = getattr(self.store, "cold_pos", None)
+        direct = getattr(self.store, "_read_cold_rows_direct", None)
+        cold_rows = [int(cp[e]) for e in ids] if cp is not None else None
         for name in self.gpu:
             buf = bufs[name]
-            for i, e in enumerate(ids):
-                buf[i].copy_(self.store.row(name, e))
+            if not (
+                cold_rows is not None
+                and direct is not None
+                and direct(name, cold_rows, buf)
+            ):
+                for i, e in enumerate(ids):
+                    buf[i].copy_(self.store.row(name, e))
         if _PROF["on"]:
             _th = time.perf_counter()
             _PROF["gather"] += _th - _tg
