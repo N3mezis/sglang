@@ -47,16 +47,23 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
         return
     pager = method._pager
     s2l = getattr(pager, "_slot_expert_d", None)
-    if s2l is not None:
+    if logical_to_slot is None and s2l is not None:
         # Captured / on-device path: a FIXED-[K] gather by the slot->logical map (updated in-graph by
-        # the decide kernel) — capture-safe, re-read each replay. Empty slots (-1) clamp to 0; their
-        # GEMM output is masked out downstream, so the borrowed scalar is inert.
+        # the decide kernel) — capture-safe, re-read each replay. Only valid when the ON-DEVICE decide
+        # positioned the weights (captured keep-warm / on-device waves), i.e. no explicit wave map was
+        # passed. Empty slots (-1) clamp to 0; their GEMM output is masked out downstream, so the
+        # borrowed scalar is inert.
         idx = s2l.clamp(min=0).long()
         for nm, full in fe.items():
             getattr(layer, nm).data.copy_(full[idx])
     else:
-        # Eager host path: scatter the resident slots by the logical->slot map. Boolean-mask indexing is
-        # fine eager but NOT capturable (data-dependent shape) — hence the fixed gather above under capture.
+        # Eager scatter by the logical->slot map. The HOST wave path (_wave_apply) positions weights by
+        # its LOCAL l2g (host page_in, not the on-device decide) and passes it as logical_to_slot — that
+        # map, NOT the on-device _slot_expert_d (which the host wave leaves stale, and which can even
+        # hold an out-of-range logical id from a prior spec-verify step -> a scalar-gather OOB), is what
+        # matches where the weights landed. Falls back to the live pager map for the eager keep-warm path
+        # (logical_to_slot=None, s2l=None). Boolean-mask indexing is data-dependent-shape (NOT
+        # capturable), but _wave_apply is only ever reached OFF the capture path, so this is safe.
         l2g = (
             logical_to_slot
             if logical_to_slot is not None
