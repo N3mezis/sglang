@@ -35,7 +35,17 @@ _ALL_PAGERS: list = []
 # overhead. Off by default (negligible perf_counter cost when on; zero when off).
 _PROF = {
     "on": bool(int(os.environ.get("PE_PROFILE", "0") or 0)),
-    "item": 0.0,  # per-layer self._cold_n_d.item() sync stalls (summed over layers, per token)
+    "item": 0.0,  # per-layer doorbell-read block (summed over layers/breaks, per token)
+    # item decomposition (answers the "what is the 4.5ms item-sync" fork):
+    "item_spin": 0.0,  # time in the cn<0 bounded-spin busy-loop — HOST-only, shadow-IMMUNE (no GPU sync)
+    "item_fallback": 0.0,  # time in the .item() D2H fallback — GPU-blocking, shadow-SUSCEPTIBLE
+    "nbreaks": 0,  # stage_cold_at_break calls (= breaks) this window
+    "nstage": 0,  # breaks that actually staged cold (cn>0)
+    "nfallback": 0,  # breaks where the doorbell was NOT visible (cn<0 -> spin/.item())
+    # zero-vs-nonzero split: outrun-latency (branch 1, fixable) => hit==miss ~equal; raw mapped-write
+    # propagation (branch 2, wall) => miss-layers systematically slower (a nonzero count to propagate).
+    "item_hit": 0.0,  # item time on breaks whose doorbell read 0 (nothing to stage)
+    "item_miss": 0.0,  # item time on breaks whose doorbell read >0 (real cold miss)
     "refill": 0.0,  # staging total (= tolist + gather + h2d + python)
     "tolist": 0.0,  # _needed_d/_slot_expert_d .tolist() D2H syncs
     "gather": 0.0,  # host-side torch.stack([row(e)...]) (incl mmap faults)
@@ -251,9 +261,36 @@ def _bcg_post_step() -> None:
                     jac,
                     k,
                 )
+                nbrk = _PROF["nbreaks"]
+                nmiss = _PROF["nstage"]
+                nhit = nbrk - nmiss
+                ms_per_break = (_PROF["item"] / nbrk * 1e3) if nbrk else 0.0
+                logger.info(
+                    "[pe-prof-item] breaks/tok=%.1f stage/tok=%.1f fallback/tok=%.1f | "
+                    "ms/break=%.3f = spin %.3f + .item() %.3f + fastread %.3f | "
+                    "ms/break doorbell==0(hit)=%.3f doorbell>0(miss)=%.3f "
+                    "[equal=>outrun-latency/fixable; miss-slower=>mapped-write-propagation/wall]",
+                    nbrk / k,
+                    nmiss / k,
+                    _PROF["nfallback"] / k,
+                    ms_per_break,
+                    (_PROF["item_spin"] / nbrk * 1e3) if nbrk else 0.0,
+                    (_PROF["item_fallback"] / nbrk * 1e3) if nbrk else 0.0,
+                    (
+                        ((_PROF["item"] - _PROF["item_spin"] - _PROF["item_fallback"]) / nbrk * 1e3)
+                        if nbrk
+                        else 0.0
+                    ),
+                    (_PROF["item_hit"] / nhit * 1e3) if nhit else 0.0,
+                    (_PROF["item_miss"] / nmiss * 1e3) if nmiss else 0.0,
+                )
                 for key in (
                     "tok",
                     "item",
+                    "item_spin",
+                    "item_fallback",
+                    "item_hit",
+                    "item_miss",
                     "refill",
                     "tolist",
                     "gather",
@@ -261,6 +298,7 @@ def _bcg_post_step() -> None:
                     "overlap",
                 ):
                     _PROF[key] = 0.0
+                _PROF["nbreaks"] = _PROF["nstage"] = _PROF["nfallback"] = 0
                 _PROF["n"] = _PROF["overlap_n"] = 0
         _PROF["last"] = _now
     _maybe_profile_refresh()  # no-op after the horizon; syncs internally only on the re-pin step
@@ -871,16 +909,31 @@ class ExpertPager:
         # design; the fallback also covers a lost write).
         bell = self._doorbell_np
         cn = int(bell[0])
+        _fb = cn < 0
         if cn < 0:
+            _ts = time.perf_counter() if _prof else 0.0
             deadline = time.perf_counter() + 0.2
             while cn < 0 and time.perf_counter() < deadline:
                 cn = int(bell[0])
+            if _prof:
+                _PROF["item_spin"] += time.perf_counter() - _ts
             if cn < 0:
+                _ti = time.perf_counter() if _prof else 0.0
                 cn = int(self._cold_n_d.item())
+                if _prof:
+                    _PROF["item_fallback"] += time.perf_counter() - _ti
         bell[0] = -1  # re-arm for the next replay
         if _prof:
             _t1 = time.perf_counter()
             _PROF["item"] += _t1 - _t0
+            _PROF["nbreaks"] += 1
+            if _fb:
+                _PROF["nfallback"] += 1
+            if cn > 0:
+                _PROF["nstage"] += 1
+                _PROF["item_miss"] += _t1 - _t0
+            else:
+                _PROF["item_hit"] += _t1 - _t0
         if cn > 0:
             _ta = time.perf_counter() if _prof else 0.0
             # ONE batched D2H for plan + residency + recency (vs one .tolist() sync per tensor),
