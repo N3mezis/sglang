@@ -71,44 +71,70 @@ _REPLAY_HOOK_INSTALLED = False
 # use counts on-device), then re-pin each windowed layer's hottest W experts once, out-of-graph, so the cold
 # tail becomes the least-routed experts (rare window-misses). Always on with a fixed horizon: it is a no-op
 # unless the store is windowed (nothing is registered in _REPLAY_PAGERS), and a few hundred tokens is plenty.
-_PROFILE_TOKENS: int = int(
-    os.environ.get("SGLANG_PAGED_EXPERTS_PROFILE_TOKENS", "128") or "128"
-)  # initial freq-profiling horizon before the one-shot window pin (env-tunable for the horizon sweep)
+_PROFILE_TOKENS_ENV = os.environ.get("SGLANG_PAGED_EXPERTS_PROFILE_TOKENS")
+_PROFILE_TOKENS: int = int(_PROFILE_TOKENS_ENV) if _PROFILE_TOKENS_ENV else 512
+_PROFILE_TOKENS_SET = bool(_PROFILE_TOKENS_ENV)
+# Initial freq-profiling horizon before the FIRST window pin. Default 512 for the one-shot (RAM/full-pin)
+# case (window_horizon.py: ~+3.6 pts window coverage vs 128, warmup-amortized). But when ROLLING is active
+# (disk), a long initial horizon just crawls on the bad initial [0,W) split before the first pin and rolling
+# refines anyway — so pin EARLY (_ROLLING_INITIAL_HORIZON) unless the env is set explicitly. Env-tunable.
+_ROLLING_INITIAL_HORIZON: int = 128
 _profile_count: int = 0
 _profile_done: bool = False
-# Rolling window re-profile (opt-in). By default the window is freq-ranked ONCE after the initial horizon
-# and never re-adapts (one-shot). With SGLANG_PAGED_EXPERTS_WINDOW_REFRESH=N>0, after the initial pin the
-# window is re-ranked every N decode tokens, so the pinned tier tracks the RECENT hot set as the workload
-# drifts across domains/sessions (§4f: domains route to near-disjoint expert sets). refresh_window_freq
-# already halves _freq_d on each re-pin, so successive re-ranks decay old history exponentially = a rolling
-# window; and set_window_membership moves only the experts that actually change tier (Δ-set), so a stable
-# workload re-ranks to the same set at ~zero data-movement cost. Continuous GPU-resident LRU adapts
-# regardless; this only re-tiers the HOST window (pinned vs cold), so it pays off mainly on a disk cold tier
-# where a window miss is a disk read. N should be >> the initial horizon (e.g. 512-2048) to bound the
-# per-refresh sync + re-pin cost.
-_WINDOW_REFRESH: int = int(os.environ.get("SGLANG_PAGED_EXPERTS_WINDOW_REFRESH", "0") or "0")
+# Rolling window re-profile (OPT-IN). After the initial horizon the window is re-ranked every N decode tokens
+# so the pinned tier tracks the RECENT hot set as the workload drifts across domains (§4f: near-disjoint expert
+# sets; measured ~2-3x on a genuinely DRIFTING disk workload). refresh_window_freq halves _freq_d per re-pin
+# (exponential decay), set_window_membership moves only the experts that change tier (Δ-set). NOT auto-on:
+# disk auto-enable was tried + reverted — on a STABLE workload it still churns 150-250 tier-moves/re-pin
+# (small-count freq noise at the W-rank boundary defeats the 0.5 ratio-hysteresis) = wasted disk IO; safe
+# auto-on needs an absolute-count-floor + persistence promotion policy (unbuilt). Enable explicitly with
+# SGLANG_PAGED_EXPERTS_WINDOW_REFRESH=N (>> the initial horizon, e.g. 1024-2048, to bound re-pin churn).
+_WINDOW_REFRESH_ENV = os.environ.get("SGLANG_PAGED_EXPERTS_WINDOW_REFRESH")
+_WINDOW_REFRESH: int = int(_WINDOW_REFRESH_ENV) if _WINDOW_REFRESH_ENV else 0
+_WINDOW_REFRESH_HYSTERESIS: float = 0.5  # rolling re-pins swap only a challenger >50% hotter (partial; see above)
+
+
+def _effective_window_refresh() -> int:
+    """Rolling re-profile interval in tokens (0 = one-shot, never re-adapt). OPT-IN via
+    SGLANG_PAGED_EXPERTS_WINDOW_REFRESH=N (N>0 interval; 0/unset one-shot).
+
+    NOTE: disk auto-enable was tried and REVERTED. On a STABLE workload the re-rank churns 150-250 tier-moves
+    per re-pin even with the 0.5 ratio-hysteresis, because over a short window with halving decay mid-ranked
+    experts have tiny counts and small-count noise routinely exceeds any ratio margin at the W-rank boundary —
+    wasted disk IO with nothing to adapt to. A safe auto-on needs a robust anti-jitter promotion policy
+    (absolute count floor + multi-re-pin persistence), unbuilt. Until then rolling stays opt-in; it earns its
+    measured ~2-3x only on genuinely DRIFTING disk workloads."""
+    return _WINDOW_REFRESH if _WINDOW_REFRESH_ENV else 0
 
 
 def _maybe_profile_refresh() -> None:
     """Called once per decode token (at replay convergence / BCG step boundary, out-of-graph). Re-pins each
-    windowed layer's hottest W experts after the initial horizon; if rolling refresh is enabled, keeps
-    re-pinning every _WINDOW_REFRESH tokens (tracking workload drift) instead of latching after the first."""
+    windowed layer's hottest W experts after the initial horizon; if rolling refresh is active (explicit env,
+    or auto on a disk cold tier) keeps re-pinning every N tokens (tracking workload drift) instead of latching."""
     global _profile_count, _profile_done
     if not _REPLAY_PAGERS:
         return
-    if _profile_done and _WINDOW_REFRESH <= 0:
-        return  # one-shot mode (default): pinned once, never re-adapts
+    refresh = _effective_window_refresh()
+    if _profile_done and refresh <= 0:
+        return  # one-shot mode: pinned once, never re-adapts
     _profile_count += 1
-    horizon = _PROFILE_TOKENS if not _profile_done else _WINDOW_REFRESH
+    if _profile_done:
+        horizon = refresh
+    elif refresh > 0 and not _PROFILE_TOKENS_SET:
+        horizon = _ROLLING_INITIAL_HORIZON  # rolling active -> pin early, then let rolling refine
+    else:
+        horizon = _PROFILE_TOKENS
     if _profile_count < horizon:
         return
     # The re-pin rewrites the pinned host_hot store in place, which the captured UVA gathers read — any
     # still-in-flight gather must finish first. Paid on the (re-)pin step only (every horizon/N tokens).
     torch.cuda.synchronize()
+    # margin=0 for the initial pin (plain freq top-W); hysteresis on rolling re-pins (suppress boundary jitter).
+    margin = _WINDOW_REFRESH_HYSTERESIS if _profile_done else 0.0
     moved = 0
     for p in _REPLAY_PAGERS:
         try:
-            moved += p.refresh_window_freq() or 0
+            moved += p.refresh_window_freq(margin) or 0
         except Exception as e:
             logger.error("[paged-experts] freq-window refresh failed: %s", e)
     if not _profile_done:
@@ -116,15 +142,17 @@ def _maybe_profile_refresh() -> None:
         logger.info(
             "[paged-experts] freq-ranked window: initial re-pin on %d layer(s) after %d tokens%s",
             len(_REPLAY_PAGERS),
-            _PROFILE_TOKENS,
-            f"; rolling re-pin every {_WINDOW_REFRESH} tokens" if _WINDOW_REFRESH > 0 else "",
+            horizon,
+            f"; rolling re-pin every {refresh} tokens (hysteresis {_WINDOW_REFRESH_HYSTERESIS})"
+            if refresh > 0
+            else "",
         )
     else:
-        # Rolling re-pin: `moved` is the total experts that changed tier across layers — the workload-drift
-        # signal (0 = the recent hot set matches what's pinned, i.e. no benefit and no churn this cycle).
+        # Rolling re-pin: `moved` = total experts that changed tier across layers — the workload-drift signal
+        # (0 = the recent hot set matches what's pinned: no benefit and no churn this cycle).
         logger.info(
             "[paged-experts] rolling window re-pin (%d tok): %d expert tier-moves across %d layer(s)",
-            _WINDOW_REFRESH,
+            refresh,
             moved,
             len(_REPLAY_PAGERS),
         )
@@ -1032,19 +1060,37 @@ class ExpertPager:
         # layer's/wave's staging) while copies are in flight.
         torch.cuda.current_stream().synchronize()
 
-    def refresh_window_freq(self) -> None:
+    def refresh_window_freq(self, margin: float = 0.0) -> int:
         """P3 freq-ranked window: re-pin the hottest W experts (by the on-device use counts ``decide_bounded``
         accumulated during profiling) so the cold tail is the *least*-routed experts -> window-misses become
-        rare -> few replay-twice rounds. Runs once, out-of-graph, between tokens; refreshes the membership
-        maps in place (fixed address -> the captured graph reads the new split on its next replay). The GPU
-        slots keep their expert-indexed data, so only the page-in source tier moves (no residency reset).
-        """
+        rare -> few replay-twice rounds. Runs out-of-graph, between tokens; refreshes the membership maps in
+        place (fixed address -> the captured graph reads the new split on its next replay). The GPU slots keep
+        their expert-indexed data, so only the page-in source tier moves (no residency reset).
+
+        ``margin`` > 0 applies HYSTERESIS (rolling re-pins): keep the current window and swap a would-be
+        (promote, demote) pair only when the challenger is clearly hotter than the incumbent it displaces
+        (freq[p] > freq[d]*(1+margin)). This suppresses near-tie boundary jitter -- on a STABLE workload the
+        window re-ranks to ~itself at zero data movement (measured: without it ~16% of W flips per re-pin, pure
+        wasted disk IO on a disk tier) -- while a real drift (sustained freq gap) still swaps. margin=0 (the
+        initial pin) takes the plain top-W."""
         if not self._windowed:
             return 0
         freq = (
             self._freq_d.tolist()
         )  # per-expert routing count over the profiling window (one-time D2H)
-        hot = sorted(range(self.E), key=lambda e: freq[e], reverse=True)[: self.store.W]
+        W = self.store.W
+        hot = sorted(range(self.E), key=lambda e: freq[e], reverse=True)[:W]
+        if margin > 0.0:
+            cur = set(e for e in range(self.E) if int(self.store.hot_pos[e]) >= 0)
+            cand = set(hot)
+            promos = sorted((e for e in cand if e not in cur), key=lambda e: freq[e], reverse=True)
+            demos = sorted((e for e in cur if e not in cand), key=lambda e: freq[e])  # weakest first
+            keep = set(cur)
+            for p, d in zip(promos, demos):
+                if freq[p] > freq[d] * (1.0 + margin):  # clear win -> swap; near-tie -> keep incumbent
+                    keep.discard(d)
+                    keep.add(p)
+            hot = list(keep)
         moved = self.store.set_window_membership(hot) or 0  # experts that changed tier (drift Δ)
         # refresh the device membership map IN PLACE (same buffer the captured decide_bounded reads)
         self._log2hot_d.copy_(
@@ -1177,6 +1223,10 @@ class ExpertPager:
         ids = pair[0].tolist()
         slots = pair[1].tolist()
         self._stage_cold_into_slots(ids, slots)
+        if _PROF["on"]:
+            # Measurement only: let the per-step [pe-prof] printer report the WAVE regime (token time +
+            # eager staging gather/h2d fraction) — the deterministic split that gates wave double-buffering.
+            _ensure_bcg_post_step_hook()
 
     def reset_residency_ondevice(self) -> None:
         """Clear the keep-warm residency maps after a windowed wave step. A windowed wave stages only the
