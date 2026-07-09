@@ -156,7 +156,11 @@ class CapturedPlacement(Placement):
 
         pager = method._pager
         topk_ids = dispatch_output.topk_output.topk_ids
-        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] <= pager.K
+        # STRICT '<': keep-warm needs eviction headroom to stage cold misses. At the exact boundary
+        # bs*top_k == K a fully-disjoint batch leaves ZERO evictable slots, so a cold miss cannot be
+        # staged and the BCG break's stage_cold_at_break raises (no replay-twice retry under capture).
+        # Leave >=1 slot: the boundary batch routes to the wave path instead (collision-free static homes).
+        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] < pager.K
         if keep_warm:
             mode = os.environ.get("SGLANG_PAGED_EXPERTS_EAGER_BREAK", "0")
             if mode == "2":
@@ -234,7 +238,11 @@ class CapturedWindowedPlacement(Placement):
 
         pager = method._pager
         topk_ids = dispatch_output.topk_output.topk_ids
-        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] <= pager.K
+        # STRICT '<': keep-warm needs eviction headroom to stage cold misses. At the exact boundary
+        # bs*top_k == K a fully-disjoint batch leaves ZERO evictable slots, so a cold miss cannot be
+        # staged and the BCG break's stage_cold_at_break raises (no replay-twice retry under capture).
+        # Leave >=1 slot: the boundary batch routes to the wave path instead (collision-free static homes).
+        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] < pager.K
         if keep_warm:
             pager.decide_and_page_bounded_ondevice(topk_ids)
             hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
@@ -313,7 +321,11 @@ class CapturedWindowedBCGPlacement(Placement):
 
         pager = method._pager
         topk_ids = dispatch_output.topk_output.topk_ids
-        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] <= pager.K
+        # STRICT '<': keep-warm needs eviction headroom to stage cold misses. At the exact boundary
+        # bs*top_k == K a fully-disjoint batch leaves ZERO evictable slots, so a cold miss cannot be
+        # staged and the BCG break's stage_cold_at_break raises (no replay-twice retry under capture).
+        # Leave >=1 slot: the boundary batch routes to the wave path instead (collision-free static homes).
+        keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] < pager.K
         if keep_warm:
             pager.decide_and_page_bounded_ondevice(
                 topk_ids

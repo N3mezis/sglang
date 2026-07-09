@@ -559,7 +559,11 @@ def _shape_capture_bs_to_keep_warm(
     sa = get_global_server_args()
     _, htc, _, _ = _moe_geometry()
     top_k = getattr(htc, "num_experts_per_tok", 8) or 8
-    cap = max(1, K // top_k)
+    # Largest keep-warm-capturable bs. Uses (K-1)//top_k, matching placement's STRICT bs*top_k < K bound
+    # (one slot of eviction headroom): at an exact multiple bs*top_k == K there is none, and staging a
+    # cold miss fails. Also prevents the non-breakable windowed path from capturing a boundary bs that
+    # placement then rejects at capture time.
+    cap = max(1, (K - 1) // top_k)
     # Only windowed WITHOUT the breakable backend must hard-clamp (its distinct>K wave is the uncapturable
     # eager host path). Windowed + breakable has the captured on-device wave, so it behaves like full-pin.
     hard_clamp = windowed and not breakable_decode
