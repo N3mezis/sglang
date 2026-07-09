@@ -15,6 +15,7 @@ import torch
 from sglang.jit_kernel.paged_experts_decide import (
     paged_experts_decide,
     paged_experts_decide_bounded,
+    paged_experts_decide_bounded_wave,
     paged_experts_decide_wave,
     paged_experts_gather,
     paged_experts_gather_multi,
@@ -74,6 +75,35 @@ def _ref_wave(topk, E, K, w, slot_base=0):
             src.append(e)
             dst.append(e - lo + slot_base)
     return src, dst, idx
+
+
+def _ref_bounded_wave(topk, E, K, wave_k, w, log2hot, slot_base=0):
+    """Reference for the COMPACTED windowed wave: distinct active experts (appearance order) get a global
+    index d; the d-th belongs to wave floor(d/wave_k), slot (d%wave_k)+slot_base. For wave `w`, its group's
+    experts split into hits (src=hot idx, dst=slot) vs cold (cold_log). idx[e]=slot for this wave's experts
+    (hit or cold), else -1. se[slot]=e for this wave's slots, else -1."""
+    lo = w * wave_k
+    idx = [-1] * E
+    se = [-1] * K
+    src, dst, cold, seen = [], [], [], []
+    d = 0
+    for e in topk:
+        if e < 0 or e >= E or e in seen:
+            continue
+        seen.append(e)
+        di = d
+        d += 1
+        if not (lo <= di < lo + wave_k):
+            continue
+        slot = (di - lo) + slot_base
+        se[slot] = e
+        idx[e] = slot
+        if log2hot[e] >= 0:
+            src.append(log2hot[e])
+            dst.append(slot)
+        else:
+            cold.append(e)
+    return src, dst, cold, idx, se
 
 
 def _i32(x):
@@ -173,6 +203,128 @@ def test_decide_wave_matches_reference():
         assert all(base <= s < base + half for s in dst[:n].tolist())
         served += src[:n].tolist()
     assert sorted(served) == sorted(experts)
+
+
+def _window_log2hot(E, hot):
+    """log2hot[e] = hot-block index if e in the pinned window `hot` (order = block order), else -1."""
+    log2hot = [-1] * E
+    for i, e in enumerate(hot):
+        log2hot[e] = i
+    return log2hot
+
+
+@requires_cuda
+@pytest.mark.parametrize("slot_base_bank", [False, True])
+def test_decide_bounded_wave_matches_reference(slot_base_bank):
+    """Windowed static waves: each wave's distinct active experts split into in-graph window hits and
+    deferred cold, every active expert served in exactly one wave (hits + cold), idx carries home slots."""
+    E, K = 16, 6
+    hot = [0, 2, 4, 6, 8, 10, 12]  # the pinned window (7 of 16 experts)
+    log2hot = _window_log2hot(E, hot)
+    l2h = _i32(log2hot)
+    experts = [0, 3, 7, 8, 13, 1, 9]  # distinct > K -> waves; mix of window hits (0,8) and cold (3,7,13,1,9)
+    topk = _i32(experts)
+    src = _i32([0] * K)
+    dst = _i32([0] * K)
+    n_out = _i32([0])
+    cold_log = _i32([0] * K)
+    cold_n = _i32([0])
+    idx = _i32([-1] * E)
+    slot_expert = _i32([-1] * K)
+
+    half = K // 2
+    wave_k = half if slot_base_bank else K
+    nwaves = (E + wave_k - 1) // wave_k
+    served = []
+    for w in range(nwaves):
+        base = (w & 1) * half if slot_base_bank else 0
+        paged_experts_decide_bounded_wave(
+            topk, E, wave_k, w, l2h, src, dst, n_out, cold_log, cold_n, idx, slot_expert, slot_base=base
+        )
+        r_src, r_dst, r_cold, r_idx, r_se = _ref_bounded_wave(
+            experts, E, K, wave_k, w, log2hot, slot_base=base
+        )
+        n = int(n_out.item())
+        nc = int(cold_n.item())
+        assert idx.tolist() == r_idx, f"wave {w}: idx"
+        assert src[:n].tolist() == r_src, f"wave {w}: src (hot-block indices)"
+        assert dst[:n].tolist() == r_dst, f"wave {w}: dst (compacted slots)"
+        assert cold_log[:nc].tolist() == r_cold, f"wave {w}: cold_log"
+        assert (
+            slot_expert[base : base + wave_k].tolist() == r_se[base : base + wave_k]
+        ), f"wave {w}: slot_expert"
+        assert all(base <= s < base + wave_k for s in dst[:n].tolist())
+        served += [hot[h] for h in src[:n].tolist()]  # hits: hot-block idx -> logical expert id
+        served += cold_log[:nc].tolist()
+    # every active expert is served in exactly one wave, either as a window hit or a deferred cold miss
+    assert sorted(served) == sorted(experts)
+
+
+@requires_cuda
+def test_decide_bounded_wave_doorbell():
+    """The mapped-pinned doorbell receives this wave's cold count host-visibly (for the BCG break spin)."""
+    E, K = 16, 6
+    hot = [0, 2, 4, 6, 8, 10]
+    l2h = _i32(_window_log2hot(E, hot))
+    experts = [0, 3, 7, 9]  # 4 distinct < K -> all in compacted wave 0: 0 is a window hit, 3/7/9 are cold
+    topk = _i32(experts)
+    src, dst, n_out = _i32([0] * K), _i32([0] * K), _i32([0])
+    cold_log, cold_n, idx = _i32([0] * K), _i32([0]), _i32([-1] * E)
+    slot_expert = _i32([-1] * K)
+    doorbell = torch.full((1,), -1, dtype=torch.int32, device="cpu").pin_memory()
+    db_ptr = paged_experts_host_devptr(doorbell)
+    paged_experts_decide_bounded_wave(
+        topk, E, K, 0, l2h, src, dst, n_out, cold_log, cold_n, idx, slot_expert, doorbell=db_ptr
+    )
+    torch.cuda.synchronize()
+    assert int(cold_n.item()) == 3  # experts 3, 7, 9 are cold (not in the window) in compacted wave 0
+    assert int(doorbell[0].item()) == 3  # host-visible via __threadfence_system
+    assert int(n_out.item()) == 1  # expert 0 is the one window hit
+
+
+@requires_cuda
+def test_decide_bounded_wave_is_cuda_graph_capturable():
+    """Capture one wave's windowed decide, then replay with topk mutated in place; the stateless wave
+    plan must recompute correctly each replay (matches an eager run)."""
+    E, K, w = 16, 6, 0
+    l2h = _i32(_window_log2hot(E, [0, 2, 4, 6, 8, 10]))
+    steps = [[0, 3, 5], [2, 4, 1], [0, 5, 3]]  # all in wave 0 (e < 6)
+
+    def _run(topk_vals, buf=None):
+        src, dst, n_out = _i32([0] * K), _i32([0] * K), _i32([0])
+        cold_log, cold_n, idx = _i32([0] * K), _i32([0]), _i32([-1] * E)
+        se = _i32([-1] * K)
+        tk = buf if buf is not None else _i32(topk_vals)
+        paged_experts_decide_bounded_wave(
+            tk, E, K, w, l2h, src, dst, n_out, cold_log, cold_n, idx, se
+        )
+        return src, dst, n_out, cold_log, cold_n, idx
+
+    eager = []
+    for vals in steps:
+        _, _, n_out, cold_log, cold_n, idx = _run(vals)
+        eager.append((idx.tolist(), cold_log[: int(cold_n.item())].tolist()))
+
+    topk_buf = _i32(steps[0])
+    src, dst, n_out = _i32([0] * K), _i32([0] * K), _i32([0])
+    cold_log, cold_n, idx = _i32([0] * K), _i32([0]), _i32([-1] * E)
+    se = _i32([-1] * K)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            paged_experts_decide_bounded_wave(
+                topk_buf, E, K, w, l2h, src, dst, n_out, cold_log, cold_n, idx, se
+            )
+    torch.cuda.current_stream().wait_stream(s)
+
+    for i, vals in enumerate(steps):
+        topk_buf.copy_(_i32(vals))
+        g.replay()
+        torch.cuda.synchronize()
+        assert idx.tolist() == eager[i][0], f"captured replay {i}: idx"
+        assert cold_log[: int(cold_n.item())].tolist() == eager[i][1], f"replay {i}: cold_log"
 
 
 @requires_cuda

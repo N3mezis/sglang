@@ -405,7 +405,9 @@ def _make_method_class():
                 )
                 if self.use_ondevice:
                     _shape_capture_bs_to_keep_warm(
-                        self.num_resident, windowed=self.window > 0
+                        self.num_resident,
+                        windowed=self.window > 0,
+                        breakable_decode=self._breakable_decode,
                     )
             from sglang.srt.layers.moe.paged_experts.pager import setup_pager
 
@@ -535,19 +537,22 @@ def _pin_is_capped() -> bool:
         return False
 
 
-def _shape_capture_bs_to_keep_warm(K: int, windowed: bool) -> None:
+def _shape_capture_bs_to_keep_warm(
+    K: int, windowed: bool, breakable_decode: bool = False
+) -> None:
     """Shape the decode capture batch list around the keep-warm bound ``bs*top_k <= K``, known the
     moment K and the window resolve (post-load, before graph capture).
 
-    Windowed stores: HARD clamp to ``K//top_k`` regardless of user settings — the distinct>K fallback
-    is a host-driven wave, uncapturable, and capture at such sizes used to fail at startup.
+    Windowed + NON-breakable: HARD clamp to ``K//top_k`` regardless of user settings — the distinct>K
+    fallback is a host-driven wave, uncapturable, and capture at such sizes fails at startup.
 
-    Full-pin stores: captured waves past the bound work but cost ``ceil(E/K)`` GEMMs per layer — a
-    measured 2.7x throughput cliff right above the bound (int4-30B: 373 tok/s captured at bs=8 vs 139
-    at bs=16). When the user did NOT set an explicit capture list, shape the default: clamp to the
-    bound and make sure the bound itself is a capture bucket (bs up to ``K//top_k`` then pads to a
-    captured graph instead of falling off). An explicit ``--cuda-graph-max-bs-decode`` /
-    ``--cuda-graph-bs-decode`` is respected (the one-time wave-cliff warning still fires).
+    Full-pin, and windowed + BREAKABLE (the on-device windowed wave, ``_ondevice_bounded_wave_apply``):
+    captured waves past the bound work but cost ``ceil(E/K)`` GEMMs per layer — a measured 2.7x throughput
+    cliff right above the bound (int4-30B: 373 tok/s captured at bs=8 vs 139 at bs=16). When the user did
+    NOT set an explicit capture list, shape the default: clamp to the bound and make sure the bound itself
+    is a capture bucket (bs up to ``K//top_k`` then pads to a captured graph instead of falling off). An
+    explicit ``--cuda-graph-max-bs-decode`` / ``--cuda-graph-bs-decode`` is respected (larger batches then
+    capture as waves; the one-time wave-cliff warning fires at runtime).
     """
     from sglang.srt.server_args import get_global_server_args
 
@@ -555,17 +560,20 @@ def _shape_capture_bs_to_keep_warm(K: int, windowed: bool) -> None:
     _, htc, _, _ = _moe_geometry()
     top_k = getattr(htc, "num_experts_per_tok", 8) or 8
     cap = max(1, K // top_k)
+    # Only windowed WITHOUT the breakable backend must hard-clamp (its distinct>K wave is the uncapturable
+    # eager host path). Windowed + breakable has the captured on-device wave, so it behaves like full-pin.
+    hard_clamp = windowed and not breakable_decode
     user_set = (
         getattr(sa, "cuda_graph_max_bs_decode", None) is not None
         or getattr(sa, "cuda_graph_bs_decode", None) is not None
     )
-    if not windowed and user_set:
-        return  # full-pin + explicit setting: the user chose their operating point
+    if not hard_clamp and user_set:
+        return  # explicit setting: the user chose their operating point (waves capture past the bound)
     try:
         decode_cfg = sa.cuda_graph_config.decode
         old_bs = list(decode_cfg.bs)
         new_bs = [b for b in old_bs if b <= cap]
-        if not windowed and cap not in new_bs:
+        if not hard_clamp and cap not in new_bs:
             new_bs.append(
                 cap
             )  # capture the bound itself: bs up to K//top_k stays captured
@@ -578,7 +586,7 @@ def _shape_capture_bs_to_keep_warm(K: int, windowed: bool) -> None:
                 K,
                 new_bs,
                 cap,
-                "uncaptured wave" if windowed else "uncaptured",
+                "uncaptured host wave" if hard_clamp else "captured wave",
             )
     except Exception as e:
         logger.warning(

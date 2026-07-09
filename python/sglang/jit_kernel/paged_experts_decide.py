@@ -20,6 +20,7 @@ def _jit_paged_experts_decide_module() -> Module:
             ("decide", "decide"),
             ("decide_bounded", "decide_bounded"),
             ("decide_wave", "decide_wave"),
+            ("decide_bounded_wave", "decide_bounded_wave"),
             ("gather", "gather"),
             ("gather_multi", "gather_multi"),
             ("scatter_multi", "scatter_multi"),
@@ -182,6 +183,61 @@ def paged_experts_decide_wave(
         dst,
         n_out,
         idx,
+    )
+
+
+def paged_experts_decide_bounded_wave(
+    topk: torch.Tensor,
+    num_experts: int,
+    wave_k: int,
+    wave: int,
+    log2hot: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    n_out: torch.Tensor,
+    cold_log: torch.Tensor,
+    cold_n: torch.Tensor,
+    idx: torch.Tensor,
+    slot_expert: torch.Tensor,
+    slot_base: int = 0,
+    doorbell: int = 0,
+) -> None:
+    """On-device COMPACTED fixed-wave decision for the pinned-WINDOW store (distinct active experts > K).
+
+    Unlike :func:`paged_experts_decide_wave`'s static home (which spreads experts over ``ceil(E/wave_k)``
+    mostly-empty waves when K << E), this COMPACTS the distinct active experts by appearance order: the
+    ``d``-th distinct expert in ``topk`` goes to wave ``floor(d/wave_k)``, slot ``(d % wave_k) + slot_base``.
+    The caller runs only ``ceil(min(topk_n, num_experts)/wave_k)`` waves. For ``wave``, its group's experts
+    are split by window membership (``log2hot[e]`` = hot-block index, or -1 if cold) like
+    :func:`paged_experts_decide_bounded`: window HITS go to ``(src, dst, n_out)`` for the in-graph gather
+    from ``host_hot``; COLD misses record their **logical** id in ``cold_log`` (count ``cold_n`` + optional
+    ``doorbell``) for the BCG eager break to stage into their slot. ``idx[e]`` = this wave's slot for its
+    experts (hit or cold; the break stages cold before the GEMM, so no masking round), else -1.
+    ``slot_expert[slot]`` = the logical expert assigned to that slot (for the captured nvfp4 scalar refresh);
+    unused slots are -1 (masked -> inert). The caller sums the per-wave GEMM partials (lossless). ``slot_base``
+    banks the slot pool for double-buffered waves. No host sync (capturable).
+
+    All tensors are ``int32`` CUDA: ``topk`` ``[topk_n]``; ``src``/``dst``/``cold_log``/``slot_expert``
+    ``[>=wave_k]`` (``slot_expert`` ``[num_slots]``); ``n_out``/``cold_n`` ``[1]``; ``log2hot``/``idx``
+    ``[num_experts]``. ``doorbell`` (optional): a MAPPED PINNED host address (the kernel writes the cold
+    count there host-visibly for the BCG break).
+    """
+    module = _jit_paged_experts_decide_module()
+    module.decide_bounded_wave(
+        topk,
+        int(num_experts),
+        int(wave_k),
+        int(wave),
+        int(slot_base),
+        log2hot,
+        src,
+        dst,
+        n_out,
+        cold_log,
+        cold_n,
+        int(doorbell),
+        idx,
+        slot_expert,
     )
 
 

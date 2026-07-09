@@ -385,6 +385,47 @@ def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
     return out
 
 
+def _ondevice_bounded_wave_apply(method, layer, dispatch_output, topk_ids):
+    """Captured WINDOWED wave path (distinct > K on a windowed store; breakable backend only). Serve in
+    ``ceil(E/K)`` static waves, each planned on-device (window hits gathered in-graph from ``host_hot``,
+    cold deferred) with its cold experts staged at an in-layer eager break before the wave's GEMM — so a
+    ``> K`` windowed decode batch stays CAPTURED instead of falling to the sync-heavy eager host wave
+    (``_wave_apply``). Serial full-K (no banking) under capture. Sums the per-wave partials (lossless);
+    resets the keep-warm residency maps at the end so the following keep-warm decode step re-pages clean.
+    Windowed analog of ``_ondevice_wave_apply``."""
+    from sglang.srt.layers.moe.paged_experts.placement import _bcg_cold_wave_break
+
+    pager = method._pager
+    E, K = pager.E, pager.K
+    topk_weights = dispatch_output.topk_output.topk_weights
+    # COMPACTED waves: the distinct active experts number at most num_tokens*top_k (capped at E), and the
+    # decide kernel packs them by appearance order, so we run only ceil(min(num_tokens*top_k, E)/K) waves —
+    # not ceil(E/K). num_tokens/top_k are static under capture, so the wave count is graph-stable.
+    max_distinct = min(topk_ids.shape[0] * topk_ids.shape[-1], E)
+    nwaves = (max_distinct + K - 1) // K
+    out = None
+    for w in range(nwaves):
+        # segment 1: decide (compact + window-split) + window-hit gather; cold experts deferred to the break
+        pager.decide_and_page_bounded_wave_ondevice(topk_ids, w)
+        # eager break: stage THIS wave's cold experts into their assigned slots, then the GEMM segment runs
+        # with them resident. Remap AFTER the break reads the live map (hits from decide + cold staged).
+        _bcg_cold_wave_break()(pager, dispatch_output.hidden_states)
+        # Fused remap+mask (ONE launch, reading the live post-break map) — the same kernel the keep-warm
+        # path uses; saves the gather + 2x where + 2x zeros_like chain PER WAVE. Python-chain fallback for
+        # weight layouts the kernel doesn't handle.
+        fused = pager.remap_mask_ondevice(topk_ids, topk_weights)
+        if fused is not None:
+            partial = _gemm_hidden_fused(
+                method, layer, dispatch_output, fused[0], fused[1], clone_hidden=True
+            )
+        else:
+            remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
+            partial = _gemm_hidden(method, layer, dispatch_output, remap, clone_hidden=True)
+        out = partial if out is None else out + partial
+    pager.reset_residency_ondevice()
+    return out
+
+
 def paged_apply(method, layer, dispatch_output):
     """Dispatch the step to the method's decode placement (eager host vs captured on-device).
 

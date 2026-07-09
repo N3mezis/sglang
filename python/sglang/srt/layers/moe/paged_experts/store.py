@@ -269,6 +269,16 @@ class ExpertStore(ABC):
         """Fill the whole host backing for ``name`` from a contiguous ``[E, *slot_shape]`` CPU tensor."""
         self.host[name].copy_(full)
 
+    # --- cold-refill gather (hot path): batched form of ``row()`` ---
+    def gather_rows_into(self, name: str, ids, buf: torch.Tensor) -> None:
+        """Gather expert rows ``ids`` (logical expert ids, in order) into ``buf[0:len(ids)]`` with ONE
+        indexed copy per tensor — the batched replacement for the per-expert ``buf[i].copy_(row(name, e))``
+        loop on the decode cold-refill hot path (the measured host-bound cost). Single ``[E, *]`` backing
+        here; ``WindowedExpertStore`` overrides to route each id into its hot/cold tier."""
+        n = len(ids)
+        idx = torch.as_tensor(ids, dtype=torch.int64)
+        buf[:n].copy_(self.host[name].index_select(0, idx))
+
 
 class PinnedExpertStore(ExpertStore):
     """Pinned (page-locked) host store, paged with sglang's existing ``transfer_kv_per_layer_mla`` block
@@ -579,6 +589,25 @@ class WindowedExpertStore(ExpertStore):
         self.host_hot[name].copy_(full[: self.W])
         self.host_cold[name].copy_(full[self.W :])
 
+    def gather_rows_into(self, name: str, ids, buf: torch.Tensor) -> None:
+        """Tier-split batched gather (overrides the single-buffer default): each id routes to host_hot
+        (pinned window) or host_cold via hot_pos/cold_pos. Two indexed copies per tensor (hot rows, cold
+        rows) preserving id order, replacing the per-expert ``row()`` loop. Handles a mixed hot/cold miss
+        set — which the O_DIRECT cold path cannot (it assumes all-cold rows)."""
+        n = len(ids)
+        idx = torch.as_tensor(ids, dtype=torch.int64)
+        hp = self.hot_pos[idx]
+        is_hot = hp >= 0
+        pos = torch.arange(n)
+        if bool(is_hot.any()):
+            hi = pos[is_hot]
+            buf[:n].index_copy_(0, hi, self.host_hot[name].index_select(0, hp[is_hot]))
+        cold_mask = ~is_hot
+        if bool(cold_mask.any()):
+            ci = pos[cold_mask]
+            cr = self.cold_pos[idx[cold_mask]]
+            buf[:n].index_copy_(0, ci, self.host_cold[name].index_select(0, cr))
+
     def set_window_membership(self, hot_experts) -> None:
         """Re-pin the window to hold ``hot_experts`` (the top-W by routing frequency) instead of the static
         ``[0, W)`` — the P3 freq-ranked window. Runs once, out-of-graph, after a short profiling period;
@@ -601,7 +630,7 @@ class WindowedExpertStore(ExpertStore):
             demoted
         ), "window size W is fixed; tier moves must pair up"
         if not promoted:
-            return  # membership unchanged
+            return 0  # membership unchanged (a stable workload re-ranks to the same set: zero churn)
         # Disk cold tier: queue read-ahead for the promoted rows so the swap below faults them in
         # parallel (force: the swap reads via the mmap even when page-ins go O_DIRECT).
         self.prefetch_cold(promoted, force=True)
@@ -623,6 +652,7 @@ class WindowedExpertStore(ExpertStore):
             self.hot_pos[d] = -1
             self.cold_pos[d] = cold_row
             self.cold_pos[p] = -1
+        return len(promoted)  # experts that changed tier (the workload-drift Δ)
 
     def page_in(
         self,

@@ -114,6 +114,33 @@ def _warn_wave_capture_once(pager, topk_ids):
     )
 
 
+_WINDOWED_WAVE_CAPTURE_WARNED = False
+
+
+def _warn_windowed_wave_capture_once(pager, topk_ids):
+    """Windowed path: a captured batch with ``bs*top_k > K`` is served in COMPACTED on-device waves, each
+    paying a masked GEMM plus (for window-missing experts) a per-wave cold-staging break —
+    ``ceil(min(bs*top_k, E)/K)`` waves per layer per step. Correct and captured (the win over the eager host
+    wave), but a real per-step cost; say so once."""
+    global _WINDOWED_WAVE_CAPTURE_WARNED
+    if _WINDOWED_WAVE_CAPTURE_WARNED:
+        return
+    _WINDOWED_WAVE_CAPTURE_WARNED = True
+    bs, top_k = topk_ids.shape[0], topk_ids.shape[-1]
+    nwaves = (min(bs * top_k, pager.E) + pager.K - 1) // pager.K
+    logger.warning(
+        "[paged-experts] windowed captured wave: batch bs=%d exceeds the keep-warm bound (bs*top_k=%d > "
+        "K=%d) — every MoE layer serves %d compacted captured waves/step (plus per-wave cold staging). This "
+        "keeps concurrent windowed decode on the captured path; cap --cuda-graph-max-bs at %d (K//top_k) to "
+        "stay in the single-GEMM keep-warm regime instead.",
+        bs,
+        bs * top_k,
+        pager.K,
+        nwaves,
+        max(1, pager.K // top_k),
+    )
+
+
 class CapturedPlacement(Placement):
     """On-device decide + UVA gather, run inside sglang's captured decode graph (no host sync). The
     keep-warm vs static-wave regime is chosen from shapes alone (``num_tokens*top_k <= K``).
@@ -241,6 +268,31 @@ def _bcg_cold_break():
     return _bcg_break
 
 
+_bcg_wave_break = None
+
+
+def _bcg_cold_wave_break():
+    """The eager break that stages ONE windowed WAVE's cold experts (BCG break-and-page-in, wave path).
+    Wrapped with ``eager_on_graph`` so, under breakable-decode capture, calling it ends the wave's
+    decide+gather segment, stages that wave's cold (host_cold -> home slots) eager, and starts the wave's
+    GEMM segment — a cold miss is paged inline in the same pass, no second full-graph replay. The wave loop
+    is unrolled at capture time, so each wave gets its own break closure with its own ``wave`` bound. Built
+    lazily (eager_on_graph hard-raises off CUDA)."""
+    global _bcg_wave_break
+    if _bcg_wave_break is None:
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            eager_on_graph,
+        )
+
+        def _stage_wave(pager, hidden_states):
+            pager.stage_cold_wave_at_break()
+            # Return None on purpose (same as _bcg_cold_break): a pass-through tensor makes the backend's
+            # output-copy launch a redundant D2D self-copy every break; None falls through with no copy.
+
+        _bcg_wave_break = eager_on_graph(True)(_stage_wave)
+    return _bcg_wave_break
+
+
 class CapturedWindowedBCGPlacement(Placement):
     """Captured windowed decode under the *breakable* backend (BCG break-and-page-in). Same on-device
     decide_bounded + windowed gather as the replay-twice variant, but the deferred cold experts are staged
@@ -251,7 +303,12 @@ class CapturedWindowedBCGPlacement(Placement):
     needs_ondevice_store = True
 
     def apply(self, method, layer, dispatch_output):
-        from sglang.srt.layers.moe.paged_experts.forward import _wave_apply
+        import torch
+
+        from sglang.srt.layers.moe.paged_experts.forward import (
+            _ondevice_bounded_wave_apply,
+            _wave_apply,
+        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         pager = method._pager
@@ -269,8 +326,15 @@ class CapturedWindowedBCGPlacement(Placement):
             # Remap AFTER the break: the fused remap_mask reads the LIVE map, so it sees the experts the
             # break just staged (segment 2 of the broken graph).
             hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
-        else:  # prefill / big batch: eager host wave (not on the captured decode path)
-            _reject_wave_under_capture(pager, topk_ids)
+        elif torch.cuda.is_current_stream_capturing():
+            # distinct > K inside a decode-graph capture: serve in CAPTURED on-device windowed waves (each
+            # wave stages its cold at an eager break) instead of rejecting — this is what lets concurrent
+            # windowed decode batch past K//top_k stay on the fast captured path.
+            _warn_windowed_wave_capture_once(pager, topk_ids)
+            hidden = _ondevice_bounded_wave_apply(
+                method, layer, dispatch_output, topk_ids
+            )
+        else:  # off-graph (prefill / big one-shot batch): eager host wave
             distinct = pager.distinct_active(topk_ids)
             hidden = _wave_apply(method, layer, dispatch_output, topk_ids, distinct)
         return StandardCombineInput(hidden_states=hidden)

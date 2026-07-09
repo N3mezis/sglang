@@ -271,6 +271,83 @@ __global__ void decide_wave_kernel(
   }
 }
 
+// Windowed COMPACTED-wave decision (distinct active experts > K on a WINDOWED store). Unlike
+// decide_wave_kernel's static home (wave floor(e/wave_k) -> ceil(E/wave_k) waves, mostly empty when
+// K << E), this COMPACTS the distinct active experts by appearance order: the d-th distinct expert in
+// ``topk`` goes to wave floor(d/wave_k), slot (d % wave_k) + slot_base. The caller runs only
+// ceil(min(topk_n, E)/wave_k) waves (<= a handful for a decode batch), so nearly every wave is full.
+// This wave's group is distinct indices [w*wave_k, w*wave_k+wave_k). Each is split by window membership
+// like decide_bounded_kernel: window HITS (log2hot[e] >= 0) gather in-graph from the pinned hot block
+// (src = hot-block index, dst = compacted slot); COLD misses (log2hot[e] < 0) record their logical id in
+// cold_log for the eager break to stage into their slot (BCG; staged before the wave's GEMM, so idx maps
+// them directly -- no masking round needed as in replay-twice). idx[e] = this wave's slot for its experts
+// (hit or cold), else -1; slot_expert[slot] = logical expert (for the captured nvfp4 scalar refresh);
+// unused slots -1 (masked -> inert). doorbell: 0, or a MAPPED PINNED host address the cold count is
+// written to host-visibly (see decide_bounded_kernel) for the BCG break to spin on. Capturable (no host
+// sync); the caller sums the per-wave GEMM partials -- lossless (each active expert in exactly one wave).
+__global__ void decide_bounded_wave_kernel(
+    const int32_t* topk,
+    int topk_n,
+    int E,
+    int wave_k,
+    int w,
+    int slot_base,
+    const int32_t* log2hot,  // [E] hot-block index if e in window, else -1
+    int32_t* src,            // [>=wave_k] out: windowed page-in source (hot-block index) for hits
+    int32_t* dst,            // [>=wave_k] out: compacted slots for hits
+    int32_t* n_out,          // [1]  out: number of windowed page-ins (hits)
+    int32_t* cold_log,       // [>=wave_k] out: deferred cold misses (logical expert ids)
+    int32_t* cold_n,         // [1]  out: number of cold entries
+    int64_t doorbell,        // 0, or a MAPPED PINNED host address for the cold count (see decide_bounded)
+    int32_t* idx,            // [E]  out: logical -> slot for this wave's experts (hit or cold), else -1
+    int32_t* slot_expert) {  // [K]  out: slot -> logical for this wave's slots (nvfp4 refresh); unused -1
+  if (blockIdx.x || threadIdx.x >= 32) return;
+  const int lane = threadIdx.x;
+  // init: idx[e] = -1 for all E; slot_expert = -1 for this wave's slot range. Lane 0 fills in the wave's
+  // experts below (after the warp barrier).
+  for (int e = lane; e < E; e += 32) idx[e] = -1;
+  for (int s = lane; s < wave_k; s += 32) slot_expert[slot_base + s] = -1;
+  __syncwarp();
+  // pass (lane 0, serial): walk topk in appearance order, index distinct actives, and for the ones in
+  // THIS wave's compacted group split into in-graph hits vs deferred cold.
+  if (lane == 0) {
+    const int lo = w * wave_k;  // this wave owns distinct indices [lo, lo + wave_k)
+    int nw = 0, nc = 0, d = 0;
+    for (int i = 0; i < topk_n; ++i) {
+      const int e = topk[i];
+      if (e < 0 || e >= E) continue;
+      bool seen = false;  // dedup by first occurrence -> stable appearance-order distinct index
+      for (int j = 0; j < i; ++j) {
+        if (topk[j] == e) {
+          seen = true;
+          break;
+        }
+      }
+      if (seen) continue;
+      const int di = d++;                        // e is the di-th distinct active expert
+      if (di < lo || di >= lo + wave_k) continue;  // not this wave's compacted group
+      const int slot = (di - lo) + slot_base;
+      slot_expert[slot] = e;  // slot -> logical (weight arrives via the gather below or the break)
+      idx[e] = slot;          // logical -> slot; BCG stages cold before the GEMM, so no masking round
+      const int hidx = log2hot[e];
+      if (hidx >= 0) {  // window hit -> on-device gather from the pinned hot block
+        src[nw] = hidx;
+        dst[nw] = slot;
+        ++nw;
+      } else {  // cold miss -> defer; the break stages host_cold into `slot`
+        cold_log[nc] = e;
+        ++nc;
+      }
+    }
+    *n_out = nw;
+    *cold_n = nc;
+    if (doorbell != 0) {
+      __threadfence_system();  // device writes above visible before the host sees the count
+      *reinterpret_cast<volatile int32_t*>(doorbell) = nc;
+    }
+  }
+}
+
 // Fused remap + weight mask: replaces the per-layer python chain
 //   remap = idx[topk]; safe_ids = where(remap >= 0, remap, 0); masked_tw = where(remap >= 0, tw, 0)
 // (a gather + 2x where + 2x zeros_like = 5 elementwise launches) with ONE capturable launch. Reads the
@@ -519,6 +596,63 @@ void decide_wave(
       static_cast<int32_t*>(dst.data_ptr()),
       static_cast<int32_t*>(n_out.data_ptr()),
       static_cast<int32_t*>(idx.data_ptr()));
+}
+
+void decide_bounded_wave(
+    tvm::ffi::TensorView topk,
+    int64_t num_experts,
+    int64_t wave_k,
+    int64_t wave,
+    int64_t slot_base,
+    tvm::ffi::TensorView log2hot,
+    tvm::ffi::TensorView src,
+    tvm::ffi::TensorView dst,
+    tvm::ffi::TensorView n_out,
+    tvm::ffi::TensorView cold_log,
+    tvm::ffi::TensorView cold_n,
+    int64_t doorbell,
+    tvm::ffi::TensorView idx,
+    tvm::ffi::TensorView slot_expert) {
+  using namespace host;
+
+  // src/dst/cold_log/slot_expert are [K]; idx/log2hot are [E]; topk is [T].
+  SymbolicSize K = {"num_slots"}, T = {"topk_n"}, E = {"num_experts"};
+  SymbolicDevice device_;
+  device_.set_options<kDLCUDA>();
+  TensorMatcher({K})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(src)
+      .verify(dst)
+      .verify(cold_log)
+      .verify(slot_expert);
+  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk);
+  TensorMatcher({E})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(idx)
+      .verify(log2hot);
+
+  const int t = static_cast<int>(T.unwrap());
+  const DLDevice device = device_.unwrap();
+
+  LaunchKernel(1, 32, device)(
+      decide_bounded_wave_kernel,
+      static_cast<const int32_t*>(topk.data_ptr()),
+      t,
+      static_cast<int>(num_experts),
+      static_cast<int>(wave_k),
+      static_cast<int>(wave),
+      static_cast<int>(slot_base),
+      static_cast<const int32_t*>(log2hot.data_ptr()),
+      static_cast<int32_t*>(src.data_ptr()),
+      static_cast<int32_t*>(dst.data_ptr()),
+      static_cast<int32_t*>(n_out.data_ptr()),
+      static_cast<int32_t*>(cold_log.data_ptr()),
+      static_cast<int32_t*>(cold_n.data_ptr()),
+      doorbell,
+      static_cast<int32_t*>(idx.data_ptr()),
+      static_cast<int32_t*>(slot_expert.data_ptr()));
 }
 
 // Resolve the UVA device pointer of a pinned host tensor, once at setup (NOT inside the captured

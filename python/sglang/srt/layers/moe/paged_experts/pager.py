@@ -71,34 +71,64 @@ _REPLAY_HOOK_INSTALLED = False
 # use counts on-device), then re-pin each windowed layer's hottest W experts once, out-of-graph, so the cold
 # tail becomes the least-routed experts (rare window-misses). Always on with a fixed horizon: it is a no-op
 # unless the store is windowed (nothing is registered in _REPLAY_PAGERS), and a few hundred tokens is plenty.
-_PROFILE_TOKENS: int = 128
+_PROFILE_TOKENS: int = int(
+    os.environ.get("SGLANG_PAGED_EXPERTS_PROFILE_TOKENS", "128") or "128"
+)  # initial freq-profiling horizon before the one-shot window pin (env-tunable for the horizon sweep)
 _profile_count: int = 0
 _profile_done: bool = False
+# Rolling window re-profile (opt-in). By default the window is freq-ranked ONCE after the initial horizon
+# and never re-adapts (one-shot). With SGLANG_PAGED_EXPERTS_WINDOW_REFRESH=N>0, after the initial pin the
+# window is re-ranked every N decode tokens, so the pinned tier tracks the RECENT hot set as the workload
+# drifts across domains/sessions (§4f: domains route to near-disjoint expert sets). refresh_window_freq
+# already halves _freq_d on each re-pin, so successive re-ranks decay old history exponentially = a rolling
+# window; and set_window_membership moves only the experts that actually change tier (Δ-set), so a stable
+# workload re-ranks to the same set at ~zero data-movement cost. Continuous GPU-resident LRU adapts
+# regardless; this only re-tiers the HOST window (pinned vs cold), so it pays off mainly on a disk cold tier
+# where a window miss is a disk read. N should be >> the initial horizon (e.g. 512-2048) to bound the
+# per-refresh sync + re-pin cost.
+_WINDOW_REFRESH: int = int(os.environ.get("SGLANG_PAGED_EXPERTS_WINDOW_REFRESH", "0") or "0")
 
 
 def _maybe_profile_refresh() -> None:
-    """Called once per decode token (at replay convergence, out-of-graph). After the profiling horizon,
-    re-pin every windowed layer's hottest W experts once."""
+    """Called once per decode token (at replay convergence / BCG step boundary, out-of-graph). Re-pins each
+    windowed layer's hottest W experts after the initial horizon; if rolling refresh is enabled, keeps
+    re-pinning every _WINDOW_REFRESH tokens (tracking workload drift) instead of latching after the first."""
     global _profile_count, _profile_done
-    if _profile_done or not _REPLAY_PAGERS:
+    if not _REPLAY_PAGERS:
         return
+    if _profile_done and _WINDOW_REFRESH <= 0:
+        return  # one-shot mode (default): pinned once, never re-adapts
     _profile_count += 1
-    if _profile_count < _PROFILE_TOKENS:
+    horizon = _PROFILE_TOKENS if not _profile_done else _WINDOW_REFRESH
+    if _profile_count < horizon:
         return
-    # The re-pin rewrites the pinned host_hot store in place, which the captured UVA gathers read —
-    # any still-in-flight gather must finish first. Paid once (this is the horizon step).
+    # The re-pin rewrites the pinned host_hot store in place, which the captured UVA gathers read — any
+    # still-in-flight gather must finish first. Paid on the (re-)pin step only (every horizon/N tokens).
     torch.cuda.synchronize()
+    moved = 0
     for p in _REPLAY_PAGERS:
         try:
-            p.refresh_window_freq()
+            moved += p.refresh_window_freq() or 0
         except Exception as e:
             logger.error("[paged-experts] freq-window refresh failed: %s", e)
-    _profile_done = True
-    logger.info(
-        "[paged-experts] freq-ranked window: re-pinned hottest W on %d layer(s) after %d tokens",
-        len(_REPLAY_PAGERS),
-        _profile_count,
-    )
+    if not _profile_done:
+        _profile_done = True
+        logger.info(
+            "[paged-experts] freq-ranked window: initial re-pin on %d layer(s) after %d tokens%s",
+            len(_REPLAY_PAGERS),
+            _PROFILE_TOKENS,
+            f"; rolling re-pin every {_WINDOW_REFRESH} tokens" if _WINDOW_REFRESH > 0 else "",
+        )
+    else:
+        # Rolling re-pin: `moved` is the total experts that changed tier across layers — the workload-drift
+        # signal (0 = the recent hot set matches what's pinned, i.e. no benefit and no churn this cycle).
+        logger.info(
+            "[paged-experts] rolling window re-pin (%d tok): %d expert tier-moves across %d layer(s)",
+            _WINDOW_REFRESH,
+            moved,
+            len(_REPLAY_PAGERS),
+        )
+    _profile_count = 0
 
 
 _BCG_HOOK_INSTALLED = False
@@ -273,7 +303,7 @@ def _post_replay_refill_all() -> bool:
         _MISS_VEC[:_MISS_VEC_N].sum().item()
     )  # one sync; no-miss steps stop here
     if total == 0:
-        _prefetch_next_step()  # step boundary: temporal read-ahead of the predicted cold set
+        _prefetch_next_step()  # step boundary: temporal read-ahead of this step's persisted cold working set
         _maybe_profile_refresh()  # token converged (no misses) -> count it toward the profiling horizon
         return False
     counts = _MISS_VEC[:_MISS_VEC_N].tolist()
@@ -874,8 +904,9 @@ class ExpertPager:
         it converges in one extra replay; K <= top_k is the misconfig this guards — raise
         --paged-experts-num-resident above top_k.) Returns the number staged."""
         missed = cold_log[:cn]  # logical ids (defer mode emits logical ids)
-        # Record the prediction for the next-step temporal prefetch BEFORE any early return — the
-        # no-headroom case is exactly the set guaranteed to miss again next round.
+        # Record THIS step's cold set for the next-step temporal-reuse prefetch BEFORE any early return
+        # (temporal reuse, NOT routing prediction — decode's working set persists step-to-step, which the
+        # locality measurements confirm; the no-headroom case is exactly the set guaranteed to miss again).
         self._last_cold_ids = list(missed)
         hot_pos = getattr(self.store, "hot_pos", None)
         hot_list = hot_pos.tolist() if hot_pos is not None else None
@@ -907,27 +938,60 @@ class ExpertPager:
         l2g = self.logical_to_gpu_index_cuda
         slots = evictable[:n]
         ids = list(missed[:n])
-        # Disk cold tier: kick parallel read-ahead for all of this layer's cold rows up front (MADV_WILLNEED),
-        # so the gather below doesn't serialize on one page fault at a time. No-op for the RAM tier.
+        # Shared cold-staging data movement (prefetch + pinned gather + fused scatter + one stream sync).
+        self._stage_cold_into_slots(ids, slots)
+        # Batched residency + recency update (3 indexed writes total, vs 2-3 scalar device writes per
+        # staged expert): unmap the evicted occupants, map the staged experts, and stamp the staged slots
+        # with the CURRENT step — a staged cold expert must not inherit its victim's stale recency, or the
+        # next decide evicts it first and it thrashes through another deferred round.
+        slots_dev = torch.tensor(slots, dtype=torch.int64, device=self.device)
+        olds = [se[s] for s in slots if se[s] >= 0]
+        if olds:
+            l2g[torch.tensor(olds, dtype=torch.int64, device=self.device)] = -1
+        self._slot_expert_d[slots_dev] = torch.tensor(
+            ids, dtype=torch.int32, device=self.device
+        )
+        l2g[torch.tensor(ids, dtype=torch.int64, device=self.device)] = slots_dev.to(
+            torch.int32
+        )
+        self._slot_lastuse_d[slots_dev] = self._step_ctr_d
+        return n
+
+    def _stage_cold_into_slots(self, ids, slots) -> None:
+        """Shared cold-staging DATA MOVEMENT: read the cold rows for logical ``ids`` from ``host_cold``
+        into pinned buffers, then fused-scatter them into device ``slots`` (``ids[i]`` -> ``slots[i]``).
+        Ends with one stream sync so the shared pinned buffers are safe to reuse. The residency-map
+        bookkeeping is the caller's — it differs: the replay-twice/BCG refill (:func:`_refill_after_replay`)
+        evicts occupants + stamps recency; the windowed wave break (:func:`stage_cold_wave_at_break`) writes
+        no maps at all (the wave decide kernel already wrote idx + slot_expert for every in-wave expert)."""
+        n = len(ids)
+        if n == 0:
+            return
+        # Disk cold tier: kick parallel read-ahead for all of these rows up front (MADV_WILLNEED), so the
+        # gather below doesn't serialize on one page fault at a time. No-op for the RAM tier.
         store = getattr(self, "store", None)
         if store is not None and hasattr(store, "prefetch_cold"):
             store.prefetch_cold(ids)
         _tg = time.perf_counter() if _PROF["on"] else 0.0
         # Gather the cold rows into PINNED buffers (vs torch.stack -> pageable), so the H2D below is a
-        # fast pinned transfer instead of a slow synchronous pageable one. Serial on purpose: with the
-        # WILLNEED read-ahead above the faults are already serviced concurrently, and threading the warm
-        # copies was measured net-negative (see store.py's staging notes).
+        # fast pinned transfer instead of a slow synchronous pageable one. The WILLNEED read-ahead above
+        # services the disk faults concurrently; the copy itself is a batched indexed gather
+        # (store.gather_rows_into), not a per-expert loop.
         bufs = {
             name: _stage_pin_buf(name, self.K, p.shape[1:], p.dtype)
             for name, p in self.gpu.items()
         }
         # Cold rows read through the O_DIRECT queue-depth pool (QD ~6) when the store backs cold on
-        # disk — the serial store.row() mmap-fault loop is single-threaded and left the disk at ~40% of
-        # its concurrent ceiling on decode. Per-tensor fallback to the mmap copy (RAM-windowed stores,
-        # unaligned rows, or IO failure), mirroring store.page_in.
+        # disk — the single-threaded mmap-fault path left the disk at ~40% of its concurrent ceiling on
+        # decode. Fallback to the batched store.gather_rows_into (RAM-windowed stores, unaligned rows,
+        # mixed hot/cold miss sets, or IO failure).
         cp = getattr(self.store, "cold_pos", None)
         direct = getattr(self.store, "_read_cold_rows_direct", None)
-        cold_rows = [int(cp[e]) for e in ids] if cp is not None else None
+        cold_rows = (
+            cp[torch.as_tensor(ids, dtype=torch.int64)].tolist()
+            if cp is not None
+            else None
+        )
         for name in self.gpu:
             buf = bufs[name]
             if not (
@@ -935,13 +999,14 @@ class ExpertPager:
                 and direct is not None
                 and direct(name, cold_rows, buf)
             ):
-                for i, e in enumerate(ids):
-                    buf[i].copy_(self.store.row(name, e))
+                # Batched indexed gather (one/two index_select per tensor) instead of the per-expert
+                # row()-copy loop — this fill was the dominant host-bound decode cost at low concurrency.
+                self.store.gather_rows_into(name, ids, buf)
         if _PROF["on"]:
             _th = time.perf_counter()
             _PROF["gather"] += _th - _tg
         # Fused scatter: ONE contiguous async H2D per tensor into the device staging rows, then one
-        # scatter_multi launch places every tensor's rows into the victim slots — replacing 4*n
+        # scatter_multi launch places every tensor's rows into the destination slots — replacing 4*n
         # micro-copies (two of which move <1 KB fp8 scale rows). Falls back to per-row copies past the
         # staging cap or on non-windowed stores.
         if getattr(self, "_sc_stage", None) is not None and n <= self._sc_cap:
@@ -963,25 +1028,9 @@ class ExpertPager:
                     gpu_param.data[slot].copy_(buf[i], non_blocking=True)
         if _PROF["on"]:
             _PROF["h2d"] += time.perf_counter() - _th
-        # Batched residency + recency update (3 indexed writes total, vs 2-3 scalar device writes per
-        # staged expert): unmap the evicted occupants, map the staged experts, and stamp the staged slots
-        # with the CURRENT step — a staged cold expert must not inherit its victim's stale recency, or the
-        # next decide evicts it first and it thrashes through another deferred round.
-        slots_dev = torch.tensor(slots, dtype=torch.int64, device=self.device)
-        olds = [se[s] for s in slots if se[s] >= 0]
-        if olds:
-            l2g[torch.tensor(olds, dtype=torch.int64, device=self.device)] = -1
-        self._slot_expert_d[slots_dev] = torch.tensor(
-            ids, dtype=torch.int32, device=self.device
-        )
-        l2g[torch.tensor(ids, dtype=torch.int64, device=self.device)] = slots_dev.to(
-            torch.int32
-        )
-        self._slot_lastuse_d[slots_dev] = self._step_ctr_d
         # One sync for all tensors' async H2D: the shared pinned bufs must not be overwritten (by the next
-        # layer's refill) while copies are in flight.
+        # layer's/wave's staging) while copies are in flight.
         torch.cuda.current_stream().synchronize()
-        return n
 
     def refresh_window_freq(self) -> None:
         """P3 freq-ranked window: re-pin the hottest W experts (by the on-device use counts ``decide_bounded``
@@ -991,19 +1040,21 @@ class ExpertPager:
         slots keep their expert-indexed data, so only the page-in source tier moves (no residency reset).
         """
         if not self._windowed:
-            return
+            return 0
         freq = (
             self._freq_d.tolist()
         )  # per-expert routing count over the profiling window (one-time D2H)
         hot = sorted(range(self.E), key=lambda e: freq[e], reverse=True)[: self.store.W]
-        self.store.set_window_membership(hot)
+        moved = self.store.set_window_membership(hot) or 0  # experts that changed tier (drift Δ)
         # refresh the device membership map IN PLACE (same buffer the captured decide_bounded reads)
         self._log2hot_d.copy_(
             self.store.hot_pos.to(dtype=torch.int32, device=self.device)
         )
         # Age the counts (halve) instead of zeroing: ``_freq_d`` doubles as the LFU eviction key, and a
-        # hard zero would erase the very frequency history LFU keys on right after the re-pin.
+        # hard zero would erase the very frequency history LFU keys on right after the re-pin. On a rolling
+        # re-profile this halving IS the exponential decay that makes the window track the recent hot set.
         self._freq_d.copy_(torch.div(self._freq_d, 2, rounding_mode="floor"))
+        return moved
 
     def decide_and_page_wave_ondevice(
         self,
@@ -1049,6 +1100,91 @@ class ExpertPager:
         l2g[lo : lo + ngrp] = torch.arange(
             slot_base, slot_base + ngrp, dtype=torch.int32, device=self.device
         )
+        self._slot_lastuse_d.zero_()
+
+    def decide_and_page_bounded_wave_ondevice(
+        self,
+        topk_ids: torch.Tensor,
+        wave: int,
+        *,
+        wave_k: Optional[int] = None,
+        slot_base: int = 0,
+    ) -> None:
+        """One static wave for the pinned-WINDOW store (distinct > K): plan + gather this wave's window
+        HITS on-device from ``host_hot`` (capture-safe), and record its COLD (window-missing) experts in
+        ``_cold_log_d`` (count in ``_cold_n_d`` + the mapped doorbell) for the BCG break to stage into
+        their static home slots. The caller runs ceil(E/wave_k) waves, each: this decide -> break (stage
+        cold) -> masked GEMM, and sums the partials; then ``reset_residency_ondevice`` clears the maps.
+        Windowed analog of ``decide_and_page_wave_ondevice``; BCG-only (cold needs an out-of-graph break)."""
+        from sglang.jit_kernel.paged_experts_decide import (
+            paged_experts_decide_bounded_wave,
+        )
+
+        if wave == 0:
+            self._prep_topk_ondevice(topk_ids)
+        paged_experts_decide_bounded_wave(
+            self._topk_i32,
+            self.E,
+            wave_k if wave_k is not None else self.K,
+            wave,
+            self._log2hot_d,
+            self._src_d,
+            self._dst_d,
+            self._n_out_d,
+            self._cold_log_d,
+            self._cold_n_d,
+            self.logical_to_gpu_index_cuda,
+            self._slot_expert_d,  # static homes (slot -> logical); for the captured nvfp4 scalar refresh
+            slot_base=slot_base,
+            doorbell=self._doorbell_ptr,
+        )
+        self._gather_planned_ondevice()  # window hits only; cold deferred to stage_cold_wave_at_break
+
+    def stage_cold_wave_at_break(self) -> None:
+        """BCG break for one windowed compacted wave: stage this wave's deferred COLD experts into the slots
+        the decide kernel assigned them, before the wave's GEMM. The kernel already wrote both maps for every
+        in-wave expert — ``logical_to_gpu_index_cuda[e] = slot`` (so the remap after the break sees them) and
+        ``_slot_expert_d[slot] = e`` (for the nvfp4 refresh); the break only moves the cold WEIGHTS into their
+        slots, reading each cold expert's slot back from the live map. Runs eager at the break (capture
+        paused), so the doorbell read + host gather are legal. No eviction / no map writes here.
+
+        FOLLOW-UP (perf, wave-heavy workloads only): unlike the keep-warm ``stage_cold_at_break`` this does
+        NOT install ``_ensure_bcg_post_step_hook`` or record ``_last_cold_ids``, and the wave decide kernel
+        does not accumulate ``_freq_d`` — so on a deployment that decodes exclusively via waves (never a
+        ``bs*top_k <= K`` step) the freq-window re-pin + temporal cold prefetch never engage. Mixed
+        workloads self-heal (keep-warm steps install the hook + populate freq). Wiring these for wave-only
+        needs the freq accumulation in the kernel, so it is deferred rather than half-done here."""
+        bell = self._doorbell_np
+        cn = int(bell[0])
+        if cn < 0:  # doorbell not yet visible (capture-time stale / lost write): bounded spin + .item()
+            deadline = time.perf_counter() + 0.2
+            while cn < 0 and time.perf_counter() < deadline:
+                cn = int(bell[0])
+            if cn < 0:
+                cn = int(self._cold_n_d.item())
+        bell[0] = -1  # re-arm for the next replay
+        if cn <= 0:
+            return
+        cold_d = self._cold_log_d[:cn].long()
+        # ONE D2H for ids + their slots (vs a .tolist() each): the decide kernel set idx[e] = the compacted
+        # slot for every in-wave expert, so gather the cold experts' slots on-device and stack them with
+        # their ids into a single pinned copy. (Compaction is data-dependent, so the slots must be read
+        # back — but in one sync, not two.) Shaves a D2H off every non-empty wave break, which is on the
+        # host-bound critical path of the compacted-wave step.
+        pair = torch.stack(
+            [self._cold_log_d[:cn], self.logical_to_gpu_index_cuda[cold_d]]
+        ).cpu()
+        ids = pair[0].tolist()
+        slots = pair[1].tolist()
+        self._stage_cold_into_slots(ids, slots)
+
+    def reset_residency_ondevice(self) -> None:
+        """Clear the keep-warm residency maps after a windowed wave step. A windowed wave stages only the
+        ACTIVE experts into home slots (not a full [lo,hi) group like ``resync_residency_ondevice``), so
+        leaving stale claims would hand a following keep-warm decode step wrong weights. The next keep-warm
+        step re-pages from a clean slate (a one-step cost)."""
+        self._slot_expert_d.fill_(-1)
+        self.logical_to_gpu_index_cuda.fill_(-1)
         self._slot_lastuse_d.zero_()
 
     def set_residency(self, experts, base: int = 0) -> None:

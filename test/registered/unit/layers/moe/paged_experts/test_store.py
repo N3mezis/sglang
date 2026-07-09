@@ -91,6 +91,27 @@ class TestWindowedExpertStore(CustomTestCase):
             for e in range(E):
                 self.assertTrue(torch.equal(store.row(name, e).cpu(), full[e]))
 
+    def test_gather_rows_into_matches_row(self):
+        # The batched cold-refill gather must equal the per-expert row() it replaces, for a MIXED
+        # hot/cold id set in arbitrary order — covers the Windowed tier-split override and the
+        # single-buffer (Pinned) ABC path.
+        E, K, W, dev = 8, 4, 5, "cuda"
+        ids = [6, 0, 5, 2]  # 6,5 cold (>=W); 0,2 hot (<W); out of order; len == K
+        for store in (
+            WindowedExpertStore(_layer(K, dev), E, K, dev, window_W=W),
+            make_expert_store(_layer(K, dev), E, K, dev, pin_host=True, window_W=E),
+        ):
+            for name in store.gpu:
+                full = torch.randn((E, *store.gpu[name].shape[1:]))
+                store.fill_tensor(name, full)
+                buf = torch.empty((K, *store.gpu[name].shape[1:]), dtype=full.dtype)
+                store.gather_rows_into(name, ids, buf)
+                for i, e in enumerate(ids):
+                    self.assertTrue(
+                        torch.equal(buf[i], full[e]),
+                        f"{type(store).__name__} {name}: id {e} at pos {i} mismatch",
+                    )
+
     def test_mixed_page_in(self):
         # The crux: page in a HOT expert (via transfer_kv from the pinned window) and a COLD expert (via
         # the pageable indexed copy from the tail) in one plan; both must land the right rows in the right
