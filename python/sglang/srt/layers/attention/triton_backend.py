@@ -1930,36 +1930,23 @@ class TritonAttnBackend(AttentionBackend):
                 )
                 self._kvwin_store.filled = [0] * int(self.token_to_kv_pool.layer_num)
             store = self._kvwin_store
-            # Reset on ANY discontinuity (not just backward): a continuing decode has pos == filled
-            # (filled was set to prev_pos+1); a new request's first decode has pos == its prompt length,
-            # which ≠ the previous sequence's end (incl. the boot WARMUP that left the ring populated).
-            # Without this, stale low-ring slots from a prior/warmup sequence poison the window (repetition).
-            if pos != store.filled[lid]:
-                store.filled[lid] = 0
-            # Ingest new tokens [filled, pos] into the ring (evicting wrapped-out tokens to the host tail).
-            # Steady state (filled==pos) ingests ONLY the new token, taken directly from the forward_decode
-            # k,v args — no pool read, no D2H sync (critical: a per-step O(seqlen) kv_indices.tolist() over
-            # 48 layers starves the loop and trips the detokenizer watchdog on long sequences). The prefill
-            # prefix [0, pos) is backfilled from the standard pool once, on the first decode step (filled==0).
-            # Ingest new tokens [lo, pos] into the ring, reading each token's KV from the standard POOL via a
-            # device gather (kb[req_to_token slot]) — NOT the forward_decode k,v args, which are subtly not
-            # identical to the stored post-RoPE KV and degrade the windowed attention (W=8 → repetition).
-            # The gather is O(1)/step (no D2H sync, no O(seqlen) .tolist()), so it also avoids the watchdog
-            # stall. First decode step backfills the whole prefill prefix (one-time).
-            kvi = kv_indices.tolist()
-            for p in range(store.filled[lid], pos + 1):
-                s = kvi[p]
-                store.append(lid, p, kb[s], vb[s])
-            store.filled[lid] = pos + 1
-
             qv = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
             if os.environ.get("SGLANG_KV_WINDOW_CAP"):
-                # 4b'-3 capturable-shaped attention: device-driven pass lengths (kv_indptr from a device
-                # scalar) over constant arange index buffers — no python-int shape/branch on the dynamic
-                # position, so a CUDA graph replays with a varying length. pos_dev from the python pos here
-                # (eager 4b'-3a); 4b'-3c sources it from the captured-graph device seq_len. Empty tail
-                # (pos<W → num_tail_dev==0) → lse=-inf, zero-init oo → merge weights it to zero.
-                pos_dev = torch.tensor([pos], dtype=torch.int64, device=q.device)
+                # 4b'-3c FULLY DEVICE-SIDE decode (CUDA-graph capturable): no python-int pos, no .tolist(),
+                # no python loop. `pos` comes from the DEVICE seq_len (the graph replays with a varying
+                # length); the prior context [0,pos) was populated by windowed prefill (4b'-4) + prior
+                # captured decode steps, so here we only APPEND the current token (device gather of its pool
+                # slot) + evict via a device-pos scatter, then run the device two-pass attention. Prefill's
+                # last chunk overwrites all W ring slots, so no warmup/prior-request contamination survives.
+                # pos from the RUNNER-managed decode metadata (kv_indptr[1]=seq_len for bs=1), NOT
+                # forward_batch.seq_lens — under CUDA-graph replay only the forward_metadata buffers are
+                # updated in place, so this is the live value the graph must read each replay.
+                pos_dev = (kv_indptr[1:2] - 1).to(torch.int64)
+                cur_slot = kv_indices.index_select(0, pos_dev)  # [1] current token's pool slot
+                store.append_device(
+                    lid, pos_dev, kb.index_select(0, cur_slot), vb.index_select(0, cur_slot)
+                )
                 num_ring_dev = (pos_dev + 1).clamp(max=W)
                 num_tail_dev = (pos_dev + 1 - W).clamp(min=0)
                 o_w, lse_w = self._kvs_pass_dev(
@@ -1971,21 +1958,35 @@ class TritonAttnBackend(AttentionBackend):
                     layer, k_descale, v_descale, logits_soft_cap,
                 )
                 o_out = self._kvs_merge(o_w, lse_w, o_t, lse_t)
-            else:
-                num_ring = min(pos + 1, W)
-                num_tail = max(0, pos + 1 - W)
-                ring_idx = torch.arange(num_ring, dtype=torch.int32, device=q.device)
-                o_w, lse_w = self._kvs_pass(
-                    qv, store.rk[lid], store.rv[lid], ring_idx, layer, k_descale, v_descale, logits_soft_cap
+                return o_out.to(q.dtype).reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+            # --- eager path (committed, unchanged): python ingest (pool-sourced) + python two-pass ---
+            # Reset on ANY discontinuity: a continuing decode has pos == filled; a new request's first decode
+            # has pos == its prompt length ≠ the prior sequence's end (incl. boot WARMUP). Without this, stale
+            # low-ring slots poison the window (repetition). Read KV from the POOL (not the k,v args — they
+            # drift). O(1)/step device gather (no D2H sync / .tolist() → no watchdog stall).
+            if pos != store.filled[lid]:
+                store.filled[lid] = 0
+            kvi = kv_indices.tolist()
+            for p in range(store.filled[lid], pos + 1):
+                s = kvi[p]
+                store.append(lid, p, kb[s], vb[s])
+            store.filled[lid] = pos + 1
+
+            num_ring = min(pos + 1, W)
+            num_tail = max(0, pos + 1 - W)
+            ring_idx = torch.arange(num_ring, dtype=torch.int32, device=q.device)
+            o_w, lse_w = self._kvs_pass(
+                qv, store.rk[lid], store.rv[lid], ring_idx, layer, k_descale, v_descale, logits_soft_cap
+            )
+            if num_tail > 0:
+                tail_idx = torch.arange(num_tail, dtype=torch.int32, device=q.device)
+                o_t, lse_t = self._kvs_pass(
+                    qv, store.tk[lid], store.tv[lid], tail_idx, layer, k_descale, v_descale, logits_soft_cap
                 )
-                if num_tail > 0:
-                    tail_idx = torch.arange(num_tail, dtype=torch.int32, device=q.device)
-                    o_t, lse_t = self._kvs_pass(
-                        qv, store.tk[lid], store.tv[lid], tail_idx, layer, k_descale, v_descale, logits_soft_cap
-                    )
-                    o_out = self._kvs_merge(o_w, lse_w, o_t, lse_t)
-                else:
-                    o_out = o_w
+                o_out = self._kvs_merge(o_w, lse_w, o_t, lse_t)
+            else:
+                o_out = o_w
             return o_out.to(q.dtype).reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         # Select the correctly-sized attn_logits buffer for this layer.
