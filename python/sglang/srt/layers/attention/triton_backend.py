@@ -1336,8 +1336,15 @@ class TritonAttnBackend(AttentionBackend):
                 k_descale, v_descale, logits_soft_cap,
             )
             if num_tail > 0:
+                # Stage this layer's host tail UVA->VRAM (one contiguous link-rate copy), then extend over
+                # VRAM — extend re-reads prefix keys per query block, which is ~24× slower over UVA (uncached
+                # re-fetch) than VRAM (L2). See probe/extend_uva_probe.py.
+                sk = store.scratch_k[:num_tail]
+                sv = store.scratch_v[:num_tail]
+                sk.copy_(store.tk[lid][:num_tail])
+                sv.copy_(store.tv[lid][:num_tail])
                 o_t, lse_t = self._kvs_extend_pass(
-                    qext, kext, vext, Ne, store.tk[lid], store.tv[lid],
+                    qext, kext, vext, Ne, sk, sv,
                     store.tail_idx[:num_tail], num_tail, layer, False, True,
                     k_descale, v_descale, logits_soft_cap,
                 )

@@ -152,6 +152,13 @@ class WindowedKVStore:
         self.dummy = max_ctx - 1
         self.ring_idx = torch.arange(W, dtype=torch.int32, device=device)
         self.tail_idx = torch.arange(max_ctx, dtype=torch.int32, device=device)
+        # 4b'-4 prefill perf: a reused VRAM scratch to stage the host tail into before the extend tail pass.
+        # extend_attention_fwd re-reads prefix keys per query block; over UVA those re-reads re-fetch from
+        # host (uncached) → ~24× slower than VRAM (where re-reads hit L2). Staging (one contiguous UVA→VRAM
+        # copy at link rate) then extending over VRAM collapses that penalty. The per-layer tail fits VRAM
+        # (≤~56 MB at 32K), so no tiling. Decode (reads each key once) is already UVA-fast → no staging there.
+        self.scratch_k = torch.empty(max_ctx, head_num, head_dim, dtype=dtype, device=device)
+        self.scratch_v = torch.empty(max_ctx, head_num, head_dim, dtype=dtype, device=device)
 
     def append(self, layer_id: int, pos: int, k: torch.Tensor, v: torch.Tensor) -> None:
         slot = pos % self.W
