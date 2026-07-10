@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
@@ -589,6 +590,37 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
     seq_lens_gpu = batch.seq_lens
     bs = seq_lens_gpu.shape[0]
+
+    # KV-streaming 4b'-2: device-slot FIFO ring. For a windowed request, once the sequence passes the
+    # device window W_dev, free the out-of-window slot BEFORE this step's alloc, so the physical device
+    # pool holds only ~W_dev live tokens while the logical sequence grows to context_len. The evicted KV
+    # lives in the backend WindowedKVStore host-UVA tail (host_uva_tail_pool.py). Positional FIFO — no
+    # SWA/radix; requires --disable-radix-cache (ChunkCache: no lock/protected_len pinning the window's
+    # low end). bs==1, page_size==1 (the same regime the attention intercept is gated to).
+    _kvwin_dev = os.environ.get("SGLANG_KV_WINDOW")
+    if (
+        _kvwin_dev
+        and bs == 1
+        and _alloc_page_size(batch) == 1
+        # Only ring under ChunkCache (--disable-radix-cache): the double-free skip lives in
+        # ChunkCache.cache_finished_req, and radix would leak (cache_protected_len pins the low end).
+        # Under radix the backend WindowedKVStore still gives correct windowed attention (device pool
+        # just isn't physically ringed) — 4b'-1 behavior, no capacity gain but lossless + leak-free.
+        and batch.tree_cache is not None
+        and batch.tree_cache.is_chunk_cache()
+    ):
+        W_dev = int(_kvwin_dev)
+        new_pos = int(batch.seq_lens_cpu[0])  # position of the token about to be decoded
+        if new_pos >= W_dev:
+            old_slot = batch.req_to_token_pool.req_to_token[
+                batch.req_pool_indices[0], new_pos - W_dev
+            ]
+            batch.tree_cache.token_to_kv_pool_allocator.free(
+                old_slot.reshape(1).to(torch.int64)
+            )
+            # Record the ring-freed low range so request-end free (ChunkCache.cache_finished_req)
+            # skips it — else positions [0, new_pos-W_dev] are freed twice (pool leak: available>total).
+            batch.reqs[0]._kvwin_freed_upto = new_pos - W_dev + 1
 
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation

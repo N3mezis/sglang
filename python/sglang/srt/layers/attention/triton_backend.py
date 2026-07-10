@@ -1623,6 +1623,70 @@ class TritonAttnBackend(AttentionBackend):
 
         return o
 
+    def _kvs_pass(self, qv, kbuf, vbuf, idx, layer, k_descale, v_descale, logit_cap):
+        """One decode pass (bs=1) over (kbuf, vbuf) at rows ``idx``; returns (o [1,H,Dv] float32,
+        lse [1,H] float32). Shared by KV-streaming increment 4a (device split) and 4b' (windowed store
+        ring+tail). ``lse`` is the per-query log-sum-exp of THIS pass, for the flash-state merge (increment 2)."""
+        n = int(idx.shape[0])
+        device = qv.device
+        indptr = torch.tensor([0, n], dtype=torch.int32, device=device)
+        al = torch.empty(
+            1, layer.tp_q_head_num, self.max_kv_splits, layer.v_head_dim,
+            dtype=torch.float32, device=device,
+        )
+        lse = torch.full(
+            (1, layer.tp_q_head_num, self.max_kv_splits), -float("inf"),
+            dtype=torch.float32, device=device,
+        )
+        nks = torch.full((1,), self.max_kv_splits, dtype=torch.int32, device=device)
+        oo = torch.empty(1, layer.tp_q_head_num, layer.v_head_dim, dtype=qv.dtype, device=device)
+        self.decode_attention_fwd(
+            qv, kbuf, vbuf, oo, indptr, idx.to(torch.int32), al, lse, nks,
+            self.max_kv_splits, layer.scaling, k_descale, v_descale,
+            logit_cap=logit_cap, sinks=None,
+            xai_temperature_len=layer.xai_temperature_len,
+            has_mla=self.use_mla, use_pdl=self.use_pdl, page_size=self.page_size,
+        )
+        return oo.float(), torch.logsumexp(lse, dim=-1)  # [1,H,Dv], [1,H]
+
+    def _kvs_pass_dev(self, qv, kbuf, vbuf, kv_indices, num_dev, layer, k_descale, v_descale, logit_cap):
+        """Capturable decode pass: like _kvs_pass but the attended count comes from a DEVICE scalar
+        (num_dev, [1] int) written into kv_indptr, not a python int — so a CUDA graph replays with a
+        varying length. kv_indices is a constant arange buffer; the kernel reads its first num_dev entries.
+        num_dev==0 (empty tail while pos<W) yields lse=-inf → the merge weights it to zero."""
+        device = qv.device
+        indptr = torch.zeros(2, dtype=torch.int32, device=device)
+        indptr[1] = num_dev.reshape(()).to(torch.int32)
+        al = torch.empty(
+            1, layer.tp_q_head_num, self.max_kv_splits, layer.v_head_dim,
+            dtype=torch.float32, device=device,
+        )
+        lse = torch.full(
+            (1, layer.tp_q_head_num, self.max_kv_splits), -float("inf"),
+            dtype=torch.float32, device=device,
+        )
+        nks = torch.full((1,), self.max_kv_splits, dtype=torch.int32, device=device)
+        # ZERO-init (not empty): when num_dev==0 (empty tail while pos<W) the kernel writes nothing, so oo
+        # must be a finite 0 — else uninitialized NaN survives as NaN*0 in the merge and corrupts the output.
+        oo = torch.zeros(1, layer.tp_q_head_num, layer.v_head_dim, dtype=qv.dtype, device=device)
+        self.decode_attention_fwd(
+            qv, kbuf, vbuf, oo, indptr, kv_indices, al, lse, nks,
+            self.max_kv_splits, layer.scaling, k_descale, v_descale,
+            logit_cap=logit_cap, sinks=None,
+            xai_temperature_len=layer.xai_temperature_len,
+            has_mla=self.use_mla, use_pdl=self.use_pdl, page_size=self.page_size,
+        )
+        return oo.float(), torch.logsumexp(lse, dim=-1)
+
+    @staticmethod
+    def _kvs_merge(o_w, lse_w, o_t, lse_t):
+        """Flash attention-state merge of two decode passes (increment-2 math): combine window + tail by
+        their log-sum-exp weights. Reproduces single-pass full-context attention (proven ≤2.1e-4)."""
+        m = torch.maximum(lse_w, lse_t)
+        ww = torch.exp(lse_w - m).unsqueeze(-1)
+        wt = torch.exp(lse_t - m).unsqueeze(-1)
+        return (o_w * ww + o_t * wt) / (ww + wt)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1693,7 +1757,7 @@ class TritonAttnBackend(AttentionBackend):
         # pass is pointed at the host-UVA pool. Requires --disable-cuda-graph (allocates scratch eagerly).
         _kvs_w = os.environ.get("SGLANG_KV_STREAM_W")
         if (
-            _kvs_w is not None
+            _kvs_w  # non-empty (env passes "" when the knob is unset)
             and self.dcp_size <= 1
             and not (layer.sliding_window_size is not None and layer.sliding_window_size > -1)
             and (kv_indptr.shape[0] - 1) == 1  # bs=1 for this first slice
@@ -1706,26 +1770,9 @@ class TritonAttnBackend(AttentionBackend):
                 vb = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
 
                 def _pass(kbuf, vbuf, idx):
-                    n = int(idx.shape[0])
-                    indptr = torch.tensor([0, n], dtype=torch.int32, device=q.device)
-                    al = torch.empty(
-                        1, layer.tp_q_head_num, self.max_kv_splits, layer.v_head_dim,
-                        dtype=torch.float32, device=q.device,
+                    return self._kvs_pass(
+                        qv, kbuf, vbuf, idx, layer, k_descale, v_descale, logits_soft_cap
                     )
-                    lse = torch.full(
-                        (1, layer.tp_q_head_num, self.max_kv_splits), -float("inf"),
-                        dtype=torch.float32, device=q.device,
-                    )
-                    nks = torch.full((1,), self.max_kv_splits, dtype=torch.int32, device=q.device)
-                    oo = torch.empty(1, layer.tp_q_head_num, layer.v_head_dim, dtype=q.dtype, device=q.device)
-                    self.decode_attention_fwd(
-                        qv, kbuf, vbuf, oo, indptr, idx.to(torch.int32), al, lse, nks,
-                        self.max_kv_splits, layer.scaling, k_descale, v_descale,
-                        logit_cap=logits_soft_cap, sinks=None,
-                        xai_temperature_len=layer.xai_temperature_len,
-                        has_mla=self.use_mla, use_pdl=self.use_pdl, page_size=self.page_size,
-                    )
-                    return oo.float(), torch.logsumexp(lse, dim=-1)  # [1,H,Dv], [1,H]
 
                 win_idx = kv_indices[seqlen - W:]
                 tail_idx = kv_indices[: seqlen - W]
@@ -1755,11 +1802,105 @@ class TritonAttnBackend(AttentionBackend):
                 else:
                     o_t, lse_t = _pass(kb, vb, tail_idx)  # device-split fallback (4a-device-split)
 
-                m = torch.maximum(lse_w, lse_t)
-                ww = torch.exp(lse_w - m).unsqueeze(-1)
-                wt = torch.exp(lse_t - m).unsqueeze(-1)
-                o_merged = (o_w * ww + o_t * wt) / (ww + wt)
+                o_merged = self._kvs_merge(o_w, lse_w, o_t, lse_t)
                 return o_merged.to(q.dtype).reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+        # KV-streaming increment 4b' (eager, bs=1, flag-gated SGLANG_KV_WINDOW=W): the self-contained
+        # WindowedKVStore — the DEVICE holds only a W-slot FIFO ring (recent W tokens); older tokens are
+        # evicted to a mapped-UVA HOST tail (positional). Attention reads the ring (device) + the tail
+        # (host-UVA, direct) + flash-merges. This is the CAPACITY mechanism: unlike 4a (device pool holds
+        # ALL context), here the device physically stores only W — proving attention stays lossless when the
+        # device cannot hold the full context. Source rows are copied from the standard pool via kv_indices
+        # (which backfills the whole prefix on the first decode step — prefill handling is deferred to 4b'-4).
+        # No SWA/radix/scheduler: the ring is a plain FIFO by token position, backend-owned (kills the
+        # shared-pool-reference bug by construction). Eager only (python-int pos + backfill loop).
+        _kvwin = os.environ.get("SGLANG_KV_WINDOW")
+        if (
+            _kvwin  # non-empty (env passes "" when the knob is unset)
+            and self.dcp_size <= 1
+            and not self.use_mla
+            and not (layer.sliding_window_size is not None and layer.sliding_window_size > -1)
+            and (self.forward_metadata.kv_indptr.shape[0] - 1) == 1  # bs=1
+        ):
+            W = int(_kvwin)
+            kv_indices = self.forward_metadata.kv_indices
+            pos = int(kv_indices.shape[0]) - 1  # current token position (0-indexed); context = [0, pos]
+            kb = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            vb = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+            lid = layer.layer_id
+            if getattr(self, "_kvwin_store", None) is None:
+                from sglang.srt.mem_cache.host_uva_tail_pool import WindowedKVStore
+
+                self._kvwin_store = WindowedKVStore(
+                    W=W,
+                    # host tail holds ALL evicted positions up to context_len (4b'-2: context far exceeds
+                    # the device pool), NOT the device pool size (+1 scratch slot for the pos<W eviction).
+                    max_ctx=int(self.max_context_len) + 2,
+                    layer_num=int(self.token_to_kv_pool.layer_num),
+                    head_num=int(kb.shape[1]),
+                    head_dim=int(kb.shape[2]),
+                    dtype=kb.dtype,
+                    device=str(q.device),
+                )
+                self._kvwin_store.filled = [0] * int(self.token_to_kv_pool.layer_num)
+            store = self._kvwin_store
+            # Reset on ANY discontinuity (not just backward): a continuing decode has pos == filled
+            # (filled was set to prev_pos+1); a new request's first decode has pos == its prompt length,
+            # which ≠ the previous sequence's end (incl. the boot WARMUP that left the ring populated).
+            # Without this, stale low-ring slots from a prior/warmup sequence poison the window (repetition).
+            if pos != store.filled[lid]:
+                store.filled[lid] = 0
+            # Ingest new tokens [filled, pos] into the ring (evicting wrapped-out tokens to the host tail).
+            # Steady state (filled==pos) ingests ONLY the new token, taken directly from the forward_decode
+            # k,v args — no pool read, no D2H sync (critical: a per-step O(seqlen) kv_indices.tolist() over
+            # 48 layers starves the loop and trips the detokenizer watchdog on long sequences). The prefill
+            # prefix [0, pos) is backfilled from the standard pool once, on the first decode step (filled==0).
+            # Ingest new tokens [lo, pos] into the ring, reading each token's KV from the standard POOL via a
+            # device gather (kb[req_to_token slot]) — NOT the forward_decode k,v args, which are subtly not
+            # identical to the stored post-RoPE KV and degrade the windowed attention (W=8 → repetition).
+            # The gather is O(1)/step (no D2H sync, no O(seqlen) .tolist()), so it also avoids the watchdog
+            # stall. First decode step backfills the whole prefill prefix (one-time).
+            kvi = kv_indices.tolist()
+            for p in range(store.filled[lid], pos + 1):
+                s = kvi[p]
+                store.append(lid, p, kb[s], vb[s])
+            store.filled[lid] = pos + 1
+
+            qv = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+            if os.environ.get("SGLANG_KV_WINDOW_CAP"):
+                # 4b'-3 capturable-shaped attention: device-driven pass lengths (kv_indptr from a device
+                # scalar) over constant arange index buffers — no python-int shape/branch on the dynamic
+                # position, so a CUDA graph replays with a varying length. pos_dev from the python pos here
+                # (eager 4b'-3a); 4b'-3c sources it from the captured-graph device seq_len. Empty tail
+                # (pos<W → num_tail_dev==0) → lse=-inf, zero-init oo → merge weights it to zero.
+                pos_dev = torch.tensor([pos], dtype=torch.int64, device=q.device)
+                num_ring_dev = (pos_dev + 1).clamp(max=W)
+                num_tail_dev = (pos_dev + 1 - W).clamp(min=0)
+                o_w, lse_w = self._kvs_pass_dev(
+                    qv, store.rk[lid], store.rv[lid], store.ring_idx, num_ring_dev,
+                    layer, k_descale, v_descale, logits_soft_cap,
+                )
+                o_t, lse_t = self._kvs_pass_dev(
+                    qv, store.tk[lid], store.tv[lid], store.tail_idx, num_tail_dev,
+                    layer, k_descale, v_descale, logits_soft_cap,
+                )
+                o_out = self._kvs_merge(o_w, lse_w, o_t, lse_t)
+            else:
+                num_ring = min(pos + 1, W)
+                num_tail = max(0, pos + 1 - W)
+                ring_idx = torch.arange(num_ring, dtype=torch.int32, device=q.device)
+                o_w, lse_w = self._kvs_pass(
+                    qv, store.rk[lid], store.rv[lid], ring_idx, layer, k_descale, v_descale, logits_soft_cap
+                )
+                if num_tail > 0:
+                    tail_idx = torch.arange(num_tail, dtype=torch.int32, device=q.device)
+                    o_t, lse_t = self._kvs_pass(
+                        qv, store.tk[lid], store.tv[lid], tail_idx, layer, k_descale, v_descale, logits_soft_cap
+                    )
+                    o_out = self._kvs_merge(o_w, lse_w, o_t, lse_t)
+                else:
+                    o_out = o_w
+            return o_out.to(q.dtype).reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         # Select the correctly-sized attn_logits buffer for this layer.
         # The triton kernel's // Lv stride trick requires attn_logits.shape[-1]

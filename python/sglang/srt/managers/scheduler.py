@@ -1881,18 +1881,22 @@ class Scheduler(
         # into the waiting queue but can never be scheduled, blocking the queue
         # and eventually making health checks fail.
         paged_input_len = -(-input_len // self.page_size) * self.page_size
-        req.sampling_params.max_new_tokens = max(
-            0,
-            min(
-                (
-                    req.sampling_params.max_new_tokens
-                    if req.sampling_params.max_new_tokens is not None
-                    else 1 << 30
-                ),
+        requested = (
+            req.sampling_params.max_new_tokens
+            if req.sampling_params.max_new_tokens is not None
+            else 1 << 30
+        )
+        if os.environ.get("SGLANG_KV_WINDOW"):
+            # KV-streaming 4b'-2: the device pool is windowed (see alloc_for_decode), so the sequence can
+            # grow to context_len even though it exceeds the device pool. Bound max_new_tokens by
+            # context_len, NOT by the device pool size (max_req_len / max_total_num_tokens).
+            upper = self.model_config.context_len - input_len - 1
+        else:
+            upper = min(
                 self.max_req_len - input_len - 1,
                 self.max_total_num_tokens - paged_input_len - self.page_size - 1,
-            ),
-        )
+            )
+        req.sampling_params.max_new_tokens = max(0, min(requested, upper))
 
     def _process_and_broadcast_mm_inputs(
         self,

@@ -116,3 +116,63 @@ class HostUVATailKVPool:
         """Gather the tail slots for a set of (already-evicted) context positions — the attention backend's
         ``tail_kv_indices`` for this request's cold context."""
         return self.full_to_tail[positions]
+
+
+class WindowedKVStore:
+    """Self-contained windowed KV cache (KV-streaming 4b'): a per-layer DEVICE W-slot FIFO ring holding the
+    recent W tokens + a per-layer mapped-UVA HOST tail holding the older tokens (positional: tail slot == token
+    position, no allocator/map). Backend-owned; attention reads the ring (recent W) + the host tail (direct-UVA,
+    ALL older tokens) and flash-merges them. FIFO by position — NO SWA/radix/LRU/scheduler entanglement (that is
+    the whole point: it designs out every failure mode the SWA-forcing route hit). Eager, bs=1 (python-int pos).
+
+    append(layer, pos, k, v): write token `pos`'s KV into ring slot pos%W; if the ring is full, first evict the
+    token being overwritten (pos-W) into host tail[pos-W]. Attention then reads ring[:min(pos+1,W)] (device) and
+    tail[:max(0,pos-W+1)] (host-UVA), order-independent (softmax over keys)."""
+
+    def __init__(self, W, max_ctx, layer_num, head_num, head_dim, dtype=torch.float16, device="cuda"):
+        self.W = W
+        self.max_ctx = max_ctx
+        self.layer_num = layer_num
+        self.head_num = head_num
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.device = device
+        self.rk = [torch.zeros(W, head_num, head_dim, dtype=dtype, device=device) for _ in range(layer_num)]
+        self.rv = [torch.zeros(W, head_num, head_dim, dtype=dtype, device=device) for _ in range(layer_num)]
+        self.tk, self.tv, self._host = [], [], []
+        for _ in range(layer_num):
+            kd, kh = _uva_buffer((max_ctx, head_num, head_dim), dtype)
+            vd, vh = _uva_buffer((max_ctx, head_num, head_dim), dtype)
+            self.tk.append(kd)
+            self.tv.append(vd)
+            self._host += [kh, vh]
+        # 4b'-3 capture support: pre-built constant index buffers (kv_indices for the ring/tail decode
+        # passes — the kernel reads the first `num` of them via a device kv_indptr) + a scratch tail slot
+        # for evictions while pos < W (never attended). All device tensors so append/attend are graph-safe.
+        self.dummy = max_ctx - 1
+        self.ring_idx = torch.arange(W, dtype=torch.int32, device=device)
+        self.tail_idx = torch.arange(max_ctx, dtype=torch.int32, device=device)
+
+    def append(self, layer_id: int, pos: int, k: torch.Tensor, v: torch.Tensor) -> None:
+        slot = pos % self.W
+        if pos >= self.W:  # ring full: slot currently holds token pos-W -> evict to host tail (device->UVA)
+            self.tk[layer_id][pos - self.W] = self.rk[layer_id][slot]
+            self.tv[layer_id][pos - self.W] = self.rv[layer_id][slot]
+        self.rk[layer_id][slot] = k.reshape(self.head_num, self.head_dim)
+        self.rv[layer_id][slot] = v.reshape(self.head_num, self.head_dim)
+
+    def append_device(self, layer_id: int, pos_dev: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Capturable append+evict: pos_dev is a [1] int64 DEVICE tensor (no python-int branching). Evicts
+        ring[pos%W] (which holds token pos-W) to tail[pos-W], or to the scratch `dummy` slot when pos<W
+        (torch.where — no host branch), then writes ring[pos%W]=new. All device-index scatters (index_copy_),
+        so this replays correctly under a CUDA graph (slot varies with the device pos on each replay)."""
+        slot = (pos_dev % self.W).reshape(1)
+        evict_idx = torch.where(
+            pos_dev >= self.W, pos_dev - self.W, pos_dev.new_full((1,), self.dummy)
+        ).reshape(1)
+        rk, rv, tk, tv = self.rk[layer_id], self.rv[layer_id], self.tk[layer_id], self.tv[layer_id]
+        # evict OLD ring[slot] (device-index gather makes a copy) BEFORE overwriting; dummy slot when pos<W
+        tk[evict_idx] = rk[slot]
+        tv[evict_idx] = rv[slot]
+        rk[slot] = k.reshape(1, self.head_num, self.head_dim)
+        rv[slot] = v.reshape(1, self.head_num, self.head_dim)

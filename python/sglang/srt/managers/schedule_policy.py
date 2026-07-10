@@ -898,9 +898,12 @@ class PrefillAdder:
         else:
             add_req_state(req, insert_sort=True)
 
-        if not self.is_hybrid_swa:
+        if not self.is_hybrid_swa and not os.environ.get("SGLANG_KV_WINDOW"):
             # Skip this logic for swa. The SWA has different memory management, and
             # this mechanism is underestimating the memory usage.
+            # KV-streaming 4b'-2: also skip for a windowed device pool — a windowed request only ever
+            # occupies ~W device slots (alloc_for_decode ring), so reserving the full max_new_tokens
+            # here would wrongly reject long generations that exceed the small device pool.
             cur_rem_tokens = self.cur_rem_tokens - self.ceil_paged_tokens(
                 cand_extend_input_len
             )
