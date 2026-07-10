@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -1684,6 +1685,81 @@ class TritonAttnBackend(AttentionBackend):
         else:
             k_descale = 1.0
             v_descale = 1.0
+
+        # KV-streaming increment 4a (eager, bs=1, flag-gated): split the request's context into a recent
+        # window + an older tail, run TWO decode passes, and merge them by the flash attention-state merge
+        # (increment-2 math). This slice reads BOTH passes from the DEVICE pool (window := recent kv_indices,
+        # tail := older) to prove the two-pass+merge PLUMBING is lossless in the live server before the tail
+        # pass is pointed at the host-UVA pool. Requires --disable-cuda-graph (allocates scratch eagerly).
+        _kvs_w = os.environ.get("SGLANG_KV_STREAM_W")
+        if (
+            _kvs_w is not None
+            and self.dcp_size <= 1
+            and not (layer.sliding_window_size is not None and layer.sliding_window_size > -1)
+            and (kv_indptr.shape[0] - 1) == 1  # bs=1 for this first slice
+        ):
+            W = int(_kvs_w)
+            seqlen = int(kv_indices.shape[0])
+            if seqlen > W:
+                qv = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+                kb = self.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                vb = self.token_to_kv_pool.get_value_buffer(layer.layer_id)
+
+                def _pass(kbuf, vbuf, idx):
+                    n = int(idx.shape[0])
+                    indptr = torch.tensor([0, n], dtype=torch.int32, device=q.device)
+                    al = torch.empty(
+                        1, layer.tp_q_head_num, self.max_kv_splits, layer.v_head_dim,
+                        dtype=torch.float32, device=q.device,
+                    )
+                    lse = torch.full(
+                        (1, layer.tp_q_head_num, self.max_kv_splits), -float("inf"),
+                        dtype=torch.float32, device=q.device,
+                    )
+                    nks = torch.full((1,), self.max_kv_splits, dtype=torch.int32, device=q.device)
+                    oo = torch.empty(1, layer.tp_q_head_num, layer.v_head_dim, dtype=q.dtype, device=q.device)
+                    self.decode_attention_fwd(
+                        qv, kbuf, vbuf, oo, indptr, idx.to(torch.int32), al, lse, nks,
+                        self.max_kv_splits, layer.scaling, k_descale, v_descale,
+                        logit_cap=logits_soft_cap, sinks=None,
+                        xai_temperature_len=layer.xai_temperature_len,
+                        has_mla=self.use_mla, use_pdl=self.use_pdl, page_size=self.page_size,
+                    )
+                    return oo.float(), torch.logsumexp(lse, dim=-1)  # [1,H,Dv], [1,H]
+
+                win_idx = kv_indices[seqlen - W:]
+                tail_idx = kv_indices[: seqlen - W]
+                o_w, lse_w = _pass(kb, vb, win_idx)  # recent window (device pool)
+
+                # 4a-host-tail: read the OLDER tail from the host-UVA pool (proves the UVA read in the live
+                # serving forward). Populated by mirroring the device tail rows into the UVA pool (this slice
+                # is a correctness proof; 4b replaces the mirror with device→UVA eviction on window overflow).
+                if os.environ.get("SGLANG_KV_STREAM_HOST") == "1":
+                    if getattr(self, "_uva_tail", None) is None:
+                        from sglang.srt.mem_cache.host_uva_tail_pool import HostUVATailKVPool
+
+                        self._uva_tail = HostUVATailKVPool(
+                            size=int(kb.shape[0]),
+                            layer_num=int(self.token_to_kv_pool.layer_num),
+                            head_num=int(kb.shape[1]),
+                            head_dim=int(kb.shape[2]),
+                            max_context=int(kb.shape[0]),
+                            dtype=kb.dtype,
+                        )
+                    tk = self._uva_tail.get_key_buffer(layer.layer_id)
+                    tv = self._uva_tail.get_value_buffer(layer.layer_id)
+                    tidx = tail_idx.long()
+                    tk[tidx] = kb[tidx]  # mirror device tail -> UVA (device->host scatter over PCIe)
+                    tv[tidx] = vb[tidx]
+                    o_t, lse_t = _pass(tk, tv, tail_idx)  # tail read from HOST-UVA
+                else:
+                    o_t, lse_t = _pass(kb, vb, tail_idx)  # device-split fallback (4a-device-split)
+
+                m = torch.maximum(lse_w, lse_t)
+                ww = torch.exp(lse_w - m).unsqueeze(-1)
+                wt = torch.exp(lse_t - m).unsqueeze(-1)
+                o_merged = (o_w * ww + o_t * wt) / (ww + wt)
+                return o_merged.to(q.dtype).reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
         # Select the correctly-sized attn_logits buffer for this layer.
         # The triton kernel's // Lv stride trick requires attn_logits.shape[-1]

@@ -281,6 +281,17 @@ class ModelConfig:
             )
         )
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        # KV-streaming 4b: force a windowed (SWA) device KV ring on a full-attention model via env, so the
+        # generic SWA ring + per-step eviction machinery engages (the host tail, 4b-2, recovers the evicted
+        # older tokens for full-attention correctness). Env-driven to dodge --json-model-override-args CLI
+        # quoting; toggled off by default. SGLANG_FORCE_SWA_W = the window size in tokens.
+        _force_swa_w = os.environ.get("SGLANG_FORCE_SWA_W")
+        if _force_swa_w:
+            _nl = getattr(self.hf_text_config, "num_hidden_layers", None)
+            if _nl:
+                self.hf_text_config.is_hybrid_swa = True
+                self.hf_text_config.sliding_window = int(_force_swa_w)
+                self.hf_text_config.hybrid_layer_pattern = [1] * int(_nl)
         self.hf_generation_config = get_generation_config(
             self.model_path,
             trust_remote_code=trust_remote_code,
