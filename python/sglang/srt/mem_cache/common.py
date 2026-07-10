@@ -636,16 +636,21 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     ):
         W_dev = int(_kvwin_dev)
         new_pos = int(batch.seq_lens_cpu[0])  # position of the token about to be decoded
-        if new_pos >= W_dev:
-            old_slot = batch.req_to_token_pool.req_to_token[
-                batch.req_pool_indices[0], new_pos - W_dev
+        req0 = batch.reqs[0]
+        # Free the WHOLE out-of-window range [freed_upto, new_pos-W] — not just the single slot new_pos-W.
+        # After windowed PREFILL the ring freed only up to the last chunk_start, so positions
+        # [chunk_start, new_pos-W] are still resident on the first decode; freeing a single slot would skip
+        # them (they fall in the gap between the ring free and the cache_finished_req skip → W-slot leak).
+        freed_upto = getattr(req0, "_kvwin_freed_upto", 0)
+        new_freed = new_pos - W_dev + 1  # exclusive upper bound (positions <= new_pos-W leave the window)
+        if new_freed > freed_upto:
+            free_slots = batch.req_to_token_pool.req_to_token[
+                req0.req_pool_idx, freed_upto:new_freed
             ]
-            batch.tree_cache.token_to_kv_pool_allocator.free(
-                old_slot.reshape(1).to(torch.int64)
-            )
-            # Record the ring-freed low range so request-end free (ChunkCache.cache_finished_req)
-            # skips it — else positions [0, new_pos-W_dev] are freed twice (pool leak: available>total).
-            batch.reqs[0]._kvwin_freed_upto = new_pos - W_dev + 1
+            batch.tree_cache.token_to_kv_pool_allocator.free(free_slots.reshape(-1).to(torch.int64))
+            # Record the ring-freed low range so request-end free (ChunkCache.cache_finished_req) skips it
+            # (else the same slots free twice — the reverse leak, available>total).
+            req0._kvwin_freed_upto = new_freed
 
     if _alloc_page_size(batch) == 1:
         # Non-paged allocation
