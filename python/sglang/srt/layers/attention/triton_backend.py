@@ -1289,6 +1289,78 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
+        # KV-streaming 4b'-4 (windowed PREFILL, flag-gated SGLANG_KV_WINDOW, bs=1, eager): the chunk attends
+        # its prior context — split into the device ring (recent W) + host-UVA tail — via TWO windowed extend
+        # passes merged by LSE (window+chunk causal; tail non-causal skip_extend), then the chunk is ingested
+        # into the shared WindowedKVStore so subsequent chunks + decode continue seamlessly (same p%W ring
+        # convention). Proven lossless in probe/kv_windowed_extend_probe.py. 4b'-4b-1: the device pool still
+        # holds the whole prompt (whole-context re-ingest from the pool); 4b'-4b-2 adds the prefill pool ring.
+        _kvwin = os.environ.get("SGLANG_KV_WINDOW")
+        if _kvwin and self.dcp_size <= 1 and not self.use_mla and sliding_window_size == -1:
+            from sglang.srt.server_args import get_global_server_args
+
+            _kvwin_prefill = get_global_server_args().disable_radix_cache  # chunk cache only
+        else:
+            _kvwin_prefill = False
+        if (
+            _kvwin_prefill
+            and (kv_indptr.shape[0] - 1) == 1  # bs=1
+        ):
+            W = int(_kvwin)
+            lid = layer.layer_id
+            chunk_start = int(kv_indptr[1])  # prior-context length (prefix)
+            Ne = int(self.forward_metadata.qo_indptr[1])  # chunk (extend) length
+            kb = self.token_to_kv_pool.get_key_buffer(lid)
+            vb = self.token_to_kv_pool.get_value_buffer(lid)
+            if getattr(self, "_kvwin_store", None) is None:
+                from sglang.srt.mem_cache.host_uva_tail_pool import WindowedKVStore
+
+                self._kvwin_store = WindowedKVStore(
+                    W=W, max_ctx=int(self.max_context_len) + 2,
+                    layer_num=int(self.token_to_kv_pool.layer_num),
+                    head_num=int(kb.shape[1]), head_dim=int(kb.shape[2]),
+                    dtype=kb.dtype, device=str(q.device),
+                )
+                self._kvwin_store.filled = [0] * int(self.token_to_kv_pool.layer_num)
+            store = self._kvwin_store
+            if chunk_start == 0:  # new request's first chunk -> reset the shared store
+                store.filled[lid] = 0
+            qext = q.view(Ne, layer.tp_q_head_num, layer.qk_head_dim)
+            kext = k.contiguous()
+            vext = v.contiguous()
+            num_ring = min(chunk_start, W)
+            num_tail = max(0, chunk_start - W)
+            o_w, lse_w = self._kvs_extend_pass(
+                qext, kext, vext, Ne, store.rk[lid], store.rv[lid],
+                store.ring_idx[:num_ring], num_ring, layer, True, False,
+                k_descale, v_descale, logits_soft_cap,
+            )
+            if num_tail > 0:
+                o_t, lse_t = self._kvs_extend_pass(
+                    qext, kext, vext, Ne, store.tk[lid], store.tv[lid],
+                    store.tail_idx[:num_tail], num_tail, layer, False, True,
+                    k_descale, v_descale, logits_soft_cap,
+                )
+                o_out = self._kvs_merge(o_w, lse_w, o_t, lse_t)
+            else:
+                o_out = o_w
+            # ingest the chunk: whole-context re-ingest from the pool into the ring (recent W, by p%W) + tail
+            E = chunk_start + Ne
+            req_idx = forward_batch.req_pool_indices[0]
+            slots = self.req_to_token_pool.req_to_token[req_idx, :E].long()
+            dev = q.device
+            if E <= W:
+                pos = torch.arange(E, device=dev)
+            else:
+                pos = torch.arange(E - W, E, device=dev)
+                tpos = torch.arange(E - W, device=dev)
+                store.tk[lid][tpos] = kb[slots[tpos]]
+                store.tv[lid][tpos] = vb[slots[tpos]]
+            store.rk[lid][pos % W] = kb[slots[pos]]
+            store.rv[lid][pos % W] = vb[slots[pos]]
+            store.filled[lid] = E
+            return o_out.to(q.dtype).reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
         # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
         # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
@@ -1677,6 +1749,25 @@ class TritonAttnBackend(AttentionBackend):
             has_mla=self.use_mla, use_pdl=self.use_pdl, page_size=self.page_size,
         )
         return oo.float(), torch.logsumexp(lse, dim=-1)
+
+    def _kvs_extend_pass(self, qext, kext, vext, Ne, kbuf, vbuf, kv_indices, num_pref,
+                         layer, causal, skip_extend, k_descale, v_descale, logit_cap):
+        """One windowed-prefill extend pass (KV-streaming 4b'-4): chunk queries `qext` attend a prefix of
+        `num_pref` tokens in (kbuf,vbuf) at rows `kv_indices` + (unless skip_extend) the chunk itself
+        `kext,vext` causally. Returns (o [Ne,H,Dv] float32, lse [Ne,H] float32) for the flash-state merge.
+        Mirrors the proven decode two-pass, using extend_attention_fwd's lse_extend + skip_extend (proven
+        lossless in probe/kv_windowed_extend_probe.py)."""
+        device = qext.device
+        oo = torch.zeros(Ne, layer.tp_q_head_num, layer.v_head_dim, dtype=qext.dtype, device=device)
+        lse = torch.full((Ne, layer.tp_q_head_num), -float("inf"), dtype=torch.float32, device=device)
+        qo_indptr = torch.tensor([0, Ne], dtype=torch.int32, device=device)
+        kv_indptr = torch.tensor([0, num_pref], dtype=torch.int32, device=device)
+        self.extend_attention_fwd(
+            qext, kext, vext, oo, kbuf, vbuf, qo_indptr, kv_indptr, kv_indices.to(torch.int32),
+            None, causal, None, Ne, k_descale, v_descale, sm_scale=layer.scaling,
+            logit_cap=logit_cap, lse_extend=lse, skip_extend=skip_extend, page_size=self.page_size,
+        )
+        return oo.float(), lse
 
     @staticmethod
     def _kvs_merge(o_w, lse_w, o_t, lse_t):
