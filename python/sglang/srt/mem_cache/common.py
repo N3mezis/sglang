@@ -470,6 +470,31 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
+    # KV-streaming 4b'-4b-2: prefill device-slot ring. Before this chunk's alloc, free prior-context positions
+    # that have left the window (< E-W), so the device pool holds only ~W + chunk_size regardless of prompt
+    # length (freed slots are reused by this chunk's alloc). High-water mark req._kvwin_freed_upto frees each
+    # range once; the freed low req_to_token entries go stale but are never read (windowed attention reads the
+    # recent-W tail / the backend WindowedKVStore). Positions come from len(prefix_indices) (full) so they stay
+    # correct. ChunkCache + bs==1 + page_size==1. Mirrors SWA's maybe_evict_swa (which runs here too).
+    _kvwin_ext = os.environ.get("SGLANG_KV_WINDOW")
+    if (
+        _kvwin_ext
+        and len(batch.reqs) == 1
+        and _alloc_page_size(batch) == 1
+        and batch.tree_cache is not None
+        and batch.tree_cache.is_chunk_cache()
+    ):
+        W_ext = int(_kvwin_ext)
+        chunk_start = int(prefix_lens_cpu[0])
+        E = chunk_start + int(extend_lens_cpu[0])
+        req0 = batch.reqs[0]
+        freed_upto = getattr(req0, "_kvwin_freed_upto", 0)
+        new_freed = min(chunk_start, E - W_ext)  # prior positions now out of window
+        if new_freed > freed_upto and req0.req_pool_idx is not None:
+            fs = batch.req_to_token_pool.req_to_token[req0.req_pool_idx, freed_upto:new_freed]
+            batch.tree_cache.token_to_kv_pool_allocator.free(fs.reshape(-1).to(torch.int64))
+            req0._kvwin_freed_upto = new_freed
+
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache

@@ -1008,6 +1008,15 @@ class PrefillAdder:
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
 
+        # KV-streaming 4b'-4c: for a WINDOWED request the device pool is ringed (alloc_for_extend /
+        # alloc_for_decode) so it never holds more than ~W + one chunk, regardless of prompt length or
+        # max_new. Charge admission against that bound, not the full prompt — else a prompt longer than the
+        # small device pool is falsely rejected (the standard budget assumes the whole prefix stays resident).
+        if os.environ.get("SGLANG_KV_WINDOW"):
+            _w = int(os.environ["SGLANG_KV_WINDOW"])
+            _cps = get_global_server_args().chunked_prefill_size or cand_extend_input_len
+            total_tokens = min(total_tokens, _w + _cps + self.page_size)
+
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = cand_extend_input_len - req.host_hit_length
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
