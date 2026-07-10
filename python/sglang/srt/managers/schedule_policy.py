@@ -859,6 +859,15 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into the
         # budget gate so admission can't over-commit (0 for baseline / non-Mamba).
         paged_input += self._mamba_gap_budget_for_req(req)
+        # KV-streaming 4b'-4c: a windowed request rings the device pool (alloc_for_extend) so it never holds
+        # more than ~W + chunk_size, regardless of prompt length. Charge THIS gate against that bound, not the
+        # full prompt — else a prompt longer than the small device pool is rejected here (before the chunk
+        # branch below), the FCFS queue head-of-lines, and the server wedges. (ignore_eos + ChunkCache routes
+        # here, so the add_one_req cap does not apply.)
+        if os.environ.get("SGLANG_KV_WINDOW"):
+            _cps = get_global_server_args().chunked_prefill_size
+            if _cps:
+                paged_input = min(paged_input, int(os.environ["SGLANG_KV_WINDOW"]) + _cps)
         if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
@@ -1014,7 +1023,9 @@ class PrefillAdder:
         # small device pool is falsely rejected (the standard budget assumes the whole prefix stays resident).
         if os.environ.get("SGLANG_KV_WINDOW"):
             _w = int(os.environ["SGLANG_KV_WINDOW"])
-            _cps = get_global_server_args().chunked_prefill_size or cand_extend_input_len
+            # windowed device footprint = W + one chunk (NOT the full prompt — don't fall back to it when
+            # chunked_prefill_size is unset; use a sane default so the cap stays below the pool).
+            _cps = get_global_server_args().chunked_prefill_size or 2048
             total_tokens = min(total_tokens, _w + _cps + self.page_size)
 
         # adjusting the input_tokens based on host_hit_length and page_size
