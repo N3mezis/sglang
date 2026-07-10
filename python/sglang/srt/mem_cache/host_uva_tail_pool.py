@@ -161,6 +161,35 @@ class WindowedKVStore:
         self.rk[layer_id][slot] = k.reshape(self.head_num, self.head_dim)
         self.rv[layer_id][slot] = v.reshape(self.head_num, self.head_dim)
 
+    def ingest_chunk(self, layer_id: int, chunk_start: int, ck: torch.Tensor, cv: torch.Tensor) -> None:
+        """Incremental ingest of a prefill chunk [chunk_start, chunk_start+Ne) into the ring (recent W) +
+        host tail (older) — reading ONLY the chunk's own KV (ck,cv: [Ne,H,D]) + the prior device ring,
+        NEVER the prior context's pool slots. So it stays correct once the device pool rings those slots
+        away (4b'-4b-2). Vectorized; handles Ne<W and Ne>=W. Call AFTER the chunk's attention (which reads
+        the prior [0,chunk_start) window+tail)."""
+        Ne = ck.shape[0]
+        W = self.W
+        E = chunk_start + Ne
+        dev = self.device
+        rk, rv, tk, tv = self.rk[layer_id], self.rv[layer_id], self.tk[layer_id], self.tv[layer_id]
+        ck = ck.reshape(Ne, self.head_num, self.head_dim)
+        cv = cv.reshape(Ne, self.head_num, self.head_dim)
+        # (1) prior-ring positions leaving the window -> tail: [max(0,chunk_start-W), min(chunk_start, E-W))
+        lo_e, hi_e = max(0, chunk_start - W), min(chunk_start, E - W)
+        if hi_e > lo_e:
+            ep = torch.arange(lo_e, hi_e, device=dev)
+            tk[ep] = rk[ep % W]
+            tv[ep] = rv[ep % W]
+        # (2) chunk positions skipping the window straight to tail (Ne>W): [chunk_start, E-W)
+        if E - W > chunk_start:
+            tp = torch.arange(chunk_start, E - W, device=dev)
+            tk[tp] = ck[tp - chunk_start]
+            tv[tp] = cv[tp - chunk_start]
+        # (3) chunk positions entering the ring: [max(chunk_start, E-W), E)
+        rp = torch.arange(max(chunk_start, E - W), E, device=dev)
+        rk[rp % W] = ck[rp - chunk_start]
+        rv[rp % W] = cv[rp - chunk_start]
+
     def append_device(self, layer_id: int, pos_dev: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         """Capturable append+evict: pos_dev is a [1] int64 DEVICE tensor (no python-int branching). Evicts
         ring[pos%W] (which holds token pos-W) to tail[pos-W], or to the scratch `dummy` slot when pos<W

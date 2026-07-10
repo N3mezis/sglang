@@ -1344,20 +1344,15 @@ class TritonAttnBackend(AttentionBackend):
                 o_out = self._kvs_merge(o_w, lse_w, o_t, lse_t)
             else:
                 o_out = o_w
-            # ingest the chunk: whole-context re-ingest from the pool into the ring (recent W, by p%W) + tail
+            # ingest the chunk INCREMENTALLY: read the chunk's KV from the POOL at its OWN slots
+            # [chunk_start, E) (the stored post-set_kv_buffer value — the k,v args differ subtly and drift the
+            # output). Only the chunk's own slots are read (never prior context), so it survives the prefill
+            # pool ring in 4b'-4b-2 (which frees only < chunk_start-W).
             E = chunk_start + Ne
-            req_idx = forward_batch.req_pool_indices[0]
-            slots = self.req_to_token_pool.req_to_token[req_idx, :E].long()
-            dev = q.device
-            if E <= W:
-                pos = torch.arange(E, device=dev)
-            else:
-                pos = torch.arange(E - W, E, device=dev)
-                tpos = torch.arange(E - W, device=dev)
-                store.tk[lid][tpos] = kb[slots[tpos]]
-                store.tv[lid][tpos] = vb[slots[tpos]]
-            store.rk[lid][pos % W] = kb[slots[pos]]
-            store.rv[lid][pos % W] = vb[slots[pos]]
+            cslots = self.req_to_token_pool.req_to_token[
+                forward_batch.req_pool_indices[0], chunk_start:E
+            ].long()
+            store.ingest_chunk(lid, chunk_start, kb.index_select(0, cslots), vb.index_select(0, cslots))
             store.filled[lid] = E
             return o_out.to(q.dtype).reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
