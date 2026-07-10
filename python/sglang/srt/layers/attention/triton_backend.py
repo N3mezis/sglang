@@ -1967,10 +1967,20 @@ class TritonAttnBackend(AttentionBackend):
             # drift). O(1)/step device gather (no D2H sync / .tolist() → no watchdog stall).
             if pos != store.filled[lid]:
                 store.filled[lid] = 0
-            kvi = kv_indices.tolist()
-            for p in range(store.filled[lid], pos + 1):
-                s = kvi[p]
-                store.append(lid, p, kb[s], vb[s])
+            lo = store.filled[lid]
+            if lo == 0:
+                # first decode step (store not populated by windowed prefill): backfill the whole prefix
+                # [0, pos] from the pool — ONE-TIME, so a single .tolist() is fine.
+                kvi = kv_indices[: pos + 1].tolist()
+                for p in range(0, pos + 1):
+                    store.append(lid, p, kb[kvi[p]], vb[kvi[p]])
+            else:
+                # steady state: ingest only the new token(s) via a DEVICE GATHER — no per-step O(seqlen)
+                # kv_indices.tolist() (which over 48 layers stalled the loop into the detokenizer watchdog
+                # at long context), no D2H sync.
+                for p in range(lo, pos + 1):
+                    cur = kv_indices[p : p + 1].long()
+                    store.append(lid, p, kb.index_select(0, cur)[0], vb.index_select(0, cur)[0])
             store.filled[lid] = pos + 1
 
             num_ring = min(pos + 1, W)
