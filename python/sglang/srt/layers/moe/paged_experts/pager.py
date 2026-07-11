@@ -261,6 +261,15 @@ def _bcg_post_step() -> None:
                     jac,
                     k,
                 )
+                _cb = _PROF.get("cold_bytes", 0.0)
+                _gs = _PROF["gather"]
+                logger.info(
+                    "[pe-prof-gather] cold=%.1f experts/tok · %.1f MB/tok · gather BW=%.2f GB/s "
+                    "(disk O_DIRECT ceiling ~3.2 GB/s seq)",
+                    _PROF.get("cold_experts", 0.0) / k,
+                    _cb / k / 1e6,
+                    (_cb / _gs / 1e9) if _gs else 0.0,
+                )
                 nbrk = _PROF["nbreaks"]
                 nmiss = _PROF["nstage"]
                 nhit = nbrk - nmiss
@@ -296,6 +305,8 @@ def _bcg_post_step() -> None:
                     "gather",
                     "h2d",
                     "overlap",
+                    "cold_bytes",
+                    "cold_experts",
                 ):
                     _PROF[key] = 0.0
                 _PROF["nbreaks"] = _PROF["nstage"] = _PROF["nfallback"] = 0
@@ -1122,6 +1133,10 @@ class ExpertPager:
         if _PROF["on"]:
             _th = time.perf_counter()
             _PROF["gather"] += _th - _tg
+            _PROF["cold_bytes"] = _PROF.get("cold_bytes", 0.0) + n * float(
+                sum(self.store.item_bytes.values())
+            )
+            _PROF["cold_experts"] = _PROF.get("cold_experts", 0.0) + n
         # Fused scatter: ONE contiguous async H2D per tensor into the device staging rows, then one
         # scatter_multi launch places every tensor's rows into the destination slots — replacing 4*n
         # micro-copies (two of which move <1 KB fp8 scale rows). Falls back to per-row copies past the
