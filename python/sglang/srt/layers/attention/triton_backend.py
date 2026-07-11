@@ -1740,8 +1740,6 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.float32, device=device,
         )
         nks = torch.full((1,), self.max_kv_splits, dtype=torch.int32, device=device)
-        # ZERO-init (not empty): when num_dev==0 (empty tail while pos<W) the kernel writes nothing, so oo
-        # must be a finite 0 — else uninitialized NaN survives as NaN*0 in the merge and corrupts the output.
         oo = torch.zeros(1, layer.tp_q_head_num, layer.v_head_dim, dtype=qv.dtype, device=device)
         self.decode_attention_fwd(
             qv, kbuf, vbuf, oo, indptr, kv_indices, al, lse, nks,
@@ -1750,7 +1748,11 @@ class TritonAttnBackend(AttentionBackend):
             xai_temperature_len=layer.xai_temperature_len,
             has_mla=self.use_mla, use_pdl=self.use_pdl, page_size=self.page_size,
         )
-        return oo.float(), torch.logsumexp(lse, dim=-1)
+        # NaN-scrub: when num_dev==0 (empty tail while pos<W) the kernel does a 0-key softmax and writes
+        # 0/0 = NaN into oo (overwriting the zero-init). logsumexp(lse=-inf) = -inf correctly weights this
+        # pass to zero in the merge, BUT NaN*0 = NaN would still poison it — so force oo finite here. Under
+        # CUDA-graph capture this empty pass ALWAYS runs (no python skip), so the scrub is mandatory.
+        return torch.nan_to_num(oo.float(), nan=0.0), torch.logsumexp(lse, dim=-1)
 
     def _kvs_extend_pass(self, qext, kext, vext, Ne, kbuf, vbuf, kv_indices, num_pref,
                          layer, causal, skip_extend, k_descale, v_descale, logit_cap):
@@ -1941,15 +1943,19 @@ class TritonAttnBackend(AttentionBackend):
 
             if os.environ.get("SGLANG_KV_WINDOW_CAP"):
                 # 4b'-3c FULLY DEVICE-SIDE decode (CUDA-graph capturable): no python-int pos, no .tolist(),
-                # no python loop. `pos` comes from the DEVICE seq_len (the graph replays with a varying
-                # length); the prior context [0,pos) was populated by windowed prefill (4b'-4) + prior
-                # captured decode steps, so here we only APPEND the current token (device gather of its pool
-                # slot) + evict via a device-pos scatter, then run the device two-pass attention. Prefill's
-                # last chunk overwrites all W ring slots, so no warmup/prior-request contamination survives.
-                # pos from the RUNNER-managed decode metadata (kv_indptr[1]=seq_len for bs=1), NOT
-                # forward_batch.seq_lens — under CUDA-graph replay only the forward_metadata buffers are
-                # updated in place, so this is the live value the graph must read each replay.
-                pos_dev = (kv_indptr[1:2] - 1).to(torch.int64)
+                # no python loop. `pos` is a DEVICE scalar read from forward_batch.positions (the graph
+                # replays with a varying position); the prior context [0,pos) was populated by windowed
+                # prefill (4b'-4) + prior captured decode steps, so here we only APPEND the current token
+                # (device gather of its pool slot) + evict via a device-pos scatter, then run the device
+                # two-pass attention. Prefill's last chunk overwrites all W ring slots, so no warmup /
+                # prior-request contamination survives.
+                # pos from forward_batch.positions[0] = the current decode token's absolute position
+                # (== pos, 0-indexed) for bs==1. This is a LIVE captured-graph buffer: the decode runner
+                # refills it in-place per replay (build_replay_fb_view slices buffers.positions, which
+                # fill_from refills; the capture-time forward_batch.positions is _slot("positions"), the
+                # SAME storage). NB: kv_indptr[1]-1 and seq_lens are ALSO live in-place under this runner —
+                # positions is chosen for clarity; the pos source was NOT the replay-correctness issue.
+                pos_dev = forward_batch.positions[:1].to(torch.int64)
                 cur_slot = kv_indices.index_select(0, pos_dev)  # [1] current token's pool slot
                 store.append_device(
                     lid, pos_dev, kb.index_select(0, cur_slot), vb.index_select(0, cur_slot)
