@@ -426,56 +426,6 @@ def _ondevice_bounded_wave_apply(method, layer, dispatch_output, topk_ids):
     return out
 
 
-def _stream_enabled(pager) -> bool:
-    """True when the compute-through streaming store is built (full-pin int4, opt-in)."""
-    return getattr(pager, "_stream_devptr", None) is not None
-
-
-def _stream_apply(method, layer, dispatch_output, topk_ids):
-    """Compute-through streaming overflow path (full-pin int4, ``bs*top_k > K``): stream EACH expert's FFN
-    from the pinned transposed-plain store over the FULL batch and mask+weight its contribution, instead of
-    wave-cycling K slots (which pays the ceil(distinct/K) gather+GEMM cliff). MASKING, not gathering — the
-    kernel streams each expert's weights once regardless of token count (the PCIe stream is the bottleneck),
-    so feeding it all T tokens and zeroing non-routed contributions keeps shapes static and the whole pass
-    CUDA-graph-capturable. Fixed E launches. Lossless: a token's output is the sum over its top-k experts of
-    ``FFN_e(x) * tw``; non-routed tokens get weight 0 for expert e, so the per-expert partials sum to the
-    full MoE. Streams resident experts redundantly (correctness-first; a resident/streamed split is a later
-    perf refinement)."""
-    from sglang.jit_kernel.stream_moe import stream_expert_ffn
-
-    pager = method._pager
-    E = pager.E
-    inter, hidden_size, group = pager._stream_dims
-    dp, st = pager._stream_devptr, pager._stream_stride
-    hidden = dispatch_output.hidden_states
-    tw = dispatch_output.topk_output.topk_weights
-    T = hidden.shape[0]
-    dev = hidden.device
-    X = (hidden if hidden.dtype == torch.float16 else hidden.half()).contiguous()
-    out = torch.zeros(T, hidden_size, dtype=torch.float32, device=dev)
-    O = torch.empty(T, hidden_size, dtype=torch.float32, device=dev)
-    gu = torch.empty(T, 2 * inter, dtype=torch.float32, device=dev)
-    h = torch.empty(T, inter, dtype=torch.float16, device=dev)
-    twf = tw.float()
-    for e in range(E):
-        stream_expert_ffn(
-            dp["w13_qweight"] + e * st["w13_qweight"],
-            dp["w13_scales"] + e * st["w13_scales"],
-            dp["w2_qweight"] + e * st["w2_qweight"],
-            dp["w2_scales"] + e * st["w2_scales"],
-            X,
-            O,
-            gu,
-            h,
-            inter,
-            hidden_size,
-            group,
-        )
-        w_e = (twf * (topk_ids == e).float()).sum(dim=1)  # [T] routing weight of expert e per token
-        out.add_(O * w_e.unsqueeze(1))
-    return out.to(hidden.dtype)
-
-
 def paged_apply(method, layer, dispatch_output):
     """Dispatch the step to the method's decode placement (eager host vs captured on-device).
 

@@ -494,42 +494,6 @@ class ExpertPager:
         self._cold_log_d = self._needed_d = self._cold_n_d = None
         self._miss_idx = -1
 
-        # Compute-through streaming store (full-pin int4 overflow). A read-only transposed-plain-int4 pinned
-        # mirror of ALL E experts, streamed by stream_expert_ffn (jit_kernel/stream_moe) instead of paged
-        # into K slots — so a bs*top_k>K captured decode batch avoids the wave-GEMM cliff. Built by
-        # setup_stream_store when SGLANG_PAGED_EXPERTS_STREAM is set on a full-pin gptq store; None otherwise.
-        self._stream_pin: Optional[Dict[str, torch.Tensor]] = None  # keep refs so the pinned pages live
-        self._stream_devptr: Optional[Dict[str, int]] = None  # per-tensor UVA base devptr (resolved once)
-        self._stream_stride: Optional[Dict[str, int]] = None  # per-expert byte stride within each tensor
-        self._stream_dims = None  # (inter, hidden, group)
-
-    def setup_stream_store(self, model_path: str, layer_idx: int) -> None:
-        """Build the compute-through streaming store for this layer: repack the GPTQ checkpoint into the
-        transposed-plain-int4 layout, mapped-pin it, and resolve per-tensor UVA device pointers (once, at
-        load — never during capture). The streaming apply reads ``base_devptr + e*stride`` for expert ``e``.
-        Full-pin int4 only; a no-op sibling to the marlin resident fill (the two stores coexist)."""
-        from sglang.jit_kernel.paged_experts_decide import paged_experts_host_devptr
-        from sglang.srt.layers.moe.paged_experts.store import _pinned_empty
-        from sglang.srt.layers.moe.paged_experts.stream_store import (
-            fill_transposed_plain_from_checkpoint,
-        )
-
-        cpu = fill_transposed_plain_from_checkpoint(
-            model_path, layer_idx, self.E, self.device
-        )
-        self._stream_pin, self._stream_devptr, self._stream_stride = {}, {}, {}
-        for name, t in cpu.items():
-            pt = _pinned_empty(tuple(t.shape), t.dtype)
-            pt.copy_(t)
-            self._stream_pin[name] = pt
-            self._stream_devptr[name] = paged_experts_host_devptr(pt)
-            self._stream_stride[name] = t[0].numel() * t.element_size()
-        w13q, w13s = cpu["w13_qweight"], cpu["w13_scales"]  # [E, 2I, H/8], [E, 2I, H/group]
-        hidden = w13q.shape[2] * 8
-        inter = w13q.shape[1] // 2
-        group = hidden // w13s.shape[2]
-        self._stream_dims = (inter, hidden, group)
-
     # --- backing delegated to the store (exposed on the pager for the fill code) ---
     @property
     def gpu(self) -> Dict[str, torch.Tensor]:
@@ -1855,18 +1819,6 @@ def setup_pager(method, layer) -> ExpertPager:
     pager = ExpertPager(store=store, eviction=getattr(method, "eviction", "lru"))
     if method._placement.needs_ondevice_store:
         pager.setup_ondevice()  # captured path: device-resident decide + UVA gather
-    # Compute-through streaming store: full-pin (no windowing) gptq-int4 only, opt-in. Streams overflow
-    # experts (bs*top_k>K) from a pinned transposed-plain mirror instead of wave-cycling K slots.
-    if (
-        os.environ.get("SGLANG_PAGED_EXPERTS_STREAM", "0") == "1"
-        and any(n.endswith("qweight") for n in store.gpu)
-        and getattr(store, "host_hot", None) is None  # full-pin only (not windowed)
-    ):
-        pager.setup_stream_store(model_path, layer_idx)
-        logger.info(
-            "[paged-experts] L%d compute-through streaming store built (full-pin int4 overflow)",
-            layer_idx,
-        )
     # Layer-ordered registry (setup runs per layer in model order): the wave path uses it to prefetch
     # the NEXT layer's cold tier while the current layer transfers/computes. A weight reload
     # (update_weights_from_disk) re-runs setup on the same method — REPLACE the old pager in place so

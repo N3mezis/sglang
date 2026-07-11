@@ -193,28 +193,8 @@ class CapturedPlacement(Placement):
                 pager.decide_and_page_ondevice(topk_ids)
                 hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
         else:  # distinct can exceed K (prefill / big batch): static waves, summed
-            import os
-
-            from sglang.srt.layers.moe.paged_experts.forward import (
-                _stream_apply,
-                _stream_enabled,
-            )
-
-            if os.environ.get("SGLANG_PAGED_EXPERTS_PERSIST") == "1":
-                # PROBE prototype (persistent-residency policy): route bs*top_k>K through the trusted
-                # keep-warm LRU decide + gemm instead of the static re-page-every-step wave. Lossless
-                # ONLY while the ACTUAL per-layer distinct <= K (holds for B<=~24 / coherent loads; the
-                # wave-inflation probe measured median distinct 66<86 at B=16). The rare distinct>K
-                # overflow guard (doorbell-subtraction / replay-twice repair, NOT per-layer break) is
-                # Phase 2 — this phase pins compute_ms(bs16) + the persistent-LRU page-in ceiling.
-                pager.decide_and_page_ondevice(topk_ids)
-                hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
-            elif _stream_enabled(pager):
-                # compute-through: stream overflow experts from the pinned store (no wave cliff)
-                hidden = _stream_apply(method, layer, dispatch_output, topk_ids)
-            else:
-                _warn_wave_capture_once(pager, topk_ids)
-                hidden = _ondevice_wave_apply(method, layer, dispatch_output, topk_ids)
+            _warn_wave_capture_once(pager, topk_ids)
+            hidden = _ondevice_wave_apply(method, layer, dispatch_output, topk_ids)
         return StandardCombineInput(hidden_states=hidden)
 
 
