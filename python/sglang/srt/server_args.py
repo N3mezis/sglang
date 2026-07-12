@@ -1830,8 +1830,10 @@ class ServerArgs:
         Arg(
             help="Residency (eviction) policy for --enable-paged-experts. 'lru' (default) evicts the "
             "least-recently-used non-needed expert. 'lfu' evicts the least-frequently-used (use count, "
-            "LRU tiebreak) — better for skewed expert routing, where a few experts are hot.",
-            choices=["lru", "lfu"],
+            "LRU tiebreak) — better for skewed expert routing, where a few experts are hot. 'auto' picks "
+            "per decode step on the captured path: LRU single-stream, LFU for batched steps (bs > 1) — "
+            "the measured winner per regime (eviction sweep: LRU wins bs=1, LFU wins batched).",
+            choices=["lru", "lfu", "auto"],
         ),
     ] = "lru"
     paged_experts_cold_backing: A[

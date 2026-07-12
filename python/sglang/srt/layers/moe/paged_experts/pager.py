@@ -469,7 +469,14 @@ class ExpertPager:
         # holding experts 0..K-1 (what the native loader put there). logical_to_gpu_index[e] is the slot
         # of expert e (-1 if not resident); its device mirror drives the remap each step. The policy owns
         # the eviction choice + its recency/frequency bookkeeping (see policy.py).
-        self.policy: ResidencyPolicy = make_residency_policy(eviction, self.K, self.E)
+        # "auto" = per-step on the captured path: LRU single-stream, LFU for batched steps (the measured
+        # winner per regime). The host-side policy object stays LRU (eager decode is single-stream); the
+        # decide kernels take the lfu flag per launch, so under capture each bs bucket bakes its regime's
+        # policy (num_tokens is static per captured graph — the switch costs nothing at replay).
+        self._evict_auto = eviction == "auto"
+        self.policy: ResidencyPolicy = make_residency_policy(
+            "lru" if self._evict_auto else eviction, self.K, self.E
+        )
         self.slot_expert = list(range(self.K))  # slot -> expert id (-1 == empty)
         self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
         self.logical_to_gpu_index[: self.K] = torch.arange(self.K, dtype=torch.int32)
@@ -850,6 +857,14 @@ class ExpertPager:
             self._masked_tw_d.view(topk_weights.shape),
         )
 
+    def _lfu_flag(self, topk_ids: torch.Tensor) -> bool:
+        """Per-step eviction policy for the on-device decide kernels: the static server arg, or — under
+        'auto' — LRU for single-token (bs=1) steps and LFU for batched ones (the measured winner per
+        regime). num_tokens is static per captured graph, so each bs bucket bakes its policy at capture."""
+        if self._evict_auto:
+            return topk_ids.shape[0] > 1
+        return self.policy.name == "lfu"
+
     def decide_page_remap_fused(self, topk_ids: torch.Tensor, topk_weights: torch.Tensor):
         """Fused decode fast path (full-pin keep-warm): int64 ingest + decide + remap/mask in ONE launch,
         then the gather — 2 launches/layer instead of 4 (``_prep_topk`` copy, ``decide``, ``gather``,
@@ -882,7 +897,7 @@ class ExpertPager:
             l2g,
             self._slot_lastuse_d,
             self._freq_d,
-            self.policy.name == "lfu",
+            self._lfu_flag(topk_ids),
             self._src_d,
             self._dst_d,
             self._n_out_d,
@@ -913,8 +928,7 @@ class ExpertPager:
             l2g,
             self._slot_lastuse_d,
             self._freq_d,
-            self.policy.name
-            == "lfu",  # --paged-experts-eviction, same as the host path
+            self._lfu_flag(topk_ids),  # --paged-experts-eviction ('auto': LRU bs=1 / LFU batched)
             self._src_d,
             self._dst_d,
             self._n_out_d,
@@ -939,8 +953,7 @@ class ExpertPager:
             l2g,
             self._slot_lastuse_d,
             self._freq_d,
-            self.policy.name
-            == "lfu",  # --paged-experts-eviction, same as the host path
+            self._lfu_flag(topk_ids),  # --paged-experts-eviction ('auto': LRU bs=1 / LFU batched)
             self._log2hot_d,
             self._src_d,
             self._dst_d,
