@@ -196,21 +196,25 @@ def _matmul_persistent_triton(
             ),
         )
 
+    # NOTE: blocks/stages reduced (num_stages 3->2, fp16 BLOCK_N 256->128) to fit the RTX 5070 Ti / sm_120
+    # 99 KB shared-memory limit — the stock config needs ~104 KB and OOMs on Blackwell. The kernel stays
+    # batch-INVARIANT (fixed tiling, deterministic reduction order regardless of batch size); smaller tiles
+    # only cost throughput, which is irrelevant for the deterministic CI/certification mode this powers.
     configs = {
         torch.bfloat16: {
             "BLOCK_SIZE_M": 128,
             "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": 8,
-            "num_stages": 3,
+            "num_stages": 2,
             "num_warps": 8,
         },
         torch.float16: {
             "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": 256,
+            "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 64,
             "GROUP_SIZE_M": 8,
-            "num_stages": 3,
+            "num_stages": 2,
             "num_warps": 8,
         },
         torch.float32: {
@@ -218,7 +222,7 @@ def _matmul_persistent_triton(
             "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 32,
             "GROUP_SIZE_M": 8,
-            "num_stages": 3,
+            "num_stages": 2,
             "num_warps": 8,
         },
     }
