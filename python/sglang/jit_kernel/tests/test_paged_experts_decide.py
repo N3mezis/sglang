@@ -898,3 +898,115 @@ def test_scratch_split_and_d2d_gather():
     paged_experts_gather_multi(pool_base, scratch_base, e16s, res_src, res_dst, res_n)
     torch.cuda.synchronize()
     assert torch.equal(scratch.cpu(), host), "scratch != store after split fill"
+
+
+# ---------------------------------------------------------------------------
+# decide_fused: fused (int64 ingest + decide + remap/mask) vs the unfused chain
+# ---------------------------------------------------------------------------
+@requires_cuda
+@pytest.mark.parametrize("lfu", [False, True])
+def test_decide_fused_matches_unfused_chain(lfu):
+    """The fused fast path must be launch-for-launch equivalent to the 3-launch chain it replaces:
+    int64->int32 cast, decide, remap_mask — same page-in plan, same mutated residency state, same
+    safe_ids/masked_tw. Run both on cloned state over many random keep-warm steps."""
+    from sglang.jit_kernel.paged_experts_decide import paged_experts_decide_fused
+
+    E, K = 32, 12
+    dev = "cuda"
+    i32 = torch.int32
+
+    def new_state():
+        return dict(
+            sc=torch.zeros(1, dtype=i32, device=dev),
+            se=torch.arange(K, dtype=i32, device=dev),
+            es=torch.cat(
+                [torch.arange(K, dtype=i32), torch.full((E - K,), -1, dtype=i32)]
+            ).to(dev),
+            lu=torch.zeros(K, dtype=i32, device=dev),
+            fq=torch.zeros(E, dtype=i32, device=dev),
+            src=torch.zeros(K, dtype=i32, device=dev),
+            dst=torch.zeros(K, dtype=i32, device=dev),
+            n=torch.zeros(1, dtype=i32, device=dev),
+        )
+
+    a, b = new_state(), new_state()  # a = unfused chain, b = fused
+    torch.manual_seed(7)
+    for step in range(30):
+        ndist = int(torch.randint(1, K + 1, (1,)).item())
+        experts = torch.randperm(E)[:ndist].to(dev)
+        topk64 = experts.to(torch.int64)
+        tw = torch.rand(ndist, dtype=torch.float32, device=dev)
+
+        # --- unfused chain: cast + decide + remap_mask (idx aliases es, like the pager) ---
+        topk_a = topk64.to(i32)
+        paged_experts_decide(
+            topk_a, a["sc"], a["se"], a["es"], a["lu"], a["fq"], lfu,
+            a["src"], a["dst"], a["n"], a["es"],
+        )
+        safe_a = torch.empty(ndist, dtype=i32, device=dev)
+        mtw_a = torch.empty(ndist, dtype=torch.float32, device=dev)
+        paged_experts_remap_mask(topk_a, a["es"], tw, safe_a, mtw_a)
+
+        # --- fused ---
+        topk_b = torch.empty(ndist, dtype=i32, device=dev)
+        safe_b = torch.empty(ndist, dtype=i32, device=dev)
+        mtw_b = torch.empty(ndist, dtype=torch.float32, device=dev)
+        paged_experts_decide_fused(
+            topk64, topk_b, b["sc"], b["se"], b["es"], b["lu"], b["fq"], lfu,
+            b["src"], b["dst"], b["n"], b["es"], tw, safe_b, mtw_b,
+        )
+
+        na, nb = int(a["n"].item()), int(b["n"].item())
+        assert nb == na, f"step {step}: plan count {nb} != {na}"
+        assert b["src"][:na].tolist() == a["src"][:na].tolist(), f"step {step}: src"
+        assert b["dst"][:na].tolist() == a["dst"][:na].tolist(), f"step {step}: dst"
+        for k in ("sc", "se", "es", "lu", "fq"):
+            assert torch.equal(a[k], b[k]), f"step {step}: state {k} diverged"
+        assert torch.equal(safe_a, safe_b), f"step {step}: safe_ids"
+        assert torch.equal(mtw_a, mtw_b), f"step {step}: masked_tw"
+        assert torch.equal(topk_a, topk_b), f"step {step}: int32 mirror"
+
+
+@requires_cuda
+def test_decide_fused_is_cuda_graph_capturable():
+    """Capture the fused kernel in a CUDA graph and replay with mutated int64 inputs — the step counter
+    must advance per replay and the remap must track the live residency map."""
+    from sglang.jit_kernel.paged_experts_decide import paged_experts_decide_fused
+
+    E, K, T = 16, 6, 4
+    dev = "cuda"
+    i32 = torch.int32
+    sc = torch.zeros(1, dtype=i32, device=dev)
+    se = torch.arange(K, dtype=i32, device=dev)
+    es = torch.cat([torch.arange(K, dtype=i32), torch.full((E - K,), -1, dtype=i32)]).to(dev)
+    lu = torch.zeros(K, dtype=i32, device=dev)
+    fq = torch.zeros(E, dtype=i32, device=dev)
+    src = torch.zeros(K, dtype=i32, device=dev)
+    dst = torch.zeros(K, dtype=i32, device=dev)
+    n = torch.zeros(1, dtype=i32, device=dev)
+    topk64 = torch.zeros(T, dtype=torch.int64, device=dev)
+    topk32 = torch.zeros(T, dtype=i32, device=dev)
+    tw = torch.ones(T, dtype=torch.float32, device=dev)
+    safe = torch.zeros(T, dtype=i32, device=dev)
+    mtw = torch.zeros(T, dtype=torch.float32, device=dev)
+
+    def run():
+        paged_experts_decide_fused(
+            topk64, topk32, sc, se, es, lu, fq, False, src, dst, n, es, tw, safe, mtw
+        )
+
+    torch.cuda.synchronize()
+    run()  # warm the JIT outside capture
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+    base = int(sc.item())
+    topk64.copy_(torch.tensor([1, 9, 2, 14], dtype=torch.int64, device=dev))
+    g.replay()
+    torch.cuda.synchronize()
+    assert int(sc.item()) == base + 1, "step counter must advance per replay"
+    assert int(n.item()) == 2, "experts 9 and 14 were misses"
+    l2g = es.tolist()
+    assert l2g[9] >= 0 and l2g[14] >= 0, "misses paged in on replay"
+    assert safe.tolist() == [l2g[1], l2g[9], l2g[2], l2g[14]], "remap tracks the live map"
+    assert mtw.tolist() == [1.0, 1.0, 1.0, 1.0]

@@ -18,6 +18,7 @@ def _jit_paged_experts_decide_module() -> Module:
         cuda_files=["moe/paged_experts_decide.cuh"],
         cuda_wrappers=[
             ("decide", "decide"),
+            ("decide_fused", "decide_fused"),
             ("decide_bounded", "decide_bounded"),
             ("decide_wave", "decide_wave"),
             ("decide_bounded_wave", "decide_bounded_wave"),
@@ -89,6 +90,53 @@ def paged_experts_decide(
         dst,
         n_out,
         idx,
+    )
+
+
+def paged_experts_decide_fused(
+    topk64: torch.Tensor,
+    topk_i32: torch.Tensor,
+    step_ctr: torch.Tensor,
+    slot_expert: torch.Tensor,
+    expert_slot: torch.Tensor,
+    slot_lastuse: torch.Tensor,
+    freq: torch.Tensor,
+    lfu: bool,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    n_out: torch.Tensor,
+    idx: torch.Tensor,
+    tw: torch.Tensor,
+    safe_ids: torch.Tensor,
+    masked_tw: torch.Tensor,
+) -> None:
+    """Fused decode fast path (full-pin keep-warm): int64 topk ingest + keep-warm/LRU decide + remap/mask
+    in ONE capturable launch — replaces the 3-launch chain (int64->int32 ``copy_``, :func:`paged_experts_decide`,
+    :func:`paged_experts_remap_mask`) on the per-layer captured decode hot path. Identical semantics: same
+    eviction order, freq/recency bumps, and masked-weight rule; ``topk_i32`` receives the int32 mirror
+    (out-of-range ids normalized to -1). The gather stays a separate launch (its grid is sized for copy
+    bandwidth). The WINDOWED store keeps the unfused chain — its remap must run AFTER the staging break.
+
+    ``topk64`` is ``[T]`` int64 CUDA (flattened router ids); ``tw``/``masked_tw`` ``[T]`` float32;
+    ``safe_ids``/``topk_i32`` ``[T]`` int32; the rest as in :func:`paged_experts_decide`.
+    """
+    module = _jit_paged_experts_decide_module()
+    module.decide_fused(
+        topk64,
+        topk_i32,
+        step_ctr,
+        slot_expert,
+        expert_slot,
+        slot_lastuse,
+        freq,
+        int(lfu),
+        src,
+        dst,
+        n_out,
+        idx,
+        tw,
+        safe_ids,
+        masked_tw,
     )
 
 

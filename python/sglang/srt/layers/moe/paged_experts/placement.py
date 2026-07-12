@@ -190,8 +190,22 @@ class CapturedPlacement(Placement):
 
                 hidden = eager_on_graph(True)(_moe_eager)(topk_ids)
             else:
-                pager.decide_and_page_ondevice(topk_ids)
-                hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
+                # Fused fast path: int64 ingest + decide + remap/mask in one launch (+ the gather) — 2
+                # launches/layer instead of 4. Falls back to the unfused chain on unsupported layouts.
+                fused = pager.decide_page_remap_fused(
+                    topk_ids, dispatch_output.topk_output.topk_weights
+                )
+                if fused is not None:
+                    from sglang.srt.layers.moe.paged_experts.forward import (
+                        _gemm_hidden_fused,
+                    )
+
+                    hidden = _gemm_hidden_fused(
+                        method, layer, dispatch_output, fused[0], fused[1], clone_hidden=False
+                    )
+                else:
+                    pager.decide_and_page_ondevice(topk_ids)
+                    hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
         else:  # distinct can exceed K (prefill / big batch): static waves, summed
             _warn_wave_capture_once(pager, topk_ids)
             hidden = _ondevice_wave_apply(method, layer, dispatch_output, topk_ids)

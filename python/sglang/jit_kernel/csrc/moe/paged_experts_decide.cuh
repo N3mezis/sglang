@@ -126,6 +126,85 @@ __global__ void decide_kernel(
     idx[e] = expert_slot[e];
 }
 
+// Fused decode fast path (full-pin keep-warm): int64 topk ingest + decide + remap/mask in ONE launch —
+// replaces the 3-launch python chain (int64->int32 ``copy_``, ``decide``, ``remap_mask``) on the per-layer
+// captured decode hot path (2 launches saved per MoE layer per token; the gather stays separate — its grid
+// is sized for copy bandwidth, not bookkeeping). Semantics identical to that chain: same eviction order,
+// same freq/recency bumps, same masked-weight rule. The WINDOWED store keeps the unfused chain — its remap
+// must run AFTER the cold-staging break, which this kernel has no seam for.
+__global__ void decide_fused_kernel(
+    const int64_t* topk64,  // [T] router topk ids as produced (int64; negative = padding)
+    int topk_n,
+    int E,
+    int K,
+    int lfu,
+    int32_t* topk_i32,      // [T] out: int32 mirror (pick_victim scans it; out-of-range normalized to -1)
+    int32_t* step_ctr,      // [1] monotonic step counter, incremented on-device (capture-safe)
+    int32_t* slot_expert,   // [K] slot -> expert id (-1 == empty), mutated
+    int32_t* expert_slot,   // [E] expert -> slot (-1 == not resident), mutated
+    int32_t* slot_lastuse,  // [K] last step each slot was used, mutated
+    int32_t* freq,          // [E] per-expert use count (LFU key), mutated
+    int32_t* src,           // [>=K] out: page-in source experts
+    int32_t* dst,           // [>=K] out: page-in destination slots
+    int32_t* n_out,         // [1]  out: number of page-ins
+    int32_t* idx,           // [E]  out: logical -> slot map snapshot
+    const float* tw,        // [T] routing weights (float32)
+    int32_t* safe_ids,      // [T] out: slot id, masked -> 0 (slot-0 output x 0 = exact 0)
+    float* masked_tw) {     // [T] out: routing weight, masked -> 0
+  if (blockIdx.x || threadIdx.x >= 32) return;
+  const int lane = threadIdx.x;
+  // pass 0 (warp-parallel): ingest the router's int64 ids once (replaces the elementwise cast launch)
+  for (int i = lane; i < topk_n; i += 32) {
+    const int64_t e64 = topk64[i];
+    topk_i32[i] = (e64 >= 0 && e64 < E) ? static_cast<int32_t>(e64) : -1;
+  }
+  __syncwarp();
+  int step = 0;
+  if (lane == 0) step = ++(*step_ctr);
+  step = __shfl_sync(0xffffffff, step, 0);
+  // pass 1 (warp-parallel): bump per-expert use count (LFU key) and resident-hit recency
+  for (int i = lane; i < topk_n; i += 32) {
+    const int e = topk_i32[i];
+    if (e < 0) continue;
+    atomicAdd(&freq[e], 1);
+    const int s = expert_slot[e];
+    if (s >= 0) slot_lastuse[s] = step;
+  }
+  __syncwarp();
+  // pass 2 (lane 0, serial): each miss evicts a non-needed slot per the policy and pages its expert in
+  if (lane == 0) {
+    int n = 0;
+    for (int i = 0; i < topk_n; ++i) {
+      const int e = topk_i32[i];
+      if (e < 0) continue;
+      if (expert_slot[e] >= 0) continue;  // resident (or just assigned this step)
+      const int victim = pick_victim(topk_i32, topk_n, K, lfu, slot_expert, slot_lastuse, freq, nullptr);
+      if (victim < 0) continue;  // pool too small (should not happen: distinct <= K)
+      const int old = slot_expert[victim];
+      if (old >= 0) expert_slot[old] = -1;
+      slot_expert[victim] = e;
+      expert_slot[e] = victim;
+      slot_lastuse[victim] = step;
+      src[n] = e;
+      dst[n] = victim;
+      ++n;
+    }
+    *n_out = n;
+  }
+  __syncwarp();
+  // pass 3 (warp-parallel): map snapshot + fused remap/mask, reading the POST-eviction map. On the
+  // full-pin keep-warm path every active expert is resident after pass 2, so the mask only guards
+  // padding (and the impossible not-assigned case) — exactly remap_mask_kernel's rule.
+  for (int e = lane; e < E; e += 32)
+    idx[e] = expert_slot[e];
+  for (int i = lane; i < topk_n; i += 32) {
+    const int e = topk_i32[i];
+    const int s = (e >= 0) ? expert_slot[e] : -1;
+    safe_ids[i] = s >= 0 ? s : 0;
+    masked_tw[i] = s >= 0 ? tw[i] : 0.0f;
+  }
+}
+
 // Bounded keep-warm + LRU/LFU decision for the pinned-WINDOW store (distinct active experts <= K). Same
 // residency logic as ``decide_kernel`` but partitions the page-in plan by window membership so the captured
 // gather only ever reads the pinned hot block. ``log2hot[e]`` = hot-block index if expert e is in the
@@ -490,6 +569,68 @@ void decide(
       static_cast<int32_t*>(dst.data_ptr()),
       static_cast<int32_t*>(n_out.data_ptr()),
       static_cast<int32_t*>(idx.data_ptr()));
+}
+
+void decide_fused(
+    tvm::ffi::TensorView topk64,
+    tvm::ffi::TensorView topk_i32,
+    tvm::ffi::TensorView step_ctr,
+    tvm::ffi::TensorView slot_expert,
+    tvm::ffi::TensorView expert_slot,
+    tvm::ffi::TensorView slot_lastuse,
+    tvm::ffi::TensorView freq,
+    int64_t lfu,
+    tvm::ffi::TensorView src,
+    tvm::ffi::TensorView dst,
+    tvm::ffi::TensorView n_out,
+    tvm::ffi::TensorView idx,
+    tvm::ffi::TensorView tw,
+    tvm::ffi::TensorView safe_ids,
+    tvm::ffi::TensorView masked_tw) {
+  using namespace host;
+
+  // E bound to expert_slot, K to slot_expert, T to the router ids; per-token tensors (topk64/topk_i32/
+  // tw/safe_ids/masked_tw) are all [T].
+  SymbolicSize E = {"num_experts"}, K = {"num_slots"}, T = {"topk_n"};
+  SymbolicDevice device_;
+  device_.set_options<kDLCUDA>();
+  TensorMatcher({E}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(expert_slot).verify(freq).verify(idx);
+  TensorMatcher({K})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(slot_expert)
+      .verify(slot_lastuse)
+      .verify(src)
+      .verify(dst);
+  TensorMatcher({T}).with_dtype<int64_t>().with_device<kDLCUDA>(device_).verify(topk64);
+  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk_i32).verify(safe_ids);
+  TensorMatcher({T}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(tw).verify(masked_tw);
+
+  const int e = static_cast<int>(E.unwrap());
+  const int k = static_cast<int>(K.unwrap());
+  const int t = static_cast<int>(T.unwrap());
+  const DLDevice device = device_.unwrap();
+
+  LaunchKernel(1, 32, device)(
+      decide_fused_kernel,
+      static_cast<const int64_t*>(topk64.data_ptr()),
+      t,
+      e,
+      k,
+      static_cast<int>(lfu),
+      static_cast<int32_t*>(topk_i32.data_ptr()),
+      static_cast<int32_t*>(step_ctr.data_ptr()),
+      static_cast<int32_t*>(slot_expert.data_ptr()),
+      static_cast<int32_t*>(expert_slot.data_ptr()),
+      static_cast<int32_t*>(slot_lastuse.data_ptr()),
+      static_cast<int32_t*>(freq.data_ptr()),
+      static_cast<int32_t*>(src.data_ptr()),
+      static_cast<int32_t*>(dst.data_ptr()),
+      static_cast<int32_t*>(n_out.data_ptr()),
+      static_cast<int32_t*>(idx.data_ptr()),
+      static_cast<const float*>(tw.data_ptr()),
+      static_cast<int32_t*>(safe_ids.data_ptr()),
+      static_cast<float*>(masked_tw.data_ptr()));
 }
 
 void decide_bounded(

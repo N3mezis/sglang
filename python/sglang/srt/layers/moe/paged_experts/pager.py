@@ -850,6 +850,53 @@ class ExpertPager:
             self._masked_tw_d.view(topk_weights.shape),
         )
 
+    def decide_page_remap_fused(self, topk_ids: torch.Tensor, topk_weights: torch.Tensor):
+        """Fused decode fast path (full-pin keep-warm): int64 ingest + decide + remap/mask in ONE launch,
+        then the gather — 2 launches/layer instead of 4 (``_prep_topk`` copy, ``decide``, ``gather``,
+        ``remap_mask``). Returns ``(safe_ids, masked_tw)`` shaped like the inputs, or ``None`` when the
+        layout is unsupported (caller falls back to the unfused chain). Full-pin only: the windowed store's
+        remap must run AFTER the cold-staging break, which this fusion removes."""
+        from sglang.jit_kernel.paged_experts_decide import paged_experts_decide_fused
+
+        flat_ids = topk_ids.reshape(-1)
+        if (
+            self._windowed
+            or topk_ids.dtype != torch.int64
+            or not flat_ids.is_contiguous()
+            or topk_weights.dtype != torch.float32
+            or not topk_weights.is_contiguous()
+        ):
+            return None
+        t = flat_ids.numel()
+        if self._topk_i32 is None or self._topk_i32.numel() != t:
+            self._topk_i32 = torch.empty(t, dtype=torch.int32, device=self.device)
+        if self._safe_ids_d is None or self._safe_ids_d.numel() != t:
+            self._safe_ids_d = torch.empty(t, dtype=torch.int32, device=self.device)
+            self._masked_tw_d = torch.empty(t, dtype=torch.float32, device=self.device)
+        l2g = self.logical_to_gpu_index_cuda  # serves as both expert_slot and idx
+        paged_experts_decide_fused(
+            flat_ids,
+            self._topk_i32,
+            self._step_ctr_d,
+            self._slot_expert_d,
+            l2g,
+            self._slot_lastuse_d,
+            self._freq_d,
+            self.policy.name == "lfu",
+            self._src_d,
+            self._dst_d,
+            self._n_out_d,
+            l2g,
+            topk_weights.reshape(-1),
+            self._safe_ids_d,
+            self._masked_tw_d,
+        )
+        self._gather_planned_ondevice()
+        return (
+            self._safe_ids_d.view(topk_ids.shape),
+            self._masked_tw_d.view(topk_weights.shape),
+        )
+
     def decide_and_page_ondevice(self, topk_ids: torch.Tensor) -> None:
         """Capture-safe keep-warm: decide residency + page the misses entirely on-device (no host sync).
         Mutates the persistent state buffers and ``logical_to_gpu_index_cuda`` (the remap table) in place;
