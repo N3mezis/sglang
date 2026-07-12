@@ -66,6 +66,18 @@ def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
     return torch.frombuffer(buf, dtype=torch.uint8).view(dtype).reshape(shape)
 
 
+def _aligned_empty(nrows: int, row_shape, dtype, align: int = 4096) -> torch.Tensor:
+    """Non-pinned, ``align``-aligned CPU buffer (default page-aligned) — for O_DIRECT reads or in-place
+    registration, which require memory ALIGNMENT but not page-locking, so allocating many of these does
+    not draw on the OS page-lock ceiling. Over-allocate by ``align`` and slice to the aligned offset;
+    the slice keeps the base storage alive. (No consumer on the hot path today; utility for O_DIRECT /
+    cudaHostRegister experiments — see RAM_REGIME_IMPROVEMENT_MAP I1.)"""
+    nbytes = nrows * int(math.prod(tuple(row_shape))) * dtype.itemsize
+    raw = torch.empty(nbytes + align, dtype=torch.uint8)  # anonymous, non-pinned
+    off = (-raw.data_ptr()) % align
+    return raw[off : off + nbytes].view(dtype).view(nrows, *row_shape)
+
+
 # packed-quant scaffolding the fused-MoE kernel never reads on the paged path, plus the nvfp4
 # per-expert scalar scales (global/alpha/input-quant): 4-8 B each -> too small for the pinned gather
 # (sub-8/16-byte rows). The four runtime nvfp4 scalars (g*_alphas, w*_input_scale_quant) are refreshed
@@ -433,13 +445,9 @@ class WindowedExpertStore(ExpertStore):
             for name in self.gpu
         )
 
-    def _read_cold_rows_direct(self, name: str, cold_rows, buf: torch.Tensor) -> bool:
-        """O_DIRECT preads of the cold rows straight into the pinned staging rows ``buf[0..n)`` —
-        page-cache bypass (no fault storm, no double copy), queue depth from a small thread pool
-        (preads block in the kernel and release the GIL). Returns False on any precondition/IO failure;
-        the caller falls back to the mmap copy loop."""
-        import ctypes
-
+    def _direct_ok(self, name: str, buf: torch.Tensor) -> bool:
+        """O_DIRECT preconditions for reading cold rows into ``buf``: fd present, O_DIRECT not disabled,
+        row size block-aligned, buffer page-aligned + contiguous, buffer row stride == on-disk row size."""
         fd = self._cold_fd.get(name)
         nbytes = self.item_bytes[name]
         if (
@@ -449,9 +457,17 @@ class WindowedExpertStore(ExpertStore):
             or buf.data_ptr() % 4096
         ):
             return False
+        return buf[0].numel() * buf.element_size() == nbytes and buf.is_contiguous()
+
+    def _pread_pairs_direct(self, name: str, pairs, buf: torch.Tensor) -> bool:
+        """O_DIRECT pread of ``(buf_row_index, cold_row)`` pairs into ``buf`` via the QD thread pool
+        (preads block in the kernel + release the GIL -> real queue depth). Preconditions are the caller's
+        job (``_direct_ok``). Returns False on IO failure and disables the fd (caller falls back to mmap)."""
+        import ctypes
+
+        fd = self._cold_fd.get(name)
+        nbytes = self.item_bytes[name]
         stride = buf[0].numel() * buf.element_size()
-        if stride != nbytes or not buf.is_contiguous():
-            return False
         base = buf.data_ptr()
 
         def _rd(i_r):
@@ -460,17 +476,23 @@ class WindowedExpertStore(ExpertStore):
             return os.preadv(fd, [mv], r * nbytes) == nbytes
 
         try:
-            if not all(_odirect_pool().map(_rd, list(enumerate(cold_rows)))):
+            if not all(_odirect_pool().map(_rd, pairs)):
                 raise OSError("short read")
             return True
         except OSError as e:
             logger.warning(
-                "[paged-experts] O_DIRECT cold read failed for %s (%s) — mmap fallback",
-                name,
-                e,
+                "[paged-experts] O_DIRECT cold read failed for %s (%s) — mmap fallback", name, e
             )
             self._cold_fd[name] = None
             return False
+
+    def _read_cold_rows_direct(self, name: str, cold_rows, buf: torch.Tensor) -> bool:
+        """O_DIRECT read of the cold rows into pinned staging rows ``buf[0..n)`` — page-cache bypass
+        (no fault storm, no double copy), queue depth from the thread pool. Returns False on
+        precondition/IO failure; the caller falls back to the mmap copy loop."""
+        if not self._direct_ok(name, buf):
+            return False
+        return self._pread_pairs_direct(name, list(enumerate(cold_rows)), buf)
 
     def prefetch_cold(self, experts, force: bool = False) -> None:
         """Issue MADV_WILLNEED for the disk-mmap rows of ``experts`` so the kernel does parallel async
@@ -599,14 +621,20 @@ class WindowedExpertStore(ExpertStore):
         hp = self.hot_pos[idx]
         is_hot = hp >= 0
         pos = torch.arange(n)
+        # torch CPU index_copy_/index_select are unimplemented for Float8 dtypes; the gather is a pure row
+        # (byte) move, so reinterpret dst + both tiers as uint8 (fp8 = 1 byte/elem -> identical shape). The
+        # uint8 view shares storage, so index_copy_ still writes through to buf. No-op for bf16/fp16/int8.
+        dst, hot_src, cold_src = buf, self.host_hot[name], self.host_cold[name]
+        if dst.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            dst, hot_src, cold_src = dst.view(torch.uint8), hot_src.view(torch.uint8), cold_src.view(torch.uint8)
         if bool(is_hot.any()):
             hi = pos[is_hot]
-            buf[:n].index_copy_(0, hi, self.host_hot[name].index_select(0, hp[is_hot]))
+            dst[:n].index_copy_(0, hi, hot_src.index_select(0, hp[is_hot]))
         cold_mask = ~is_hot
         if bool(cold_mask.any()):
             ci = pos[cold_mask]
             cr = self.cold_pos[idx[cold_mask]]
-            buf[:n].index_copy_(0, ci, self.host_cold[name].index_select(0, cr))
+            dst[:n].index_copy_(0, ci, cold_src.index_select(0, cr))
 
     def set_window_membership(self, hot_experts) -> None:
         """Re-pin the window to hold ``hot_experts`` (the top-W by routing frequency) instead of the static
