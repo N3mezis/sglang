@@ -82,6 +82,11 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         debug_eager: bool = False,
     ) -> None:
         self._model_runner = cuda_graph_runner.model_runner
+        # Tokens per batch element of the captured forward: 1 for plain decode, num_draft_tokens for a
+        # speculative TARGET_VERIFY graph. shape_key.size counts BATCH elements, but the forward's output
+        # rows count TOKENS — slicing by size alone truncated verify logits to 1/num_draft_tokens (the
+        # eagle_sample "shape [bs, draft] invalid for input of size bs" crash under breakable decode).
+        self._num_tokens_per_bs = int(getattr(cuda_graph_runner, "num_tokens_per_bs", 1) or 1)
         self._graphs: Dict[Any, BreakableCUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
         self._pool = None
@@ -137,7 +142,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
-        size = shape_key.size
+        size = shape_key.size * self._num_tokens_per_bs  # output rows are TOKENS, not batch elements
         with BreakableCUDAGraphCapture(
             cuda_graph=graph,
             pool=(
