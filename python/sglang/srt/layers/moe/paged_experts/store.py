@@ -357,15 +357,18 @@ class RegisteredExpertStore(PinnedExpertStore):
     ReadOnly registration pins past the alloc ceiling (measured 31.3 vs ~20 GB — see
     RAM_REGIME_IMPROVEMENT_MAP I1 / register_store_probe.py).
 
-    Mechanics: the mapping is MAP_PRIVATE with PROT_READ|WRITE (``ACCESS_COPY``) so torch can view the
-    buffer, but registration passes ``cudaHostRegisterReadOnly`` — the kernel then pins with read intent
-    and the private mapping's clean file-backed pages are pinned AS-IS (a writable-intent pin would
-    copy-on-write the entire store into anonymous RAM up front, which is exactly the Default-flag OOM we
-    measured). CONTRACT: the store is read-only after construction — a host write would COW the written
-    page and silently desynchronize it from the registered (device-visible) page. Full-pin serving never
-    writes the store; the windowed re-pin does, so this class is full-pin only (``make``-time guarded).
-    ``transfer_kv`` / UVA gather work unchanged: registered memory is page-locked + device-mapped, and the
-    per-file mmap base is page-aligned (16-byte gather alignment holds whenever ``item_bytes`` does)."""
+    Mechanics: the mapping is MAP_SHARED writable (``ACCESS_WRITE``, fd ``O_RDWR``) and registration passes
+    ``cudaHostRegisterReadOnly``. MAP_SHARED is deliberate — ``register_mode_repro.py`` measured that a
+    MAP_PRIVATE (``ACCESS_COPY``) mmap HANGS in ``cudaHostRegister`` on WSL2/Blackwell (pre-faulting the
+    pages does not help — the private-COW mapping's get_user_pages path is the culprit), while MAP_SHARED
+    (read or write) registers in ~0.3 s and UVA-reads bit-exact. Writable (not ``ACCESS_READ``) so
+    ``torch.frombuffer`` accepts the buffer without its read-only rejection. CONTRACT: the store is
+    READ-ONLY after construction — because the mapping is MAP_SHARED, a stray host write would write THROUGH
+    to the cache file (not just desync), so the fill accessors (``row`` / ``fill_tensor``) hard-raise and
+    full-pin serving never writes the store (the windowed re-pin does, so this class is full-pin only,
+    ``make``-time guarded). ``transfer_kv`` / UVA gather work unchanged: registered memory is page-locked +
+    device-mapped, and the per-file mmap base is page-aligned (16-byte gather alignment holds when
+    ``item_bytes`` does)."""
 
     pinned = True
 
@@ -406,9 +409,11 @@ class RegisteredExpertStore(PinnedExpertStore):
                 nbytes = int(ent["nbytes"])
                 if os.path.getsize(path) != nbytes:
                     raise RuntimeError(f"[paged-experts] mmap store: torn cache file {path}")
-                fd = os.open(path, os.O_RDONLY)
+                # MAP_SHARED writable (O_RDWR + ACCESS_WRITE): MAP_PRIVATE hangs cudaHostRegister on WSL2
+                # (register_mode_repro.py). Read-only by contract (below) — we never write these pages.
+                fd = os.open(path, os.O_RDWR)
                 try:
-                    mm = mmap.mmap(fd, nbytes, access=mmap.ACCESS_COPY)
+                    mm = mmap.mmap(fd, nbytes, access=mmap.ACCESS_WRITE)
                 finally:
                     os.close(fd)
                 addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))

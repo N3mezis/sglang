@@ -1894,16 +1894,14 @@ def setup_pager(method, layer) -> ExpertPager:
                     "[paged-experts] --paged-experts-store mmap: nvfp4 unsupported (resident scalars) — "
                     "using the pinned fill store"
                 )
-        elif os.environ.get("SGLANG_PAGED_EXPERTS_MMAP_REGISTER", "0") != "1":
-            # KNOWN ISSUE (2026-07-12): the in-place cudaHostRegister HANGS on WSL2 when the v2 mmap is
-            # MAP_PRIVATE writable (ACCESS_COPY) — the validated probe used PROT_READ. Until the repro
-            # settles the mapping mode (likely fix: ACCESS_WRITE/shared, see QUEUED_BUILDS_PLAN), the
-            # register path is opt-in: store=mmap still fills + persists the v2 cache every boot.
+        elif os.environ.get("SGLANG_PAGED_EXPERTS_MMAP_REGISTER", "1") != "1":
+            # Escape hatch: the in-place cudaHostRegister path (MAP_SHARED writable — MAP_PRIVATE hangs on
+            # WSL2, register_mode_repro.py) is ON by default; set =0 to force the pinned fill store.
             if not _MMAP_FALLBACK_LOGGED:
                 _MMAP_FALLBACK_LOGGED = True
                 logger.warning(
-                    "[paged-experts] store=mmap: in-place registration disabled pending the WSL2 hang fix "
-                    "(SGLANG_PAGED_EXPERTS_MMAP_REGISTER=1 to test) — using the pinned fill store"
+                    "[paged-experts] store=mmap: in-place registration disabled by "
+                    "SGLANG_PAGED_EXPERTS_MMAP_REGISTER=0 — using the pinned fill store"
                 )
         elif _v2_cache_complete(v2dir, names):
             try:
