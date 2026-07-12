@@ -24,6 +24,16 @@ from sglang.jit_kernel.paged_experts_decide import (
     paged_experts_scatter_multi,
     paged_experts_scratch_split,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+# The paged_experts residency-plan kernels (decide / decide_bounded / *_wave / gather_multi / remap_mask /
+# scratch_split / decide_fused) are the deterministic core of the fork: every launch is validated against a
+# pure-Python reference and asserted CUDA-graph-capturable. Register so the equivalence + capturability gate
+# runs per-CI — in particular test_decide_fused_matches_unfused_chain, which certifies the fused fast path is
+# launch-for-launch identical to the unfused chain (the guard against a fused-path residency drift).
+# CUDA-only (no AMD registration): these kernels are sm-specific and there is no HIP build.
+register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, suite="nightly-kernel-1-gpu", nightly=True)
 
 
 # ---------------------------------------------------------------------------
