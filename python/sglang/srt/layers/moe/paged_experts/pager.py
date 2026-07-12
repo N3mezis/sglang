@@ -170,6 +170,8 @@ def _maybe_profile_refresh() -> None:
 
 
 _BCG_HOOK_INSTALLED = False
+_MMAP_STORE_LOGGED = False
+_MMAP_FALLBACK_LOGGED = False
 
 
 # The pinned staging buffers are the store's shared machinery (store.py) — the replay-twice/BCG
@@ -1716,6 +1718,57 @@ def _save_store_to_cache(store, cache_dir: Optional[str], layer_idx: int) -> Non
         )
 
 
+def _store_v2_layer_dir(cache_dir: Optional[str], layer_idx: int) -> Optional[str]:
+    """Per-layer directory of the v2 RAW store cache (one page-aligned .bin per paged tensor +
+    manifest.json) — the mmap+register (zero-copy) store's format. v1 (safetensors) stays readable for
+    the copy path; v2 exists because safetensors tensor offsets are only 8-byte aligned, while the UVA
+    gather needs a 16-byte-aligned base — a per-tensor file's mmap base is page-aligned by construction."""
+    return os.path.join(cache_dir, "v2", f"layer_{layer_idx}") if cache_dir else None
+
+
+def _v2_cache_complete(layer_dir: Optional[str], names) -> bool:
+    if not layer_dir or not os.path.exists(os.path.join(layer_dir, "manifest.json")):
+        return False
+    return all(os.path.exists(os.path.join(layer_dir, f"{n}.bin")) for n in names)
+
+
+def _save_store_v2(store, cache_dir: Optional[str], layer_idx: int) -> None:
+    """Persist the filled host store as v2 raw per-tensor files (atomic per file), so the NEXT boot can
+    mmap+register it in place (--paged-experts-store mmap) instead of re-filling."""
+    layer_dir = _store_v2_layer_dir(cache_dir, layer_idx)
+    if not layer_dir:
+        return
+    try:
+        os.makedirs(layer_dir, exist_ok=True)
+        manifest = {}
+        for name, p in store.gpu.items():
+            host = store.host.get(name) if getattr(store, "host", None) is not None else None
+            if host is None:  # windowed store: reconstruct expert order via the fill accessors
+                host = torch.empty((store.E, *p.shape[1:]), dtype=p.dtype)
+                for e in range(store.E):
+                    host[e].copy_(store.row(name, e))
+            raw = host.contiguous().view(torch.uint8).numpy()  # byte reinterpretation (bf16/fp8-safe)
+            path = os.path.join(layer_dir, f"{name}.bin")
+            with open(path + ".tmp", "wb") as f:
+                f.write(raw.tobytes())
+            os.replace(path + ".tmp", path)
+            manifest[name] = {
+                "shape": list(host.shape),
+                "dtype": str(host.dtype),
+                "nbytes": host.numel() * host.element_size(),
+            }
+        mpath = os.path.join(layer_dir, "manifest.json")
+        with open(mpath + ".tmp", "w") as f:
+            json.dump(manifest, f)
+        os.replace(mpath + ".tmp", mpath)
+    except Exception as e:
+        logger.warning(
+            "[paged-experts] v2 store cache write failed for layer %d (%s) — boot unaffected",
+            layer_idx,
+            e,
+        )
+
+
 def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
     """NVFP4 (compressed-tensors nvfp4-pack). Packed uint8 weights copy straight into the host store;
     per-group-of-16 fp8 block scales are swizzled to the cutlass 128x4 layout (matching
@@ -1816,22 +1869,80 @@ def setup_pager(method, layer) -> ExpertPager:
     copied directly. No offline artifact."""
     from sglang.srt.server_args import get_global_server_args
 
-    dev = next(layer.parameters()).device
-    store = make_expert_store(
-        layer,
-        method.E,
-        method.num_resident,
-        dev,
-        pin_host=getattr(method, "pin_host", True),
-        window_W=getattr(method, "window", 0),
-        cold_backing=getattr(method, "cold_backing", "ram"),
-        cold_dir=getattr(method, "cold_dir", None),
+    from sglang.srt.layers.moe.paged_experts.store import (
+        RegisteredExpertStore,
+        discover_paged_params,
     )
 
+    dev = next(layer.parameters()).device
     layer_idx = getattr(layer, "layer_id", getattr(layer, "layer_idx", 0))
     model_path = get_global_server_args().model_path
+    # Zero-copy store (--paged-experts-store mmap): when this layer's v2 raw cache exists, mmap +
+    # cudaHostRegister(ReadOnly) it in place — no allocation, no fill (I1). Full-pin only (the windowed
+    # re-pin writes host tiers) and not nvfp4 (its resident scalars ride a fill side-channel).
+    store = None
+    zero_copied = False
+    store_kind = getattr(method, "store_kind", "pinned")
+    if store_kind == "mmap" and not (getattr(method, "window", 0) or 0):
+        names = set(discover_paged_params(layer, method.num_resident))
+        v2dir = _store_v2_layer_dir(_store_cache_dir(model_path), layer_idx)
+        global _MMAP_FALLBACK_LOGGED
+        if "w13_weight_scale" in names:
+            if not _MMAP_FALLBACK_LOGGED:
+                _MMAP_FALLBACK_LOGGED = True
+                logger.warning(
+                    "[paged-experts] --paged-experts-store mmap: nvfp4 unsupported (resident scalars) — "
+                    "using the pinned fill store"
+                )
+        elif os.environ.get("SGLANG_PAGED_EXPERTS_MMAP_REGISTER", "0") != "1":
+            # KNOWN ISSUE (2026-07-12): the in-place cudaHostRegister HANGS on WSL2 when the v2 mmap is
+            # MAP_PRIVATE writable (ACCESS_COPY) — the validated probe used PROT_READ. Until the repro
+            # settles the mapping mode (likely fix: ACCESS_WRITE/shared, see QUEUED_BUILDS_PLAN), the
+            # register path is opt-in: store=mmap still fills + persists the v2 cache every boot.
+            if not _MMAP_FALLBACK_LOGGED:
+                _MMAP_FALLBACK_LOGGED = True
+                logger.warning(
+                    "[paged-experts] store=mmap: in-place registration disabled pending the WSL2 hang fix "
+                    "(SGLANG_PAGED_EXPERTS_MMAP_REGISTER=1 to test) — using the pinned fill store"
+                )
+        elif _v2_cache_complete(v2dir, names):
+            try:
+                store = RegisteredExpertStore(
+                    layer, method.E, method.num_resident, dev, cache_layer_dir=v2dir
+                )
+                zero_copied = True
+                global _MMAP_STORE_LOGGED
+                if not _MMAP_STORE_LOGGED:
+                    _MMAP_STORE_LOGGED = True
+                    logger.info(
+                        "[paged-experts] zero-copy store: mmap + cudaHostRegister(ReadOnly) from %s "
+                        "(no fill; read-only by contract)",
+                        os.path.dirname(v2dir),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[paged-experts] zero-copy store failed for layer %d (%s) — falling back to the "
+                    "pinned fill store",
+                    layer_idx,
+                    e,
+                )
+                store = None
+    if store is None:
+        store = make_expert_store(
+            layer,
+            method.E,
+            method.num_resident,
+            dev,
+            pin_host=getattr(method, "pin_host", True),
+            window_W=getattr(method, "window", 0),
+            cold_backing=getattr(method, "cold_backing", "ram"),
+            cold_dir=getattr(method, "cold_dir", None),
+        )
+
     try:
-        if any(n.endswith("qweight") for n in store.gpu):  # gptq-marlin int4
+        if zero_copied:
+            pass  # loaded in place from the v2 cache; nothing to fill
+        elif any(n.endswith("qweight") for n in store.gpu):  # gptq-marlin int4
             cache_dir = _store_cache_dir(model_path)
             if _fill_store_from_cache(store, cache_dir, layer_idx):
                 global _STORE_CACHE_LOGGED
@@ -1869,6 +1980,14 @@ def setup_pager(method, layer) -> ExpertPager:
             "per-expert {gate,up,down}_proj tensors; fused-expert checkpoint layouts (e.g. a packed "
             "experts.gate_up_proj) are unsupported."
         ) from e
+    if (
+        not zero_copied
+        and store_kind == "mmap"
+        and not (getattr(method, "window", 0) or 0)
+        and getattr(method, "_nvfp4_full_e", None) is None
+    ):
+        # First mmap-store boot: persist the filled store as v2 raw files so the NEXT boot zero-copies.
+        _save_store_v2(store, _store_cache_dir(model_path), layer_idx)
     logger.debug(
         "[paged-experts] L%d host store filled: E=%d, %d tensors %s",
         layer_idx,
@@ -1884,6 +2003,8 @@ def setup_pager(method, layer) -> ExpertPager:
     # (update_weights_from_disk) re-runs setup on the same method — REPLACE the old pager in place so
     # the registry doesn't grow a stale duplicate holding a second full host store.
     old_pager = getattr(method, "_pager", None)
+    if old_pager is not None and hasattr(old_pager.store, "release"):
+        old_pager.store.release()  # return the registered pin budget before the new store claims it
     if old_pager is not None and old_pager in _REPLAY_PAGERS:
         # weight reload: stop the post-replay hook from polling the stale pager (its miss-vec slot
         # stays allocated — bounded by _MISS_VEC_CAP — but is never read again)

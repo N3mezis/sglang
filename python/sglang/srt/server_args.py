@@ -1814,10 +1814,26 @@ class ServerArgs:
             help="Host expert store kind for --enable-paged-experts. 'pinned' (default) page-locks the "
             "store and pages with the fast transfer kernel. 'paged' uses a non-pinned store paged with a "
             "plain indexed copy — correct but slower; use it only when the pinned store would exceed the "
-            "host's page-locked memory limit (e.g. an unquantized model on a small-RAM box).",
-            choices=["pinned", "paged"],
+            "host's page-locked memory limit (e.g. an unquantized model on a small-RAM box). 'mmap' is the "
+            "zero-copy pinned store: the persisted repack cache is mmap'd and cudaHostRegister(ReadOnly)-"
+            "pinned in place — no allocation, no fill copy (boot in seconds after the first run), one "
+            "file-backed copy in RAM, and a higher pin ceiling than cudaHostAlloc (measured 31 vs ~20 GB). "
+            "Falls back to the pinned fill (writing the cache for the next boot) when the cache is missing; "
+            "full-pin, non-nvfp4 stores only.",
+            choices=["pinned", "paged", "mmap"],
         ),
     ] = "pinned"
+    paged_experts_k_alloc: A[
+        Optional[str],
+        Arg(
+            help="Path to a per-layer hit-curves JSON ({'Ks': [...], 'hit': [[layer][K-grid]]}, produced "
+            "by the routing-capture waterfill sim) for --enable-paged-experts. When set, the uniform "
+            "auto-K budget (K x moe_layers slots) is re-allocated PER LAYER by greedy marginal-hit "
+            "waterfill over these curves — same total VRAM, fewer misses (measured +0.59 pts aggregate "
+            "resident-hit at Kbar=64; pays at low-K operating points, e.g. a context profile). Unset = "
+            "uniform K per layer.",
+        ),
+    ] = None
     paged_experts_kv_reserve_gb: A[
         float,
         "KV-cache headroom (GB) to reserve when auto-sizing K (--paged-experts-num-resident auto). "

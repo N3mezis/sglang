@@ -350,6 +350,125 @@ class PageableExpertStore(ExpertStore):
             gpu_param.data.index_copy_(0, dst_slots, rows)
 
 
+class RegisteredExpertStore(PinnedExpertStore):
+    """Zero-copy pinned store: the host backing is the persisted repack cache (v2 raw per-tensor files)
+    ``mmap``'d and ``cudaHostRegister(Mapped|ReadOnly)``-pinned IN PLACE — no ``cudaHostAlloc``, no fill
+    copy. Boot becomes mmap + register (~0.3 s/GB measured), host RAM holds ONE file-backed copy, and the
+    ReadOnly registration pins past the alloc ceiling (measured 31.3 vs ~20 GB — see
+    RAM_REGIME_IMPROVEMENT_MAP I1 / register_store_probe.py).
+
+    Mechanics: the mapping is MAP_PRIVATE with PROT_READ|WRITE (``ACCESS_COPY``) so torch can view the
+    buffer, but registration passes ``cudaHostRegisterReadOnly`` — the kernel then pins with read intent
+    and the private mapping's clean file-backed pages are pinned AS-IS (a writable-intent pin would
+    copy-on-write the entire store into anonymous RAM up front, which is exactly the Default-flag OOM we
+    measured). CONTRACT: the store is read-only after construction — a host write would COW the written
+    page and silently desynchronize it from the registered (device-visible) page. Full-pin serving never
+    writes the store; the windowed re-pin does, so this class is full-pin only (``make``-time guarded).
+    ``transfer_kv`` / UVA gather work unchanged: registered memory is page-locked + device-mapped, and the
+    per-file mmap base is page-aligned (16-byte gather alignment holds whenever ``item_bytes`` does)."""
+
+    pinned = True
+
+    def __init__(self, layer, num_experts_E: int, num_resident_K: int, device, *, cache_layer_dir: str):
+        import ctypes
+        import json
+
+        from sglang.srt.layers.moe.paged_experts.method import _cudart_handle
+
+        self.E = num_experts_E
+        self.K = num_resident_K
+        self.device = device
+        self.gpu = discover_paged_params(layer, num_resident_K)
+        assert self.gpu, "no per-expert params found on layer"
+        self.host: Dict[str, torch.Tensor] = {}
+        self.item_bytes: Dict[str, int] = {}
+        self._regions: list = []  # (mmap, addr, reg_size) — keep-alive + unregister handles
+        rt = _cudart_handle()
+        if rt is None:
+            raise RuntimeError("[paged-experts] mmap store: CUDA runtime unavailable for cudaHostRegister")
+        manifest = json.load(open(os.path.join(cache_layer_dir, "manifest.json")))
+        HOST_REGISTER_MAPPED, HOST_REGISTER_READONLY = 0x2, 0x8
+        page = mmap.PAGESIZE
+        try:
+            for name, p in self.gpu.items():
+                ent = manifest.get(name)
+                shape = (self.E, *p.shape[1:])
+                if (
+                    ent is None
+                    or tuple(ent["shape"]) != shape
+                    or ent["dtype"] != str(p.dtype)
+                ):
+                    raise RuntimeError(
+                        f"[paged-experts] mmap store: cache manifest mismatch for {name!r} "
+                        f"(want {shape} {p.dtype}, have {ent})"
+                    )
+                path = os.path.join(cache_layer_dir, f"{name}.bin")
+                nbytes = int(ent["nbytes"])
+                if os.path.getsize(path) != nbytes:
+                    raise RuntimeError(f"[paged-experts] mmap store: torn cache file {path}")
+                fd = os.open(path, os.O_RDONLY)
+                try:
+                    mm = mmap.mmap(fd, nbytes, access=mmap.ACCESS_COPY)
+                finally:
+                    os.close(fd)
+                addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+                reg_size = ((nbytes + page - 1) // page) * page  # mmap maps whole pages; register them all
+                rc = rt.cudaHostRegister(
+                    ctypes.c_void_p(addr),
+                    ctypes.c_size_t(reg_size),
+                    HOST_REGISTER_MAPPED | HOST_REGISTER_READONLY,
+                )
+                if rc != 0:
+                    mm.close()
+                    raise RuntimeError(
+                        f"[paged-experts] cudaHostRegister({reg_size / 1e9:.2f}GB) failed rc={rc} for "
+                        f"{name!r} — register ceiling reached; fall back to --paged-experts-store pinned"
+                    )
+                self._regions.append((mm, addr, reg_size))
+                t = torch.frombuffer(mm, dtype=p.dtype, count=self.E * p[0].numel()).view(shape)
+                self.host[name] = t
+                self.item_bytes[name] = p[0].numel() * p.element_size()
+                if self.item_bytes[name] % 8 != 0:
+                    raise RuntimeError(
+                        f"[paged-experts] paged tensor {name!r} per-expert size {self.item_bytes[name]} B "
+                        "is not 8-byte aligned (transfer_kv requirement)."
+                    )
+        except Exception:
+            self.release()
+            raise
+
+    def release(self) -> None:
+        """Unregister + unmap all regions (weight reload replaces the store; the pin budget must return)."""
+        import ctypes
+
+        from sglang.srt.layers.moe.paged_experts.method import _cudart_handle
+
+        rt = _cudart_handle()
+        for mm, addr, _sz in self._regions:
+            try:
+                if rt is not None:
+                    rt.cudaHostUnregister(ctypes.c_void_p(addr))
+            except Exception:
+                pass
+        # NOTE: the mmaps stay open while any host tensor still views them (torch.frombuffer holds the
+        # buffer); dropping our refs lets GC close them once the tensors go.
+        self._regions.clear()
+        self.host = {}
+
+    def __del__(self):  # best-effort; release() is the real path (weight reload)
+        try:
+            self.release()
+        except Exception:
+            pass
+
+    # The store is READ-ONLY by contract (see class docstring): the fill accessors must never run.
+    def row(self, name: str, e: int) -> torch.Tensor:
+        raise RuntimeError("[paged-experts] mmap store is read-only (loaded from the repack cache)")
+
+    def fill_tensor(self, name: str, full: torch.Tensor) -> None:
+        raise RuntimeError("[paged-experts] mmap store is read-only (loaded from the repack cache)")
+
+
 class WindowedExpertStore(ExpertStore):
     """Pinned hot window + pageable cold tail — the fallback for stores that can't be fully page-locked.
 

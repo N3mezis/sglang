@@ -272,14 +272,85 @@ def resolve_num_resident_experts(
     return k
 
 
+@functools.lru_cache(maxsize=None)
+def resolve_k_alloc(num_experts_E: int) -> Optional[tuple]:
+    """L4 per-layer K: greedy marginal-hit waterfill of the uniform auto-K budget (K x moe_layers slots)
+    over shipped per-layer hit curves (--paged-experts-k-alloc, from the routing-capture sim). Same total
+    VRAM as uniform; measured +0.59 pts aggregate resident-hit at Kbar=64. Returns a per-MoE-layer tuple
+    of K values (model layer order), or None (uniform). Cached: resolved once, indexed per layer."""
+    import heapq
+    import json
+
+    from sglang.srt.server_args import get_global_server_args
+
+    path = getattr(get_global_server_args(), "paged_experts_k_alloc", None)
+    if not path:
+        return None
+    _, htc, moe_layers, _ = _moe_geometry()
+    top_k = getattr(htc, "num_experts_per_tok", 8) or 8
+    try:
+        d = json.load(open(path))
+        Ks, hit = list(d["Ks"]), d["hit"]
+        assert len(hit) == moe_layers, f"curves have {len(hit)} layers, model has {moe_layers}"
+        assert all(len(h) == len(Ks) for h in hit)
+    except Exception as e:
+        logger.warning("[paged-experts] k-alloc curves unusable (%s) — uniform K", e)
+        return None
+    K_uniform = resolve_num_resident_experts(num_experts_E)
+    budget = K_uniform * moe_layers
+    # floor every layer at the keep-warm-safe minimum present in the grid, then waterfill the rest
+    floor_i = next((i for i, k in enumerate(Ks) if k > top_k), 0)
+    idx = [floor_i] * moe_layers
+    spent = sum(Ks[floor_i] for _ in range(moe_layers))
+    if spent > budget:
+        logger.warning("[paged-experts] k-alloc: budget %d below the floor — uniform K", budget)
+        return None
+
+    def marg(l):
+        i = idx[l]
+        if i + 1 >= len(Ks):
+            return -1.0
+        return (hit[l][i + 1] - hit[l][i]) / (Ks[i + 1] - Ks[i])
+
+    heap = [(-marg(l), l) for l in range(moe_layers)]
+    heapq.heapify(heap)
+    while heap and spent < budget:
+        g, l = heapq.heappop(heap)
+        if -g <= 0:
+            continue
+        step = Ks[idx[l] + 1] - Ks[idx[l]]
+        if spent + step > budget:
+            continue
+        idx[l] += 1
+        spent += step
+        heapq.heappush(heap, (-marg(l), l))
+    alloc = tuple(min(num_experts_E, Ks[idx[l]]) for l in range(moe_layers))
+    logger.info(
+        "[paged-experts] per-layer K (waterfill): budget %d slots over %d layers -> K in [%d, %d] "
+        "(uniform was %d); spent %d",
+        budget, moe_layers, min(alloc), max(alloc), K_uniform, spent,
+    )
+    return alloc
+
+
+# MoE-layer construction ordinal (make_for_layer is called once per FusedMoE layer, in model order) —
+# indexes the per-layer K allocation. Reset with the sizing state on a new model build.
+_MOE_LAYER_ORD = 0
+# Running minimum keep-warm capture cap across layers (per-layer K makes it layer-dependent).
+_SHAPE_MIN_CAP = 0
+
+
 def reset_sizing_state() -> None:
     """Clear the cached sizing state for a NEW model build in this process: the geometry/K/W caches
     (keyed only on E — a different model could alias the same key) and the pre-load memory snapshots
     (free VRAM / MemAvailable move between builds)."""
-    global _PRE_LOAD_FREE_BYTES, _PRE_LOAD_HOST_AVAIL
+    global _PRE_LOAD_FREE_BYTES, _PRE_LOAD_HOST_AVAIL, _MOE_LAYER_ORD, _SHAPE_MIN_CAP
+    _MOE_LAYER_ORD = 0
+    _SHAPE_MIN_CAP = 0
     _moe_geometry.cache_clear()
     resolve_num_resident_experts.cache_clear()
     resolve_window_experts.cache_clear()
+    resolve_k_alloc.cache_clear()
     # the repack-cache digest folds in shard mtimes — recompute after a reload (updated checkpoint)
     from sglang.srt.layers.moe.paged_experts.pager import _store_cache_dir
 
@@ -323,6 +394,9 @@ def _make_method_class():
             # the store exceed RAM). cold_dir is the disk location for the "disk" tier.
             self.cold_backing = cold_backing
             self.cold_dir = cold_dir
+            # Host store kind (--paged-experts-store): "pinned" | "paged" | "mmap" (zero-copy registered;
+            # setup_pager picks the RegisteredExpertStore when the v2 cache exists). Set by make_for_layer.
+            self.store_kind = "pinned" if pin_host else "paged"
             # Decode placement: captured (on-device decide + UVA gather, needs a pinned store) when CUDA
             # graphs are on, else eager host; the captured variant is windowed (replay-twice) when a window
             # is set. The bool + window resolve to a Placement strategy (placement.py) — deferred alongside
@@ -462,11 +536,18 @@ def make_for_layer(
     _geo_mc, _geo_htc = _moe_geometry()[:2]
     check_paged_experts_quant(_quant_source(_geo_mc, _geo_htc))
     E = int(getattr(layer, "num_local_experts", None) or layer.num_experts)
+    global _MOE_LAYER_ORD
+    _ord = _MOE_LAYER_ORD
+    _MOE_LAYER_ORD += 1
     if num_resident == "auto":
         K = resolve_num_resident_experts(E, nonexpert_reserve_gb=nonexpert_reserve_gb)
+        alloc = resolve_k_alloc(E)
+        if alloc is not None and _ord < len(alloc):
+            K = int(alloc[_ord])  # L4: waterfilled per-layer K (same total budget as uniform)
     else:
         K = int(num_resident)
-    pin_host = getattr(server_args, "paged_experts_store", "pinned") != "paged"
+    store_kind = getattr(server_args, "paged_experts_store", "pinned")
+    pin_host = store_kind != "paged"
     # Use the on-device (capturable) decode path unless CUDA graphs are disabled. With graphs off it's the
     # eager kernel-free path (host decide + transfer_kv); with graphs on the decode step is captured.
     use_ondevice = not bool(getattr(server_args, "disable_cuda_graph", False))
@@ -488,7 +569,7 @@ def make_for_layer(
     cold_dir = getattr(server_args, "paged_experts_cold_dir", "") or None
     # Windowed decode under the breakable backend -> BCG break-and-page-in (no replay-twice).
     breakable_decode = resolve_breakable_decode(server_args)
-    return _make_method_class()(
+    m = _make_method_class()(
         base_method,
         E,
         K,
@@ -500,6 +581,8 @@ def make_for_layer(
         cold_dir=cold_dir,
         breakable_decode=breakable_decode,
     )
+    m.store_kind = store_kind
+    return m
 
 
 # Fraction of MemAvailable the auto window is allowed to page-lock. Deliberately conservative: the rest
@@ -563,7 +646,11 @@ def _shape_capture_bs_to_keep_warm(
     # (one slot of eviction headroom): at an exact multiple bs*top_k == K there is none, and staging a
     # cold miss fails. Also prevents the non-breakable windowed path from capturing a boundary bs that
     # placement then rejects at capture time.
+    # Per-layer K (L4): every layer's PWAL calls this with ITS K — the bound that holds for the whole
+    # model is the MINIMUM across layers, so track the running min and never re-add a larger bucket.
+    global _SHAPE_MIN_CAP
     cap = max(1, (K - 1) // top_k)
+    _SHAPE_MIN_CAP = cap = min(cap, _SHAPE_MIN_CAP if _SHAPE_MIN_CAP else cap)
     # Only windowed WITHOUT the breakable backend must hard-clamp (its distinct>K wave is the uncapturable
     # eager host path). Windowed + breakable has the captured on-device wave, so it behaves like full-pin.
     hard_clamp = windowed and not breakable_decode
