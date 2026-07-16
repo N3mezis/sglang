@@ -375,13 +375,20 @@ class InPlaceNvfp4Store(ExpertStore):
         dev = self.device
         w1_wgs, w2_wgs = w1_wgs.to(dev), w2_wgs.to(dev)
         w1_igs, w3_igs, w2_igs = w1_igs.to(dev), w3_igs.to(dev), w2_igs.to(dev)
-        w13_ws2, w2_ws2 = 1.0 / w1_wgs, 1.0 / w2_wgs
-        w13_iq = torch.minimum(w1_igs, w3_igs)
+        w13_ws2, w2_ws2 = 1.0 / w1_wgs, 1.0 / w2_wgs  # per-expert weight_scale_2 [E]
+        w13_iq = torch.minimum(w1_igs, w3_igs)  # per-expert input_scale_quant (1/input_scale) [E]
+        # Upstream's NVFP4 fused-MoE (flashinfer_cutlass/trtllm, ModelOptNvFp4FusedMoEMethod) collapses the
+        # per-expert input scale to a PER-TENSOR max: input_scale = 1/iq, max_input_scale = 1/min(iq). The
+        # kernel quantizes activations with 1/max, so the alphas must use max_input_scale too (else the
+        # x-quant and dequant scales disagree). g*_alphas stay per-expert (max_input_scale * per-expert
+        # weight_scale_2); *_input_scale_quant become 0-dim per-tensor scalars (1/max).
+        w13_is_max = (1.0 / w13_iq).max()
+        w2_is_max = (1.0 / w2_igs).max()
         return {
-            "g1_alphas": ((1.0 / w13_iq) * w13_ws2).float(),
-            "g2_alphas": ((1.0 / w2_igs) * w2_ws2).float(),
-            "w13_input_scale_quant": w13_iq.float(),
-            "w2_input_scale_quant": w2_igs.float(),
+            "g1_alphas": (w13_is_max * w13_ws2).float(),
+            "g2_alphas": (w2_is_max * w2_ws2).float(),
+            "w13_input_scale_quant": (1.0 / w13_is_max).float().reshape(()),
+            "w2_input_scale_quant": (1.0 / w2_is_max).float().reshape(()),
         }
 
     # ---- slab fill (on cache miss) -----------------------------------------------------------------

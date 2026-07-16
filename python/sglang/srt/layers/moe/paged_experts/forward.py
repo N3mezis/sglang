@@ -145,7 +145,11 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
         # borrowed scalar is inert.
         idx = s2l.clamp(min=0).long()
         for nm, full in fe.items():
-            getattr(layer, nm).data.copy_(full[idx])
+            tgt = getattr(layer, nm).data
+            if full.dim() == 0:
+                tgt.copy_(full)  # per-tensor scalar (input_scale_quant is 0-dim) — no per-slot gather
+            else:
+                tgt.copy_(full[idx])
     else:
         # Eager scatter by the logical->slot map. The HOST wave path (_wave_apply) positions weights by
         # its LOCAL l2g (host page_in, not the on-device decide) and passes it as logical_to_slot — that
@@ -162,7 +166,11 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
         resident = l2g >= 0
         slots = l2g[resident].long()
         for nm, full in fe.items():
-            getattr(layer, nm).data[slots] = full[resident]
+            tgt = getattr(layer, nm).data
+            if full.dim() == 0:
+                tgt.copy_(full)  # per-tensor scalar (input_scale_quant is 0-dim) — no per-slot scatter
+            else:
+                tgt[slots] = full[resident]
 
 
 def _gemm_hidden(
