@@ -37,6 +37,20 @@ _STREAM_GATE = float(os.environ.get("SGLANG_PAGED_STREAM_GATE", "0"))
 _STREAM_GATE_LOGGED = False
 _STREAM_GATE_KSUM = [0.0, 0]  # running (sum_kept, n_tokens) for an observed-average-k log
 
+# Stage A gate for per-layer MoE mini-graph capture (docs/design/paged-experts-perlayer-capture.md):
+# probe whether a MANUAL torch.cuda.CUDAGraph can capture base_method.apply standalone (outside sglang's
+# backend) and replay correctly. Fires ONCE on the first eligible decode _gemm_hidden, logs PASS/FAIL, then
+# falls through to the normal eager apply. Default off — pure diagnostic, never on the serving path.
+_PERLAYER_CAPTURE_PROBE = os.environ.get("SGLANG_PERLAYER_CAPTURE_PROBE", "0") == "1"
+_PERLAYER_PROBE_DONE = False
+
+# Per-layer MoE mini-graph capture (docs/design/paged-experts-perlayer-capture.md). Captures the CAPTURABLE
+# per-wave compute (s2l scalar refresh + remap + grouped GEMM) into a manual torch.cuda.CUDAGraph per layer,
+# replayed per wave — killing the ~20% compute-orchestration CPU without the full-forward VRAM wall. Pure
+# function (fixed in-buffers -> fixed `partial` out-buffer); eager accumulate + eager page-in outside.
+# Default OFF; K=1 + bs=1 + nvfp4 only. Self-gated: falls back to eager on any captured-vs-eager mismatch.
+_PERLAYER_CAPTURE = os.environ.get("SGLANG_PERLAYER_CAPTURE", "0") == "1"
+
 
 def _maybe_truncate_topk(dispatch_output) -> None:
     """In-place truncate the routing per token. Gate-threshold mode (variable k) if _STREAM_GATE>0,
@@ -173,6 +187,53 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
                 tgt[slots] = full[resident]
 
 
+def _perlayer_capture_probe(method, layer, md) -> None:
+    """Stage A gate (docs/design/paged-experts-perlayer-capture.md): verify a MANUAL torch.cuda.CUDAGraph
+    can capture base_method.apply standalone (outside sglang's backend) and replay it correctly with the
+    same fixed input buffers. If this passes, the per-layer MoE mini-graph capture is viable (the win that
+    sidesteps the full-forward VRAM wall). If it raises, the idea is dead cheaply. Logs PASS/FAIL; never
+    propagates (pure diagnostic on a one-shot decode call)."""
+    import logging
+
+    log = logging.getLogger(__name__)
+
+    def _apply():
+        o = method.base_method.apply(layer, md)
+        return o.hidden_states if hasattr(o, "hidden_states") else o
+
+    try:
+        # A captured op sequence must be warmed on a side stream first (allocate workspaces, JIT, etc.).
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                _ = _apply()
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            cap_out = _apply()  # captured; writes a fixed graph-pool output buffer
+        g.replay()
+        torch.cuda.synchronize()
+        eager_out = _apply()  # fresh eager result on the same (unmutated) md
+        diff = (cap_out.float() - eager_out.float()).abs().max().item()
+        denom = eager_out.float().abs().max().item() + 1e-9
+        log.info(
+            "[perlayer-probe] PASS: manual CUDAGraph capture+replay of base_method.apply works "
+            "(max|Δ|=%.3e rel=%.3e shape=%s) -> per-layer MoE capture is VIABLE",
+            diff,
+            diff / denom,
+            tuple(cap_out.shape),
+        )
+    except Exception as e:  # noqa: BLE001 — diagnostic must never crash serving
+        log.error(
+            "[perlayer-probe] FAIL: manual CUDAGraph capture of base_method.apply raised %r -> per-layer "
+            "MoE capture is likely DEAD (host sync / dynamic alloc under manual capture; note "
+            "expandable_segments can conflict with CUDA graphs)",
+            e,
+        )
+
+
 def _gemm_hidden(
     method,
     layer,
@@ -217,6 +278,15 @@ def _gemm_hidden(
         hidden_states=hidden.clone() if clone_hidden else hidden,
         topk_output=topk_output._replace(topk_ids=safe_ids, topk_weights=masked_tw),
     )
+    global _PERLAYER_PROBE_DONE
+    if (
+        _PERLAYER_CAPTURE_PROBE
+        and not _PERLAYER_PROBE_DONE
+        and not torch.cuda.is_current_stream_capturing()
+        and hidden.shape[0] <= 4  # decode-shaped only
+    ):
+        _PERLAYER_PROBE_DONE = True
+        _perlayer_capture_probe(method, layer, md)
     if _sT is not None:
         import time as _time
 
@@ -237,6 +307,10 @@ try:
     _sT = _sT_ if _PET else None
 except Exception:
     _sT = None
+
+import time as _time_mod
+
+_perf_ns = _time_mod.perf_counter_ns
 
 
 # Default OFF: the lean single-expert path is CORRECT but MEASURED SLOWER (2.38 vs 2.02 s/tok) — the grouped
@@ -387,6 +461,135 @@ def _scratch_prefill_apply(method, layer, dispatch_output, topk_ids, distinct=No
     return hidden
 
 
+def _pl_capture_body(method, layer, cap):
+    """The CAPTURED per-wave compute (pure fn of the fixed buffers): s2l scalar refresh + remap/mask +
+    grouped GEMM -> writes cap['partial']. Reads cap['l2g']/cap['topk_ids']/cap['topk_weights']/cap['hidden']
+    + slot-0 weights (all fixed addresses, mutated eagerly between replays). No accumulate here — the caller
+    sums cap['partial'] into out eagerly, so the graph stays a stateless function (clean warmup/capture)."""
+    _refresh_nvfp4_scalars(method, layer, logical_to_slot=None)  # s2l fixed-[K] gather (capturable)
+    remap = cap["l2g"][cap["topk_ids"]]
+    keep = (remap >= 0).to(cap["topk_weights"].dtype)
+    mtw = cap["topk_weights"] * keep
+    sids = remap.clamp(min=0)
+    md = cap["dispatch"]._replace(
+        hidden_states=cap["hidden"],
+        topk_output=cap["topk_out"]._replace(topk_ids=sids, topk_weights=mtw),
+    )
+    o = method.base_method.apply(layer, md)
+    cap["partial"].copy_(o.hidden_states if hasattr(o, "hidden_states") else o)
+
+
+def _wave_apply_perlayer_captured(method, layer, dispatch_output, topk_ids, distinct):
+    """Per-layer MoE mini-graph capture path (K=1, bs=1, nvfp4). Replays a captured per-wave compute graph
+    for each of the ``distinct`` experts (paged serially into slot-0 EAGERLY between replays), summing the
+    per-wave partials. Returns the MoE output, or None to signal "fall back to eager" (unsupported shape,
+    capture failure, or a correctness-check mismatch — never silently wrong)."""
+    import logging
+
+    pager = method._pager
+    K, E, dev = pager.K, pager.E, pager.device
+    store = pager.store
+    hidden = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+    topk_weights = topk_output.topk_weights
+    T = hidden.shape[0]
+    if T != 1 or K != 1 or getattr(method, "_pl_disabled", False):
+        return None  # this path targets bs=1/K=1; _pl_disabled latches after a mismatch
+
+    groups = [distinct[w : w + K] for w in range(0, len(distinct), K)]
+    # The captured s2l scalar refresh reads pager._slot_expert_d (slot->logical), which the ON-DEVICE init
+    # allocates but the EAGER InPlace store leaves None. Allocate it here (K slots) so the in-graph fixed-[K]
+    # gather branch of _refresh_nvfp4_scalars is available. Safe for eager: that path passes logical_to_slot
+    # explicitly, so it never reads _slot_expert_d regardless.
+    if getattr(pager, "_slot_expert_d", None) is None:
+        pager._slot_expert_d = torch.full((K,), -1, dtype=torch.int32, device=dev)
+    cap = getattr(method, "_pl_cap", None)
+    if cap is None or cap["T"] != T or cap["tk"] != topk_ids.shape[-1]:
+        cap = {
+            "T": T,
+            "tk": topk_ids.shape[-1],
+            "hidden": torch.empty_like(hidden),
+            "topk_ids": torch.empty_like(topk_ids),
+            "topk_weights": torch.empty_like(topk_weights),
+            "l2g": torch.full((E,), -1, dtype=torch.int32, device=dev),
+            "partial": torch.empty_like(hidden),
+            "dispatch": dispatch_output,
+            "topk_out": topk_output,
+            "graph": None,
+        }
+        method._pl_cap = cap
+
+    # Fill the fixed input buffers for this token (eager).
+    cap["hidden"].copy_(hidden)
+    cap["topk_ids"].copy_(topk_ids)
+    cap["topk_weights"].copy_(topk_weights)
+    l2g = cap["l2g"]
+
+    # Whole-step cold read-ahead up front (same QD prefetch the eager path uses).
+    if hasattr(store, "prefetch_cold"):
+        store.prefetch_cold(distinct)
+        store._step_prefetched = True
+
+    out = None
+    for w, group in enumerate(groups):
+        src = torch.tensor(group, dtype=torch.int64, device=dev)
+        dst = torch.arange(0, len(group), dtype=torch.int64, device=dev)  # slots 0..K-1
+        pager.page_in(
+            src, dst, src_host=group, dst_host=list(range(len(group))), async_h2d=True
+        )
+        l2g.fill_(-1)
+        l2g[src] = dst.to(torch.int32)
+        pager._slot_expert_d[dst] = src.to(torch.int32)  # for the in-graph s2l scalar refresh
+        if cap["graph"] is None:
+            # First wave of the first decode: capture (slot-0 is now populated), correctness-gate vs eager,
+            # then replay to actually produce this wave's partial.
+            eager_ref = _gemm_hidden(
+                method, layer, dispatch_output, l2g[topk_ids], clone_hidden=True, logical_to_slot=l2g
+            )
+            try:
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    for _ in range(3):
+                        _pl_capture_body(method, layer, cap)
+                torch.cuda.current_stream().wait_stream(s)
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    _pl_capture_body(method, layer, cap)
+                g.replay()
+                torch.cuda.synchronize()
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger(__name__).error(
+                    "[perlayer] capture failed on layer %s: %r -> disabling per-layer capture (eager fallback)",
+                    getattr(layer, "layer_id", "?"),
+                    e,
+                )
+                method._pl_disabled = True
+                return None
+            diff = (cap["partial"].float() - eager_ref.float()).abs().max().item()
+            denom = eager_ref.float().abs().max().item() + 1e-9
+            if diff / denom > 1e-2:
+                logging.getLogger(__name__).error(
+                    "[perlayer] correctness MISMATCH layer %s (rel=%.3e) -> disabling per-layer capture",
+                    getattr(layer, "layer_id", "?"),
+                    diff / denom,
+                )
+                method._pl_disabled = True
+                return None
+            cap["graph"] = g
+            logging.getLogger(__name__).info(
+                "[perlayer] layer %s captured + correctness OK (rel=%.3e); replaying per wave",
+                getattr(layer, "layer_id", "?"),
+                diff / denom,
+            )
+        else:
+            cap["graph"].replay()
+        out = cap["partial"].clone() if out is None else out + cap["partial"]
+    store._step_prefetched = False
+    return out
+
+
 def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct):
     """Serve > K distinct experts in waves; sum the per-wave partials (lossless).
 
@@ -403,6 +606,15 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
     )
     if hidden is not None:
         return hidden
+    if (
+        _PERLAYER_CAPTURE
+        and getattr(method, "_nvfp4_full_e", None) is not None
+        and getattr(method._pager, "K", 0) == 1
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        r = _wave_apply_perlayer_captured(method, layer, dispatch_output, topk_ids, distinct)
+        if r is not None:
+            return r  # else fall through to the eager wave path (unsupported shape / disabled)
     pager = method._pager
     K, E, dev = pager.K, pager.E, pager.device
     store = pager.store
@@ -481,11 +693,17 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
             # already guarantees the copy lands before the GEMM reads the slot — the per-wave
             # stream.synchronize() in page_in is redundant here and just stalls the CPU (~1 sync/wave x
             # waves x layers). dst_host avoids the dst_slots.to("cpu") sync too.
+            # wl_pagein bracket: sizes the UN-capturable per-wave page-in orchestration (disk+H2D+plan
+            # Python) vs the capturable compute below — gates the per-layer-capture build (perlayer doc).
+            _tp = _perf_ns() if _sT is not None else 0
             pager.page_in(
                 src, dst, src_host=group, dst_host=list(range(base, base + len(group))), async_h2d=True
             )
+            if _sT is not None:
+                _sT("wl_pagein", _perf_ns() - _tp)
         l2g.fill_(-1)
         l2g[src] = dst.to(torch.int32)
+        _tc = _perf_ns() if _sT is not None else 0
         partial = _gemm_hidden(
             method,
             layer,
@@ -494,6 +712,8 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
             clone_hidden=True,
             logical_to_slot=l2g,  # nvfp4: scatter scalars by THIS wave's map, not the stale pager map
         )
+        if _sT is not None:
+            _sT("wl_compute", _perf_ns() - _tc)  # CAPTURABLE ceiling (refresh+remap+clone+gemm)
         if banked:
             ev_gemm[b].record(cs)
         out = partial if out is None else out + partial
