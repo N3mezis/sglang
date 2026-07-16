@@ -239,6 +239,18 @@ def _bcg_post_step() -> None:
        corrupt output. Here no captured gather is in flight; we synchronize first so the step's async gathers
        finish before host_hot is permuted."""
     _prefetch_next_step()  # every step, async — overlaps the next step's compute
+    # Warm the captured windowed wave path: accumulate _freq_d from THIS step's routing for any pager whose
+    # wave break ran this token (the wave decide kernel doesn't, unlike keep-warm decide_bounded). Once/token
+    # here (not per-wave-break), reading the captured topk buffer's live value, so _maybe_profile_refresh
+    # below re-ranks the window on real frequencies. Skips keep-warm-only pagers (flag unset -> kernel fed it).
+    for p in _REPLAY_PAGERS:
+        if getattr(p, "_wave_ran_this_step", False):
+            tk = getattr(p, "_cur_topk_ids", None)
+            fq = getattr(p, "_freq_d", None)
+            if tk is not None and fq is not None:
+                idx = tk.reshape(-1).long()
+                fq.index_add_(0, idx, torch.ones_like(idx, dtype=fq.dtype))
+            p._wave_ran_this_step = False
     if _PROF["on"]:
         _now = time.perf_counter()
         if _PROF["last"] is not None:
@@ -1337,21 +1349,24 @@ class ExpertPager:
         slots, reading each cold expert's slot back from the live map. Runs eager at the break (capture
         paused), so the doorbell read + host gather are legal. No eviction / no map writes here.
 
-        FOLLOW-UP (perf, wave-heavy workloads only): unlike the keep-warm ``stage_cold_at_break`` this does
-        NOT install ``_ensure_bcg_post_step_hook`` or record ``_last_cold_ids``, and the wave decide kernel
-        does not accumulate ``_freq_d`` — so on a deployment that decodes exclusively via waves (never a
-        ``bs*top_k <= K`` step) the freq-window re-pin + temporal cold prefetch never engage. Mixed
-        workloads self-heal (keep-warm steps install the hook + populate freq). Wiring these for wave-only
-        needs the freq accumulation in the kernel, so it is deferred rather than half-done here."""
-        # Ring Stage 1 (within-step): kick async QD reads of the WHOLE layer's distinct cold set at every
-        # break (idempotent — already-staged experts are a no-op). At wave 0's break this fans all cold
-        # reads onto the read pool in parallel, so waves 1..n find their expert already read (copy from the
-        # staged buffer) instead of each break blocking on a serial O_DIRECT read. The unique() is a ≤top_k
-        # D2H (legal at the break; capture paused). See docs/design/paged-experts-ring.md.
-        tk = getattr(self, "_cur_topk_ids", None)
-        store = getattr(self, "store", None)
-        if tk is not None and store is not None and hasattr(store, "prefetch_cold"):
-            store.prefetch_cold(torch.unique(tk).tolist())
+        WARM WINDOW (2026-07-16): the wave decide kernel does not accumulate ``_freq_d`` (unlike keep-warm
+        ``decide_bounded``), so this path installs the per-step hook + registers the pager here and flags the
+        step; ``_bcg_post_step`` then accumulates ``_freq_d`` from the live routing in Python (once/token) and
+        ``_maybe_profile_refresh`` re-pins the freq-ranked window. This closed the measured cold-window
+        (600 cold/tok, Jaccard 0 → every token re-read its ~13GB working set from disk). Cross-step temporal
+        cold prefetch stays disabled (measured net-negative — see docs/design/paged-experts-ring.md)."""
+        # WARM THE CAPTURED WINDOWED WAVE PATH (the real fix for the measured 71%-disk token). Register this
+        # pager + install the per-step hook UNCONDITIONALLY (not just under _PROF), and flag that a wave step
+        # ran this token — so the freq-ranked re-pin engages: _bcg_post_step accumulates _freq_d from the live
+        # routing (the wave decide kernel, unlike keep-warm decide_bounded, does NOT) and _maybe_profile_refresh
+        # re-pins the window to the hottest W experts. Set BEFORE the cn<=0 early return so all-hit (warm)
+        # tokens still count their routing — those hits ARE the hot set that keeps the window warm. Without
+        # this the window never learns the hot set and every token re-reads its whole ~13GB expert working set
+        # from disk (measured 600 cold/tok, Jaccard 0).
+        self._wave_ran_this_step = True
+        if self not in _REPLAY_PAGERS:
+            _REPLAY_PAGERS.append(self)
+        _ensure_bcg_post_step_hook()
         bell = self._doorbell_np
         cn = int(bell[0])
         if cn < 0:  # doorbell not yet visible (capture-time stale / lost write): bounded spin + .item()
@@ -1375,12 +1390,6 @@ class ExpertPager:
         ids = pair[0].tolist()
         slots = pair[1].tolist()
         self._stage_cold_into_slots(ids, slots)
-        # Ring Stage 1: the CROSS-STEP temporal prefetch was measured net-negative here (4.04 -> 4.86 s/tok:
-        # ~40% Jaccard coverage leaves most reads synchronous while the prefetched set competes for the disk
-        # and the step-boundary drain blocks). The WITHIN-STEP prefetch (parallelize the layer's distinct
-        # cold set at the first break, all consumed same-step) is the path — see docs/design/paged-experts-ring.md.
-        if _PROF["on"]:
-            _ensure_bcg_post_step_hook()  # measurement-only, as before
 
     def reset_residency_ondevice(self) -> None:
         """Clear the keep-warm residency maps after a windowed wave step. A windowed wave stages only the
