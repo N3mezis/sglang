@@ -238,6 +238,68 @@ _POOL_LOCK = threading.Lock()
 _LOGGED = False
 
 
+class _ColdStagePool:
+    """Ring Stage 1 (within-step): a GLOBAL bounded async staging tier for the captured windowed store's
+    cold-expert reads. One MoE layer is active at a time under the BCG break loop, so a single small pool of
+    uniform pinned bufsets — shared across all layer stores, evicted LRU — covers the current layer's
+    distinct cold set (≤ top_k ≈ 4 at bs=1). Reads fan out on ``_READ_POOL`` (deep QD), so the layer's cold
+    experts read in PARALLEL instead of serially at each wave break. Keyed on ``(layer_idx, expert)`` — a
+    hit is always valid (expert weights are immutable), so cross-step reuse is a free bonus. Per-store the
+    pool would be W×layers pinned bufsets (~17 GB); global it is ``cap`` bufsets (~cap×19 MB)."""
+
+    __slots__ = ("cap", "free", "staged")
+
+    def __init__(self, cap: int = 16):
+        self.cap = cap
+        self.free = []  # list of {name: pinned tensor} bufsets, reusable across layers (uniform MoE dims)
+        self.staged = OrderedDict()  # (layer_idx, e) -> (bufs, futs); LRU by insertion/touch order
+
+    def _acquire(self, store) -> dict:
+        # Bufsets are interchangeable across uniform MoE layers; drop a mismatched one (defensive) + alloc.
+        want = store.host_hot["w13_weight"][0].shape
+        while self.free:
+            b = self.free.pop()
+            if b["w13_weight"].shape == want:
+                return b
+        return {
+            n: torch.empty_like(store.host_hot[n][0], pin_memory=True) for n in store._names
+        }
+
+    def prefetch(self, store, e: int) -> None:
+        """Kick async reads of expert ``e``'s tensors into a staged bufset (idempotent; LRU-evicts to stay
+        within ``cap``). Single-threaded caller (the eager BCG break) — no lock needed."""
+        key = (store.layer_idx, int(e))
+        ent = self.staged.get(key)
+        if ent is not None:
+            self.staged.move_to_end(key)  # LRU touch
+            return
+        if len(self.staged) >= self.cap:
+            _, (obufs, ofuts) = self.staged.popitem(last=False)  # evict oldest
+            for f in ofuts.values():
+                f.result()  # drain before recycling its buffers (near-instant for a completed old entry)
+            self.free.append(obufs)
+        bufs = self._acquire(store)
+        futs = {
+            n: _READ_POOL.submit(store._read_cold_tensor, n, key[1], bufs[n])
+            for n in store._names
+        }
+        self.staged[key] = (bufs, futs)
+
+    def gather_one(self, store, name: str, e: int, dst: torch.Tensor) -> bool:
+        """If expert ``e``'s ``name`` tensor is staged, wait for its read + copy into ``dst`` and return True;
+        else return False (caller falls back to a synchronous read)."""
+        ent = self.staged.get((store.layer_idx, int(e)))
+        if ent is None:
+            return False
+        bufs, futs = ent
+        futs[name].result()
+        dst.copy_(bufs[name])
+        return True
+
+
+_COLD_STAGE = _ColdStagePool()
+
+
 class InPlaceNvfp4Store(ExpertStore):
     pinned = False
 
@@ -667,7 +729,7 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
             hp = int(self.hot_pos[e])
             if hp >= 0:
                 buf[i].copy_(self.host_hot[name][hp])
-            else:
+            elif not _COLD_STAGE.gather_one(self, name, e, buf[i]):
                 self._read_cold_tensor(name, e, buf[i])
 
     def _read_cold_rows_direct(self, name, cold_rows, buf):
@@ -676,12 +738,23 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
         return False
 
     def prefetch_cold(self, experts, force=False):
-        return  # cold reads are synchronous in gather_rows_into; no mmap read-ahead tier
-        # Ring Stage 1 (TODO, within-step): an async deep-QD staging tier here (submit _read_cold_tensor on
-        # a pool into a bounded LRU pinned pool; gather_rows_into waits+copies) would overlap the layer's
-        # distinct cold reads. Kick it at the FIRST break with the full distinct set (read _cur_topk_ids) so
-        # all reads run same-step in parallel. The CROSS-STEP temporal variant was measured net-negative
-        # (4.04->4.86 s/tok, ~40% Jaccard + disk contention + step-boundary drain). See paged-experts-ring.md.
+        """Ring Stage 1 (within-step): kick async deep-QD reads of ``experts``' COLD tensors into the global
+        staging pool, so the layer's distinct cold set reads in PARALLEL. ``gather_rows_into`` then copies
+        from the completed staged buffer instead of blocking on a synchronous O_DIRECT read. Called at the
+        wave break with the layer's full distinct set (across-wave overlap) and per-wave with each wave's
+        cold ids (idempotent — a re-request of a staged expert is a no-op). The CROSS-STEP temporal variant
+        was measured net-negative (4.04->4.86 s/tok); this within-step variant is the path."""
+        if experts is None:
+            return
+        if os.environ.get("SGLANG_RING_PREFETCH", "0") != "1":
+            return  # MEASURED NET-NEGATIVE at bs=1 (6.62 -> 7.23 s/tok W=8): the QD-parallel win is eaten by
+            # thread-pool + extra pinned->pinned memcpy orchestration, and the bs=1 GEMM is too small to hide
+            # reads behind. DEFAULT OFF (opt-in for a bs>1 retry, where more distinct experts may amortize).
+        ids = experts.tolist() if torch.is_tensor(experts) else list(experts)
+        for e in ids:
+            e = int(e)
+            if int(self.hot_pos[e]) < 0:  # cold only; hot experts gather from host_hot in-window
+                _COLD_STAGE.prefetch(self, e)
 
     # ---- eager fallback (off-graph prefill / eager decode) -----------------------------------------
     def page_in(self, src_experts, dst_slots, *, stage_bank=0, async_h2d=False, src_host=None):

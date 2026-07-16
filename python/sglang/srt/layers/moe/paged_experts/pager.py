@@ -1308,6 +1308,9 @@ class ExpertPager:
 
         if wave == 0:
             self._prep_topk_ondevice(topk_ids)
+        # Ring Stage 1: stash the (captured, fixed-address) routing buffer so the eager break can read the
+        # live distinct set per replay and prefetch the WHOLE layer's cold experts at once (across-wave QD).
+        self._cur_topk_ids = topk_ids
         paged_experts_decide_bounded_wave(
             self._topk_i32,
             self.E,
@@ -1340,6 +1343,15 @@ class ExpertPager:
         ``bs*top_k <= K`` step) the freq-window re-pin + temporal cold prefetch never engage. Mixed
         workloads self-heal (keep-warm steps install the hook + populate freq). Wiring these for wave-only
         needs the freq accumulation in the kernel, so it is deferred rather than half-done here."""
+        # Ring Stage 1 (within-step): kick async QD reads of the WHOLE layer's distinct cold set at every
+        # break (idempotent — already-staged experts are a no-op). At wave 0's break this fans all cold
+        # reads onto the read pool in parallel, so waves 1..n find their expert already read (copy from the
+        # staged buffer) instead of each break blocking on a serial O_DIRECT read. The unique() is a ≤top_k
+        # D2H (legal at the break; capture paused). See docs/design/paged-experts-ring.md.
+        tk = getattr(self, "_cur_topk_ids", None)
+        store = getattr(self, "store", None)
+        if tk is not None and store is not None and hasattr(store, "prefetch_cold"):
+            store.prefetch_cold(torch.unique(tk).tolist())
         bell = self._doorbell_np
         cn = int(bell[0])
         if cn < 0:  # doorbell not yet visible (capture-time stale / lost write): bounded spin + .item()
