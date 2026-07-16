@@ -172,6 +172,7 @@ def _maybe_profile_refresh() -> None:
 _BCG_HOOK_INSTALLED = False
 _MMAP_STORE_LOGGED = False
 _MMAP_FALLBACK_LOGGED = False
+_INPLACE_NVFP4_LOGGED = False
 
 
 # The pinned staging buffers are the store's shared machinery (store.py) — the replay-twice/BCG
@@ -528,17 +529,26 @@ class ExpertPager:
         stage_bank: int = 0,
         async_h2d: bool = False,
         src_host: Optional[list] = None,
+        dst_host: Optional[list] = None,
     ) -> None:
         """Page the chosen experts into their slots via the store (transport-specific; a no-op if empty).
-        ``stage_bank``/``async_h2d``/``src_host`` are the double-buffered wave path's knobs: separate
-        staging buffers per bank, no trailing stream sync (the caller sequences buffer reuse with
-        events), and a host-side copy of the plan (no D2H read-back)."""
+        ``stage_bank``/``async_h2d``/``src_host``/``dst_host`` are the wave path's knobs: separate staging
+        buffers per bank, no trailing stream sync (the caller sequences buffer reuse with events / same-stream
+        order), and host-side copies of the plan (no D2H read-back sync)."""
+        kw = {}
+        if dst_host is not None:
+            # only stores that accept dst_host (in-place nvfp4); keep the base contract unchanged otherwise
+            import inspect
+
+            if "dst_host" in inspect.signature(self.store.page_in).parameters:
+                kw["dst_host"] = dst_host
         self.store.page_in(
             src_experts,
             dst_slots,
             stage_bank=stage_bank,
             async_h2d=async_h2d,
             src_host=src_host,
+            **kw,
         )
 
     def scratch_ctx(self):
@@ -1413,6 +1423,49 @@ def _weight_map(snap: str) -> Dict[str, str]:
         return {k: os.path.basename(files[0]) for k in f.keys()}
 
 
+_NEXTN_REMAP_CACHE: Dict[str, Dict[int, int]] = {}
+
+
+def _resolve_nextn_layer_idx(model_path: str, layer_idx: int) -> int:
+    """Map the EAGLE/next-n DRAFT layer to its checkpoint layer index. The draft (nextn) decoder layer is
+    built positionally with ``layer_id=0`` (see glm4_moe_nextn.py), but its routed experts live at the
+    checkpoint's MTP layer == ``num_hidden_layers`` (the nextn layer is indexed right after the main stack).
+    ``setup_pager`` runs only for layers that HAVE experts, and the leading checkpoint layers are dense
+    (``first_k_dense_replace``) — so a ``layer_idx`` with no experts in the checkpoint is unambiguously the
+    draft nextn layer. Remap it; otherwise pass through. Cached per (model_path) to avoid re-parsing the
+    index for every layer at load."""
+    cache = _NEXTN_REMAP_CACHE.get(model_path)
+    if cache is None:
+        snap = _snapshot_dir(model_path)
+        wmap = _weight_map(snap)
+        keys = list(wmap.keys() if hasattr(wmap, "keys") else wmap)
+
+        def has_experts(li: int) -> bool:
+            return any(
+                k.startswith(f"model.layers.{li}.mlp.experts.")
+                or k.startswith(f"model.language_model.layers.{li}.mlp.experts.")
+                or k.startswith(f"layers.{li}.experts.")
+                for k in keys
+            )
+
+        try:
+            mtp = int(json.load(open(os.path.join(snap, "config.json"))).get("num_hidden_layers", 0))
+        except Exception:
+            mtp = 0
+        cache = {"has": has_experts, "mtp": mtp}
+        _NEXTN_REMAP_CACHE[model_path] = cache
+    if cache["has"](layer_idx):
+        return layer_idx
+    mtp = cache["mtp"]
+    if mtp and cache["has"](mtp):
+        logger.info(
+            "[paged-experts] next-n/MTP draft layer %d -> checkpoint layer %d (experts absent at %d)",
+            layer_idx, mtp, layer_idx,
+        )
+        return mtp
+    return layer_idx  # unchanged: _experts_prefix will raise loudly with the original index
+
+
 def _experts_prefix(wmap: Dict[str, str], layer_idx: int) -> str:
     """The checkpoint name prefix of this layer's routed experts. Text-only checkpoints use
     ``model.layers.N.mlp.experts.``; VL checkpoints (e.g. Qwen3.5/3.6 MoE) nest the text model under
@@ -1770,12 +1823,25 @@ def _save_store_v2(store, cache_dir: Optional[str], layer_idx: int) -> None:
 
 
 def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
-    """NVFP4 (compressed-tensors nvfp4-pack). Packed uint8 weights copy straight into the host store;
-    per-group-of-16 fp8 block scales are swizzled to the cutlass 128x4 layout (matching
-    CompressedTensorsW4A4Nvfp4MoE.process_weights_after_loading, non-trtllm path) and stored as paged
-    tensors. The tiny per-expert global/input scalars can't page (sub-8-byte rows), so this returns the
-    four runtime-relevant ones as a resident full-E table {name: [E] f32}; forward._gemm_hidden scatters
-    them into the K slots each step by the live residency map. w1=gate, w3=up, w2=down.
+    """NVFP4 (compressed-tensors nvfp4-pack OR NVIDIA ModelOpt). Packed uint8 weights copy straight into
+    the host store; per-group-of-16 fp8 block scales are swizzled to the cutlass 128x4 layout (matching
+    CompressedTensorsW4A4Nvfp4MoE / ModelOptNvFp4FusedMoEMethod.process_weights_after_loading, non-trtllm
+    path) and stored as paged tensors. The tiny per-expert global/input scalars can't page (sub-8-byte
+    rows), so this returns the four runtime-relevant ones as a resident full-E table {name: [E] f32};
+    forward._gemm_hidden scatters them into the K slots each step by the live residency map. w1=gate,
+    w3=up, w2=down.
+
+    Both packings carry the IDENTICAL on-disk fp4 bytes; they differ only in per-expert tensor NAMES and
+    the global/input-scale reciprocal convention:
+      * compressed-tensors: ``weight_packed`` / ``weight_scale`` / ``weight_global_scale`` (= 1/actual weight
+        scale) / ``input_global_scale`` (= 1/actual input scale).
+      * ModelOpt: ``weight`` / ``weight_scale`` / ``weight_scale_2`` (= actual weight scale) / ``input_scale``
+        (= actual input scale).
+    We normalize ModelOpt to the compressed-tensors convention by inverting the two global scalars AT READ,
+    so all downstream math (``w13_ws2 = 1/w1_wgs``, the ``min`` over input scales, the alphas) is untouched
+    and produces bit-identical resident scalars. The swizzled scales land in whichever param the base
+    method's CUTLASS apply reads — ``w13_blockscale_swizzled`` (ModelOpt) or ``w13_weight_scale``
+    (compressed-tensors, swizzled in place).
     """
     from safetensors import safe_open
 
@@ -1790,20 +1856,29 @@ def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
     pre = _experts_prefix(wmap, layer_idx)
     gate, up, down = _proj_names(wmap, pre)
 
-    # raw (pre-swizzle) block-scale + global-scale collectors, filled per expert then transformed en masse
+    # Detect the packing from the checkpoint tensor names. ModelOpt names the packed weight ``{proj}.weight``
+    # + ``{proj}.weight_scale_2``; compressed-tensors names it ``{proj}.weight_packed`` + ``weight_global_scale``.
+    modelopt = f"{pre}0.{gate}.weight_packed" not in wmap
+    W_SUF = "weight" if modelopt else "weight_packed"
+    WGS_SUF = "weight_scale_2" if modelopt else "weight_global_scale"
+    IGS_SUF = "input_scale" if modelopt else "input_global_scale"
+    # The base method's CUTLASS apply reads swizzled block scales from ``*_blockscale_swizzled`` (ModelOpt)
+    # or the in-place-swizzled ``*_weight_scale`` (compressed-tensors). discover_paged_params drops the raw
+    # ``*_weight_scale`` when a ``*_blockscale_swizzled`` sibling exists, so the store holds exactly one.
+    w13_sc_name = "w13_blockscale_swizzled" if "w13_blockscale_swizzled" in store.gpu else "w13_weight_scale"
+    w2_sc_name = "w2_blockscale_swizzled" if "w2_blockscale_swizzled" in store.gpu else "w2_weight_scale"
+
+    # raw (pre-swizzle) block-scale + global-scale collectors, filled per expert then transformed en masse.
+    # ``w1_wgs``/``w*_igs`` always hold the compressed-tensors convention (reciprocal of the actual scale).
     w13_sc_raw = w2_sc_raw = None
     z = lambda: torch.empty(E, dtype=torch.float32)
     w1_wgs, w2_wgs, w1_igs, w3_igs, w2_igs = z(), z(), z(), z(), z()
+    inv = (lambda x: 1.0 / x) if modelopt else (lambda x: x)  # normalize ModelOpt -> reciprocal convention
 
     by_shard: Dict[str, list] = {}
     for e in range(E):
         for proj in (gate, up, down):
-            for suf in (
-                "weight_packed",
-                "weight_scale",
-                "weight_global_scale",
-                "input_global_scale",
-            ):
+            for suf in (W_SUF, "weight_scale", WGS_SUF, IGS_SUF):
                 by_shard.setdefault(wmap[f"{pre}{e}.{proj}.{suf}"], []).append(
                     (e, proj, suf)
                 )
@@ -1812,7 +1887,7 @@ def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
             for e, proj, suf in items:
                 t = f.get_tensor(f"{pre}{e}.{proj}.{suf}")
                 is_down = proj == down
-                if suf == "weight_packed":
+                if suf == W_SUF:
                     if is_down:
                         store.row("w2_weight", e).copy_(t)
                     else:
@@ -1835,18 +1910,18 @@ def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
                             if proj == gate
                             else w13_sc_raw[e][half:]
                         ).copy_(t)
-                elif suf == "weight_global_scale":
+                elif suf == WGS_SUF:
                     if proj == gate:
-                        w1_wgs[e] = t.flatten()[0]
+                        w1_wgs[e] = inv(t.flatten()[0])
                     elif is_down:
-                        w2_wgs[e] = t.flatten()[0]
-                else:  # input_global_scale
+                        w2_wgs[e] = inv(t.flatten()[0])
+                else:  # input scale (global reciprocal, or ModelOpt actual -> inverted)
                     dst = w1_igs if proj == gate else (w2_igs if is_down else w3_igs)
-                    dst[e] = t.flatten()[0]
+                    dst[e] = inv(t.flatten()[0])
 
     # swizzle block scales to the cutlass 128x4 layout (same transform the method's PWAL applies)
-    store.fill_tensor("w13_weight_scale", swizzle_blockscale(w13_sc_raw.to(device)).cpu())
-    store.fill_tensor("w2_weight_scale", swizzle_blockscale(w2_sc_raw.to(device)).cpu())
+    store.fill_tensor(w13_sc_name, swizzle_blockscale(w13_sc_raw.to(device)).cpu())
+    store.fill_tensor(w2_sc_name, swizzle_blockscale(w2_sc_raw.to(device)).cpu())
 
     # derived per-expert scalars (cutlass path): weight_scale_2 = 1/weight_global_scale;
     # input_scale_quant = min over the (w1,w3) input global scales; g_alphas = (1/input) * weight_scale_2.
@@ -1877,13 +1952,50 @@ def setup_pager(method, layer) -> ExpertPager:
     dev = next(layer.parameters()).device
     layer_idx = getattr(layer, "layer_id", getattr(layer, "layer_idx", 0))
     model_path = get_global_server_args().model_path
+    # EAGLE/next-n draft layer is built with layer_id=0 but its experts live at the checkpoint MTP layer.
+    layer_idx = _resolve_nextn_layer_idx(model_path, layer_idx)
     # Zero-copy store (--paged-experts-store mmap): when this layer's v2 raw cache exists, mmap +
     # cudaHostRegister(ReadOnly) it in place — no allocation, no fill (I1). Full-pin only (the windowed
     # re-pin writes host tiers) and not nvfp4 (its resident scalars ride a fill side-channel).
     store = None
     zero_copied = False
     store_kind = getattr(method, "store_kind", "pinned")
-    if store_kind == "mmap" and not (getattr(method, "window", 0) or 0):
+    # nvfp4 zero-copy IN-PLACE: mmap the checkpoint expert regions directly and page/swizzle per resident
+    # slot on demand — no materialized host store. The ONLY way to serve an expert set larger than
+    # RAM+disk (e.g. GLM-5.2's 427 GB). Handles windowed/streaming too (the window is a materialized-store
+    # budget knob, moot for an in-place mmap). Eager path only (paged store; --disable-cuda-graph).
+    if store_kind == "mmap":
+        _names = set(discover_paged_params(layer, method.num_resident))
+        if "w13_blockscale_swizzled" in _names or "w13_weight_scale" in _names:
+            from sglang.srt.layers.moe.paged_experts.inplace_nvfp4_store import (
+                _WINDOWED,
+                InPlaceNvfp4Store,
+                WindowedNvfp4Store,
+            )
+
+            # WINDOWED variant (SGLANG_INPLACE_WINDOWED): fixed pinned host_hot window -> CUDA-graph-
+            # capturable decode. Otherwise the LRU-slab in-place store (eager only).
+            if _WINDOWED:
+                store = WindowedNvfp4Store(
+                    layer, method.E, method.num_resident, dev,
+                    model_path=model_path, layer_idx=layer_idx,
+                )
+            else:
+                store = InPlaceNvfp4Store(
+                    layer, method.E, method.num_resident, dev,
+                    model_path=model_path, layer_idx=layer_idx,
+                )
+            method._nvfp4_full_e = store.nvfp4_full_e
+            zero_copied = True
+            global _INPLACE_NVFP4_LOGGED
+            if not _INPLACE_NVFP4_LOGGED:
+                _INPLACE_NVFP4_LOGGED = True
+                logger.info(
+                    "[paged-experts] zero-copy %s NVFP4 store: checkpoint experts + swizzle "
+                    "(no materialized store, no /cold copy)",
+                    "WINDOWED (captured)" if _WINDOWED else "IN-PLACE (eager)",
+                )
+    if store is None and store_kind == "mmap" and not (getattr(method, "window", 0) or 0):
         names = set(discover_paged_params(layer, method.num_resident))
         v2dir = _store_v2_layer_dir(_store_cache_dir(model_path), layer_idx)
         global _MMAP_FALLBACK_LOGGED
@@ -1957,7 +2069,9 @@ def setup_pager(method, layer) -> ExpertPager:
             "w13_weight_scale_inv" in store.gpu
         ):  # fp8 block-quant (weights + block scales)
             _fill_fp8_block_from_checkpoint(store, model_path, layer_idx)
-        elif "w13_weight_scale" in store.gpu:  # nvfp4 (packed uint8 + swizzled fp8 block scales)
+        elif (
+            "w13_weight_scale" in store.gpu or "w13_blockscale_swizzled" in store.gpu
+        ):  # nvfp4 (packed uint8 + swizzled fp8 block scales); ModelOpt pages the swizzled scale param
             # No store cache here (unlike gptq-marlin): nvfp4's fill transform is just a cheap GPU
             # block-scale swizzle, and the swizzled store is LARGER than the checkpoint (padded
             # scales), so a cache hit reads more bytes to save a near-free op — measured net-neutral

@@ -505,7 +505,34 @@ class DeepseekV2WeightLoaderMixin:
                 else self.model.decoder.self_attn
             )
 
-            if hasattr(self_attn.kv_b_proj, "qweight"):
+            if hasattr(self_attn.kv_b_proj, "qweight") and hasattr(
+                self_attn.kv_b_proj, "weight_scale"
+            ):
+                # hybrid_int4_nvfp4 backbone: RTN int4 (qweight uint8 [out, in/2] + per-group weight_scale).
+                # Dequantize to dense [out, in] (same orientation as the bf16 branch, no .T), then REQUANTIZE
+                # to per-output-channel fp8 and hand it to the fp8 absorption path below. The MLA absorption
+                # always re-materializes kv_b as resident w_kc/w_vc; storing them as fp8 instead of bf16
+                # halves that (~2.3 GB -> ~1.15 GB) — the difference between overflowing a 16 GB card and
+                # fitting. The channel scale below is what channel_quant_to_tensor_quant consumes to emit a
+                # per-tensor ``w_scale`` (used by the forward's bmm_fp8 / dequant path).
+                from sglang.srt.layers.quantization.hybrid_int4_nvfp4 import (
+                    dequantize_int4,
+                )
+
+                w_bf16 = dequantize_int4(
+                    self_attn.kv_b_proj.qweight, self_attn.kv_b_proj.weight_scale
+                )
+                _FP8_MAX = 448.0  # torch.float8_e4m3fn max magnitude
+                ch = (w_bf16.abs().amax(dim=1, keepdim=True) / _FP8_MAX).clamp_min(1e-8)
+                w = (w_bf16 / ch).to(torch.float8_e4m3fn)  # per-channel fp8; dtype routes to the fp8 path
+                # free the int4 source (absorbed) and expose the fp8 channel scale as weight_scale
+                self_attn.kv_b_proj.qweight.data = torch.empty(
+                    0, dtype=torch.uint8, device=self_attn.kv_b_proj.qweight.device
+                )
+                self_attn.kv_b_proj.weight_scale = torch.nn.Parameter(
+                    ch, requires_grad=False
+                )
+            elif hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported
                 awq_dequantize_f = awq_dequantize_func()
                 if awq_dequantize_f is not None:
@@ -683,6 +710,11 @@ class DeepseekV2WeightLoaderMixin:
                 )
                 self_attn.w_vc = bind_or_assign(self_attn.w_vc, w_vc.contiguous())
                 self_attn.use_deep_gemm_bmm = True
+
+        # Return freed blocks (absorbed kv_b int4 params + per-layer dequant transients) to CUDA so the
+        # KV-cache sizer sees the reclaimed headroom — torch's caching allocator otherwise retains them.
+        if layer_ids:
+            torch.cuda.empty_cache()
 
     @classmethod
     def generate_weight_name_filter(cls, logical_experts_map: Dict[int, List[int]]):

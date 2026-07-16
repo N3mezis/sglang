@@ -29,6 +29,28 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+# Paged-experts wall-clock brackets (SGLANG_PE_TIMING=1): lazily resolve the shared _stage accumulator so
+# the decode forward can attribute per-token time to model_backbone / logits (trunk = backbone - moe_call).
+_PE_BB_STAGE = "unset"
+_PE_BB_FLUSH = None
+
+
+def _pe_bb_stage():
+    global _PE_BB_STAGE, _PE_BB_FLUSH
+    if _PE_BB_STAGE == "unset":
+        try:
+            from sglang.srt.layers.moe.paged_experts.inplace_nvfp4_store import (
+                _PE_TIMING,
+                _stage,
+                _stage_flush,
+            )
+
+            _PE_BB_STAGE = _stage if _PE_TIMING else None
+            _PE_BB_FLUSH = _stage_flush if _PE_TIMING else None
+        except Exception:
+            _PE_BB_STAGE = None
+    return _PE_BB_STAGE
+
 from sglang.jit_kernel.dsv4 import (
     silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
@@ -341,6 +363,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             gemm_output_zero_allocator is not None
             and x.shape[0] <= 256
+            and getattr(self.gate_up_proj, "weight", None) is not None
             and self.gate_up_proj.weight.dtype == torch.uint8
         ):
             y = gemm_output_zero_allocator.allocate(
@@ -355,6 +378,7 @@ class DeepseekV2MLP(nn.Module):
         if (
             self.swiglu_limit is not None
             and not self.down_proj.reduce_results
+            and getattr(self.down_proj, "weight", None) is not None
             and self.down_proj.weight.dtype == torch.uint8
             and hasattr(self.down_proj, "weight_scale_inv")
         ):
@@ -771,6 +795,7 @@ class DeepseekV2MoE(nn.Module):
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
+                "hybrid_int4_nvfp4",
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight
@@ -1795,11 +1820,17 @@ class DeepseekV2AttentionMLA(
             self.has_fused_proj
             and hasattr(self.fused_qkv_a_proj_with_mqa.quant_method, "quant_config")
             and self.fused_qkv_a_proj_with_mqa.quant_method.quant_config.get_name()
-            in {"awq", "awq_marlin", "moe_wna16"}
+            # hybrid_int4_nvfp4 packs its weight (no dense ``.weight``); treat it like the other packed
+            # families so every ``not is_packed_weight and ....weight.dtype`` fast-path check short-circuits
+            # and the MLA down-proj goes through the quant-aware linear apply.
+            in {"awq", "awq_marlin", "moe_wna16", "hybrid_int4_nvfp4"}
         )
         self.use_min_latency_fused_a_gemm = (
             self.has_fused_proj
             and not self.is_packed_weight
+            # A quantized fused_qkv_a (e.g. hybrid_int4_nvfp4) has no dense ``.weight`` — the fast path
+            # reads ``.weight.T`` directly, so disable it and fall to the quant-aware linear apply below.
+            and getattr(self.fused_qkv_a_proj_with_mqa, "weight", None) is not None
             and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.bfloat16
             and self.fused_qkv_a_proj_with_mqa.weight.shape[0] % 16 == 0
             and self.fused_qkv_a_proj_with_mqa.weight.shape[1] % 256 == 0
@@ -2383,9 +2414,24 @@ class DeepseekV2Model(nn.Module):
             self.cp_size = None
 
         if self.pp_group.is_first_rank:
+            # Quantize embed_tokens ONLY for the hybrid_int4_nvfp4 checkpoint (its repack int4'd the
+            # embedding, so the module must use the int4 method to load `.qweight` — else it falls back to
+            # an unquantized bf16 `.weight` that the checkpoint no longer has, leaving it unfilled + wasting
+            # ~1.4 GB). Other quant configs leave embeddings unquantized (their get_quant_method returns
+            # None for VocabParallelEmbedding), so this is scoped to avoid changing their behavior.
+            _embed_quant_config = (
+                quant_config
+                if (
+                    quant_config is not None
+                    and quant_config.get_name() == "hybrid_int4_nvfp4"
+                )
+                else None
+            )
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
+                quant_config=_embed_quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
                 **get_embedding_tp_kwargs(),
             )
         else:
@@ -2859,18 +2905,36 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                     extend_seqs_len=forward_batch.extend_seq_lens_cpu,
                 )
 
+        _stg = _pe_bb_stage()
+        if _stg is not None:
+            import time as _pet
+
+            _b0 = _pet.perf_counter_ns()
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
+        if _stg is not None:
+            # Sync so model_backbone is TRUE per-token wall-clock (attn+backbone+MoE incl GPU exec), not
+            # just launch time — decode is eager here, so this is the natural token-boundary drain.
+            torch.cuda.current_stream().synchronize()
+            _stg("model_backbone", _pet.perf_counter_ns() - _b0)
+            _l0 = _pet.perf_counter_ns()
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(
+            out = self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
+            if _stg is not None:
+                torch.cuda.current_stream().synchronize()
+                _stg("logits", _pet.perf_counter_ns() - _l0)
+                if _PE_BB_FLUSH is not None:
+                    _mode = "decode" if forward_batch.forward_mode.is_decode() else "prefill"
+                    _PE_BB_FLUSH(f"{_mode} n={len_input_ids}")
+            return out
         else:
             return hidden_states
 

@@ -105,6 +105,36 @@ class ModelRunnerKVCacheMixin:
         # KV pool budget = currently-free GPU memory minus the non-static runtime
         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
         # already resident (model weights, etc.) is thus charged against it.
+        import collections as _c
+        import os as _os
+
+        if _os.environ.get("SGLANG_MEM_BREAKDOWN") == "1":
+            try:
+                import torch as _t
+
+                cat = _c.defaultdict(float)
+                for _n, _p in self.model.named_parameters():
+                    key = ".".join(
+                        [s for s in _n.split(".") if not s.isdigit()][:4]
+                    ) + f" [{_p.dtype}]"
+                    cat[key] += _p.numel() * _p.element_size() / 1e9
+                for _n, _b in self.model.named_buffers():
+                    cat[f"BUF {_n.split('.')[-1]} [{_b.dtype}]"] += (
+                        _b.numel() * _b.element_size() / 1e9
+                    )
+                logger.info(
+                    "[MEM] torch allocated=%.2f GB reserved=%.2f GB",
+                    _t.cuda.memory_allocated() / 1e9,
+                    _t.cuda.memory_reserved() / 1e9,
+                )
+                for k, v in sorted(cat.items(), key=lambda x: -x[1])[:25]:
+                    if v > 0.02:
+                        logger.info("[MEM] %7.3f GB  %s", v, k)
+                logger.info(
+                    "[MEM] total params = %.2f GB", sum(cat.values())
+                )
+            except Exception as _e:
+                logger.info("[MEM] breakdown failed: %s", _e)
         available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,

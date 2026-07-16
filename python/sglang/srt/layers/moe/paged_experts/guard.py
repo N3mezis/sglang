@@ -115,6 +115,33 @@ def check_paged_experts_quant(hf_text_config: Any) -> None:
             f"checkpoint uses format={fmt or 'unknown'!r}. Use an nvfp4-pack, block-quant fp8, "
             "GPTQ int4, or unquantized checkpoint, or run without --enable-paged-experts."
         )
+    if quant_method == "hybrid_int4_nvfp4":
+        # Bench hybrid checkpoint: INT4 dense/attention backbone + NVFP4 routed experts. The experts are
+        # the SAME ModelOpt NVFP4 packing the modelopt branch below handles (paged in place); the int4
+        # backbone is resident and none of paged-experts' concern. Accept.
+        return
+    if quant_method in ("modelopt_fp4", "modelopt"):
+        # NVIDIA ModelOpt NVFP4: the SAME on-disk fp4 packing as compressed-tensors nvfp4 (packed
+        # uint8 weights + per-group-of-16 fp8 block scales), only the per-expert tensor NAMES and the
+        # global/input-scale reciprocal convention differ (weight/weight_scale_2/input_scale store the
+        # ACTUAL scale; compressed-tensors' weight_global_scale/input_global_scale store its reciprocal).
+        # The paged fill reads the modelopt names and inverts at read, so the store + forward math are
+        # identical (see pager._fill_nvfp4_from_checkpoint). ModelConfig rewrites a raw ``modelopt`` +
+        # quant_algo=NVFP4 to ``modelopt_fp4``; accept either, but only the NVFP4 algo — modelopt fp8
+        # experts are a different (unwired) layout.
+        algo = (
+            (qc.get("quant_algo") or qc.get("moe_quant_algo") or "").upper()
+            if isinstance(qc, dict)
+            else ""
+        )
+        if quant_method == "modelopt_fp4" or "NVFP4" in algo or "FP4" in algo:
+            return
+        raise RuntimeError(
+            f"Paged Experts supports ModelOpt only with the NVFP4 packing; this checkpoint declares "
+            f"quant_algo={algo or 'unknown'!r}. Use an NVFP4 ModelOpt checkpoint, an nvfp4-pack "
+            "compressed-tensors, block-quant fp8, GPTQ int4, or unquantized checkpoint, or run "
+            "without --enable-paged-experts."
+        )
     raise RuntimeError(
         f"Paged Experts does not support quant_method={quant_method or 'unknown'!r}: the host "
         "store handles unquantized (bf16/fp16), gptq-marlin int4, and fp8 block-quant checkpoints "

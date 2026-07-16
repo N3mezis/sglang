@@ -52,7 +52,10 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    skip_lm_head_capture_hidden_mode,
+)
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
@@ -261,8 +264,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
 
+        # logits-outside-graph: LM head runs eagerly post-replay on captured hidden_states (needs FULL).
+        self.enable_logits_outside_graph = (
+            model_runner.server_args.enable_logits_outside_cuda_graph
+        )
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
-        if model_runner.server_args.enable_return_hidden_states:
+        if (
+            model_runner.server_args.enable_return_hidden_states
+            or self.enable_logits_outside_graph
+        ):
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
         # Attention backend
@@ -866,12 +876,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     post_warmup_hook=post_warmup_hook,
                     skip_logits=False,
                 )
-                self.backend.capture_one(
-                    shape_key,
-                    run_once,
-                    dummies=None,
-                    post_warmup_hook=post_warmup_hook,
+                # logits-outside-graph: capture the forward with the LM head skipped so only hidden_states
+                # is traced into the graph (the two warmup passes inside capture_one also see the flag).
+                skip_ctx = (
+                    skip_lm_head_capture_hidden_mode()
+                    if self.enable_logits_outside_graph
+                    else contextlib.nullcontext()
                 )
+                with skip_ctx:
+                    self.backend.capture_one(
+                        shape_key,
+                        run_once,
+                        dummies=None,
+                        post_warmup_hook=post_warmup_hook,
+                    )
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
@@ -890,6 +908,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if self.model_runner.server_args.enable_return_hidden_states
             else CaptureHiddenMode.NULL
         )
+        capture_hidden_mode_required_for_logits_outside_graph = (
+            CaptureHiddenMode.FULL
+            if self.enable_logits_outside_graph
+            else CaptureHiddenMode.NULL
+        )
 
         # Determine the highest capture_hidden_mode required
         # (If we have FULL, we can emulate LAST or NULL)
@@ -898,6 +921,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_hidden_mode_required_by_forward_batch,
             capture_hidden_mode_required_by_spec_info,
             capture_hidden_mode_required_for_returning_hidden_states,
+            capture_hidden_mode_required_for_logits_outside_graph,
         )
 
         # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
@@ -1049,6 +1073,33 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     torch.cuda.current_stream().cuda_stream,
                 )
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+
+        if (
+            self.enable_logits_outside_graph
+            and isinstance(output, LogitsProcessorOutput)
+            and not self.is_dllm
+        ):
+            # The captured graph produced hidden_states only (LM head skipped). Run the LM head +
+            # logits_processor EAGERLY on the replayed hidden_states — outside the graph — so lm_head
+            # never lives in the captured graph. (Single-request/no-DP/no-spec; _get_pruned_states is
+            # identity for decode, so the sliced hidden reproduces the correct rows.)
+            hidden_states = output.hidden_states[: self.raw_num_token]
+            model = self.model_runner.model
+            eager_out = model.logits_processor(
+                forward_batch.input_ids[: self.raw_num_token],
+                hidden_states,
+                model.lm_head,
+                forward_batch,
+            )
+            return LogitsProcessorOutput(
+                next_token_logits=eager_out.next_token_logits,
+                hidden_states=(
+                    hidden_states
+                    if self.model_runner.server_args.enable_return_hidden_states
+                    else None
+                ),
+                customized_info=output.customized_info,
+            )
 
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:

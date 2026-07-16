@@ -315,6 +315,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.hot_token_id = None
 
     def init_lm_head(self):
+        # Quantized vocab (e.g. hybrid_int4_nvfp4): the target's embed/lm_head have no bf16 `.weight` to
+        # share (they carry `.qweight`), and dequantizing them to bf16 for sharing would cost ~GBs the card
+        # was quantized to avoid. The draft (next-n) loads its OWN vocab from the SAME checkpoint (identical
+        # quantized weights), so skip the tie and let the draft use its own — correct + VRAM-neutral.
+        tgt_model = self.target_worker.model_runner.model
+        _embed = getattr(getattr(tgt_model, "model", None), "embed_tokens", None)
+        if _embed is not None and not hasattr(_embed, "weight"):
+            logger.info(
+                "[eagle] target vocab is quantized (no bf16 .weight); draft uses its own embed/lm_head "
+                "from the same checkpoint — skipping the embed/head share."
+            )
+            return
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
         if self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head

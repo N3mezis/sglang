@@ -323,7 +323,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm", "triton"
 ]
 
 
@@ -620,6 +620,13 @@ class DeepseekSparseAttnBackend(
         metadata: DSAMetadata,
         seqlens_32_2d: torch.Tensor,
     ) -> None:
+        # deep_gemm.get_paged_mqa_logits_metadata is SM100-gated ("Unsupported architecture" on SM120).
+        # The SM120 torch-fallback indexer ignores paged_mqa_schedule_metadata (None -> fallback path), so
+        # skip the schedule build entirely on SM120.
+        from sglang.srt.utils.common import is_sm120_supported
+
+        if is_sm120_supported():
+            return
         new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
             seqlens_32_2d, 64, deep_gemm.get_num_sms()
         )
@@ -920,9 +927,14 @@ class DeepseekSparseAttnBackend(
             # NOTE: block_kv arg must be 64 here — DG computes SPLIT_KV =
             # block_kv * 4 and both DG's and the indexer's compute kernels
             # require SPLIT_KV = 256; this is independent of the cache page size.
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            from sglang.srt.utils.common import is_sm120_supported
+
+            if not is_sm120_supported():
+                # deep_gemm paged-MQA-logits metadata is sm100-only; SM120 uses the indexer torch fallback
+                # (which ignores this schedule), so leave it None.
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -1197,9 +1209,14 @@ class DeepseekSparseAttnBackend(
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
-            paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
-            )
+            from sglang.srt.utils.common import is_sm120_supported
+
+            if not is_sm120_supported():
+                # deep_gemm paged-MQA-logits metadata is sm100-only; SM120 uses the indexer torch fallback
+                # (which ignores this schedule), so leave it None.
+                paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
+                    paged_mqa_ctx_lens_2d, 64, deep_gemm.get_num_sms()
+                )
 
         metadata = DSAMetadata(
             page_size=self.real_page_size,
@@ -1856,6 +1873,15 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+        elif dsa_impl == "triton":
+            return self._forward_triton(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
         elif dsa_impl == "flashmla_sparse":
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
@@ -2045,6 +2071,15 @@ class DeepseekSparseAttnBackend(
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_tilelang(
                 q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+                v_head_dim=layer.v_head_dim,
+            )
+        elif self.dsa_decode_impl == "triton":
+            return self._forward_triton(
+                q_nope=q_nope,
+                q_rope=q_rope,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
@@ -2310,6 +2345,62 @@ class DeepseekSparseAttnBackend(
             sm_scale=sm_scale,
             d_v=v_head_dim,
         )
+
+    def _forward_triton(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        page_table_1: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        """Portable MLA attention fallback (``--dsa-*-backend triton``).
+
+        The tilelang sparse kernel needs 226 KB shared memory (> the 99 KB SM120 / consumer-Blackwell
+        limit) and fa3/flashmla/trtllm ship no SM120 kernel, so DSA has no working attention backend on
+        such GPUs. This is a plain-torch absorbed-MLA reference: gather each query's sparse KV rows
+        (``page_table_1``, ``-1``-padded), score q·kv over the fused 512-lora + 64-rope dim, softmax with
+        the ``-1`` positions masked out, and take the value (``[:512]``) weighted sum. For kv_len <= topk
+        it is exactly the sparse result. Arch-agnostic (no shared-memory ceiling); slow, but the
+        streamed-expert paging dominates decode latency anyway. A hand-written Triton kernel could replace
+        this for speed.
+
+        q_nope ``[T,H,512]`` + q_rope ``[T,H,64]`` (bf16); kv_cache ``[N,1,576]`` bf16 (``[:512]`` lora
+        value, ``[512:]`` rope key); page_table_1 ``[T,topk]`` int32. Returns ``[1,T,H,512]`` to match
+        ``_forward_tilelang``.
+        """
+        q = torch.cat([q_nope, q_rope], dim=-1)  # [T,H,576]
+        kv = kv_cache.reshape(kv_cache.shape[0], -1)  # [N,576]
+        idx = page_table_1.long()  # [T,topk], -1 padded
+        # topk is fixed at 2048, but for kv_len < topk most columns are -1 padding. The indexer left-packs
+        # valid entries, so slice to the largest populated column: for short context this cuts the gather +
+        # einsum from 2048 to ~kv_len (a huge constant-factor win; no effect once kv_len >= topk).
+        # BUT the dynamic width uses device->host syncs (.any()/.nonzero().max()) which are ILLEGAL under
+        # CUDA-graph capture — so keep full fixed width while capturing (correct, just processes all topk).
+        if not torch.cuda.is_current_stream_capturing():
+            valid = idx >= 0
+            if bool(valid.any()):
+                width = int(valid.any(dim=0).nonzero().max()) + 1
+                idx = idx[:, :width]
+        else:
+            # Under capture the dynamic width (.any()/.nonzero()) is illegal (host sync). Slice to a FIXED
+            # cap instead: valid KV <= max_total_tokens (page pool), so columns beyond it are always -1 —
+            # lossless, and it shrinks the per-layer gather/scores buffers (which dominate the graph pool)
+            # by topk/cap (2048 -> cap). SGLANG_DSA_CAPTURE_WIDTH (default 2048 = no-op).
+            import os as _os
+
+            cap = int(_os.environ.get("SGLANG_DSA_CAPTURE_WIDTH", "2048"))
+            if 0 < cap < idx.shape[1]:
+                idx = idx[:, :cap]
+        valid = idx >= 0
+        gathered = kv[idx.clamp(min=0)]  # [T,width,576] bf16
+        # bf16 QK (matmul accumulates in fp32 internally); softmax in fp32 for stability.
+        scores = torch.einsum("thd,tkd->thk", q, gathered).float() * sm_scale
+        scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+        w = torch.softmax(scores, dim=-1).to(q.dtype)  # [T,H,width]
+        out = torch.einsum("thk,tkd->thd", w, gathered[..., :v_head_dim])
+        return out.unsqueeze(0)  # [1,T,H,512]
 
     def _forward_aiter(
         self,

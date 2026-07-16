@@ -83,6 +83,22 @@ def autotune_dummy_run_mode():
         _in_autotune_dummy_run = False
 
 
+# When set, LogitsProcessor.forward computes + returns hidden_states (requires capture_hidden_mode=FULL)
+# but SKIPS the LM head, leaving next_token_logits=None. Used by enable_logits_outside_cuda_graph to keep
+# the LM head OUT of the captured decode graph — logits are computed eagerly on the replayed hidden_states.
+_skip_lm_head_capture_hidden = False
+
+
+@contextmanager
+def skip_lm_head_capture_hidden_mode():
+    global _skip_lm_head_capture_hidden
+    _skip_lm_head_capture_hidden = True
+    try:
+        yield
+    finally:
+        _skip_lm_head_capture_hidden = False
+
+
 @dataclasses.dataclass
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/sglang/srt/layers/logits_processor.py::LogitsProcessor
@@ -370,6 +386,14 @@ class LogitsProcessor(nn.Module):
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
+            if _skip_lm_head_capture_hidden:
+                # enable_logits_outside_cuda_graph capture path: surface hidden_states as the graph
+                # output and SKIP the LM head; the runner computes logits eagerly post-replay.
+                return LogitsProcessorOutput(
+                    next_token_logits=None,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (

@@ -487,6 +487,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
+                "hybrid_int4_nvfp4",  # int4 gate_up_proj is packed (.qweight, no .weight) — mirror deepseek_v2
             }
             self.shared_experts_is_int8 = (
                 not is_packed_weight

@@ -64,6 +64,52 @@ class EagerPlacement(Placement):
         return StandardCombineInput(hidden_states=hidden)
 
 
+class SharedStreamingPlacement(EagerPlacement):
+    """Shared K-slot pool (one pool aliased across ALL MoE layers, K=top_k). Each layer STREAMS its routed
+    experts into slots 0..n-1 and runs ONE grouped MoE GEMM — vs K=1's top_k masked waves. Because the pool
+    is physically shared, there is no valid cross-layer residency: reset the maps and page the distinct set
+    deterministically each layer (no keep-warm reuse — decide_keep_warm would skip-page an expert whose
+    shared slot holds a PRIOR layer's weights → silent corruption). Eager only. When distinct > K (batched),
+    falls back to the wave path (still correct)."""
+
+    needs_ondevice_store = False
+
+    def apply(self, method, layer, dispatch_output):
+        import torch
+
+        from sglang.srt.layers.moe.paged_experts.forward import (
+            _gemm_hidden,
+            _wave_apply,
+            mask_and_remap_expert_ids,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        pager = method._pager
+        topk_ids = dispatch_output.topk_output.topk_ids
+        distinct = pager.distinct_active(topk_ids)
+        if len(distinct) <= pager.K:
+            dev = pager.device
+            n = len(distinct)
+            src = torch.tensor(distinct, dtype=torch.int64, device=dev)
+            dst = torch.arange(n, dtype=torch.int64, device=dev)
+            # STREAM: page this layer's distinct experts into slots 0..n-1 of the shared pool (async H2D,
+            # same-stream-ordered with the GEMM below). Host-side plan avoids D2H syncs.
+            pager.page_in(
+                src, dst, src_host=distinct, dst_host=list(range(n)), async_h2d=True
+            )
+            # reset the residency map to EXACTLY this layer's placement (shared pool has no carry-over)
+            l2g = pager.logical_to_gpu_index_cuda
+            l2g.fill_(-1)
+            l2g[src] = dst.to(l2g.dtype)
+            remap = mask_and_remap_expert_ids(topk_ids, l2g)
+            hidden = _gemm_hidden(
+                method, layer, dispatch_output, remap, clone_hidden=False, logical_to_slot=l2g
+            )
+        else:
+            hidden = _wave_apply(method, layer, dispatch_output, topk_ids, distinct)
+        return StandardCombineInput(hidden_states=hidden)
+
+
 def _keep_warm_gemm(method, layer, dispatch_output, pager):
     """The keep-warm GEMM tail shared by the captured placements: fused remap+mask (ONE launch replacing
     the gather + 2x where + 2x zeros_like chain) with the python chain as fallback for weight layouts the

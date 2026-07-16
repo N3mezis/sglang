@@ -41,6 +41,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp8Config,
     ModelOptMixedPrecisionConfig,
 )
+from sglang.srt.layers.quantization.hybrid_int4_nvfp4 import HybridInt4NvFp4Config
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
@@ -98,6 +99,7 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "auto-round-int8": W8A8Int8Config,
     "modelslim": ModelSlimConfig,
     "quark_int4fp8_moe": QuarkInt4Fp8Config,
+    "hybrid_int4_nvfp4": HybridInt4NvFp4Config,
 }
 
 

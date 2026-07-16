@@ -614,10 +614,62 @@ class DefaultModelLoader(BaseModelLoader):
                 weights_iterator, source.prefix, self.load_config.draft_model_idx
             )
 
+        # Honor the safetensors index as the authoritative tensor manifest: a tensor physically present
+        # in a shard but ABSENT from the index is an orphan (e.g. old bf16 backbone weights left in shards
+        # that a hybrid-quant repack replaced in place via a merged index + symlinks). Filtering them is a
+        # no-op for normal checkpoints (every shard tensor is indexed) and prevents the loader from trying
+        # to load stale tensors whose module now expects a different (quantized) param layout.
+        if use_safetensors:
+            index_names = self._index_tensor_names(hf_folder)
+            if index_names:
+                weights_iterator = (
+                    (name, tensor)
+                    for (name, tensor) in weights_iterator
+                    if name in index_names
+                )
+
+        # Paged-experts (mmap/in-place store): the routed expert weights are re-read from the checkpoint
+        # by the store's own fill/page-in, so having the general loader ALSO read every expert tensor is
+        # pure waste — it faults the entire ~427 GB expert set through the OS cache on each boot (25+ min
+        # on a cold cache, and it stalled the multi-thread loader on this box). Skip ``.experts.`` tensors
+        # here; the K-slot pool is created empty and filled by the store. (Only routed experts —
+        # ``.mlp.experts.`` — are skipped; shared_experts / router gate / backbone all still load.)
+        try:
+            _sa = get_global_server_args()
+            if (
+                use_safetensors
+                and getattr(_sa, "enable_paged_experts", False)
+                and getattr(_sa, "paged_experts_store", "pinned") == "mmap"
+            ):
+                weights_iterator = (
+                    (name, tensor)
+                    for (name, tensor) in weights_iterator
+                    if ".experts." not in name
+                )
+        except Exception:
+            pass
+
         if self.counter_before_loading_weights == 0.0:
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    @staticmethod
+    def _index_tensor_names(hf_folder: str) -> set:
+        """Set of tensor names in the safetensors index (authoritative manifest), or empty if none."""
+        import json as _json
+
+        for idx_name in (
+            "model.safetensors.index.json",
+            "consolidated.safetensors.index.json",
+        ):
+            p = os.path.join(hf_folder, idx_name)
+            if os.path.exists(p):
+                try:
+                    return set(_json.load(open(p)).get("weight_map", {}).keys())
+                except Exception:
+                    return set()
+        return set()
 
     @classmethod
     def _filter_mtp_weights(

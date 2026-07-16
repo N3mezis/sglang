@@ -301,6 +301,8 @@ DSA_CHOICES = [
     "tilelang",
     "aiter",
     "trtllm",
+    "triton",  # portable torch/triton MLA fallback for consumer archs (e.g. SM120) whose shared-memory
+    # limit (99 KB) the tilelang sparse kernel (226 KB) and other DSA kernels can't meet.
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
@@ -1869,6 +1871,17 @@ class ServerArgs:
         "Directory for the --paged-experts-cold-backing disk cold tier. Must be a real disk with room for "
         "the cold tail (NOT a tmpfs like /tmp). Empty (default) uses the system temp dir.",
     ] = ""
+    paged_experts_stream: A[
+        bool,
+        Arg(
+            help="Streaming decode for --enable-paged-experts: relax the resident-K floor from top_k to 1, "
+            "so a store too large to keep even top_k experts resident (e.g. a >VRAM MoE on a small card) "
+            "sizes down to a minimal K-slot pool and STREAMS each layer's routed experts K-at-a-time from "
+            "the windowed/disk store through the on-device wave (lossless, captured). Trades throughput "
+            "(ceil(top_k/K) wave GEMMs + per-wave paging per layer) for fitting the model at all. No effect "
+            "when the store already fits top_k experts resident.",
+        ),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn
@@ -2311,6 +2324,12 @@ class ServerArgs:
     enable_return_hidden_states: A[
         bool,
         "Enable returning hidden states with responses.",
+    ] = False
+    enable_logits_outside_cuda_graph: A[
+        bool,
+        "Compute the LM head / logits EAGERLY after decode CUDA-graph replay (hidden_states captured as "
+        "the graph output). Keeps lm_head out of the captured graph so it can be host-offloaded and the "
+        "logits tail doesn't bloat the instantiated graph. Single-request/no-DP/no-spec only.",
     ] = False
     enable_return_routed_experts: A[
         bool,

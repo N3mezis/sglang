@@ -91,6 +91,8 @@ _NONPAGED_SUFFIXES = (
     "_scale_2",
     "_alphas",
     "_scale_quant",
+    "_input_scale",  # ModelOpt nvfp4 per-expert input scalar (compressed-tensors names it
+    # ..._input_global_scale, already covered by _global_scale); rides the deferred resident-scalar path.
 )
 
 
@@ -188,12 +190,27 @@ def _stage_pin_buf(name: str, k: int, row_shape, dtype) -> torch.Tensor:
 
 def discover_paged_params(layer, num_slots: int) -> Dict[str, torch.Tensor]:
     """Per-expert params on ``layer``: leading dim == num_slots (the K-slot pool) and non-empty per-slot."""
+    names = {
+        name
+        for name, _ in list(layer.named_parameters(recurse=False))
+        + list(layer.named_buffers(recurse=False))
+    }
     out = {}
     for name, p in list(layer.named_parameters(recurse=False)) + list(
         layer.named_buffers(recurse=False)
     ):
         if any(name.endswith(s) for s in _NONPAGED_SUFFIXES):
             continue
+        # ModelOpt nvfp4 keeps BOTH the raw block scale (``w13_weight_scale``) and its cutlass-swizzled
+        # copy (``w13_blockscale_swizzled``) after process_weights_after_loading; its CUTLASS apply reads
+        # ONLY the swizzled one. Page the swizzled copy (the fill writes swizzled scales there) and drop
+        # the raw duplicate — else the store doubles the (multi-GB) block-scale footprint with an inert
+        # tensor. Compressed-tensors swizzles in place under ``w13_weight_scale`` (no ``_swizzled`` sibling),
+        # so it is unaffected.
+        if name.endswith("_weight_scale"):
+            sib = name[: -len("_weight_scale")] + "_blockscale_swizzled"
+            if sib in names:
+                continue
         if p.dim() >= 1 and p.shape[0] == num_slots and p[0].numel() > 0:
             out[name] = p
     return out

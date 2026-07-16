@@ -23,7 +23,34 @@ from sglang.srt.layers.moe.paged_experts.guard import (
     check_paged_experts_compat,
     check_paged_experts_quant,
 )
-from sglang.srt.layers.moe.paged_experts.placement import make_placement
+from sglang.srt.layers.moe.paged_experts.placement import (
+    SharedStreamingPlacement,
+    make_placement,
+)
+
+# SHARED K-slot expert pool (SGLANG_PAGED_SHARED_POOL): alias every layer's K-slot params to ONE module
+# singleton so K resident experts cost K (not K*num_layers) of VRAM. Lets K = top_k fit on a small card ->
+# each layer streams its routed experts into the shared pool + runs ONE grouped GEMM (vs top_k masked waves
+# at K=1). Eager only; the paged slot content is throwaway (page_in repopulates per layer) so last-writer-
+# wins during load is harmless. See SharedStreamingPlacement.
+_SHARED_POOL_ON = os.environ.get("SGLANG_PAGED_SHARED_POOL", "0") != "0"
+_SHARED_POOL: dict = {}
+
+
+def _alias_shared_pool(layer, k: int) -> None:
+    """Rebind each K-slot param's storage to the module singleton (first layer donates it; later layers
+    alias, freeing their own storage). Called in create_weights (weights) + PWAL (scales/alphas) so nothing
+    accumulates K*num_layers during construction."""
+    for name, p in list(layer.named_parameters(recurse=False)) + list(
+        layer.named_buffers(recurse=False)
+    ):
+        if not (isinstance(p, torch.Tensor) and p.dim() >= 1 and p.shape[0] == k):
+            continue
+        cur = _SHARED_POOL.get(name)
+        if cur is None:
+            _SHARED_POOL[name] = p
+        elif p.data.data_ptr() != cur.data.data_ptr():
+            p.data = cur.data
 from sglang.srt.layers.moe.paged_experts.sizing import (
     compute_num_resident_experts,
     compute_window_experts,
@@ -245,6 +272,9 @@ def resolve_num_resident_experts(
     free = _PRE_LOAD_FREE_BYTES or torch.cuda.mem_get_info()[0]
     top_k = getattr(htc, "num_experts_per_tok", 8) or 8
     mem_frac = sa.mem_fraction_static or 0.85
+    # --paged-experts-stream: relax the resident floor from top_k to 1 so a store too large to keep even
+    # top_k experts resident sizes to a minimal pool and streams the routed experts K-at-a-time.
+    stream = bool(getattr(sa, "paged_experts_stream", False))
     k = compute_num_resident_experts(
         free_vram_bytes=free,
         mem_fraction=mem_frac,
@@ -254,10 +284,11 @@ def resolve_num_resident_experts(
         per_expert_layer_bytes=per_el,
         top_k=top_k,
         num_experts=num_experts_E,
+        min_k=1 if stream else 0,
     )
     logger.info(
         "[paged-experts] resident K=%d/%d (%d%%): free=%.2fGB mem_fraction=%.3f "
-        "nonexpert=%.2fGB(%s) KV_reserve=%.2fGB per_expert=%.2fMB moe_layers=%d",
+        "nonexpert=%.2fGB(%s) KV_reserve=%.2fGB per_expert=%.2fMB moe_layers=%d%s",
         k,
         num_experts_E,
         k * 100 // num_experts_E,
@@ -268,6 +299,7 @@ def resolve_num_resident_experts(
         kv_reserve / 1e9,
         per_el / 1e6,
         moe_layers,
+        " [STREAM: floor=1, wave K-at-a-time]" if stream and k < top_k else "",
     )
     return k
 
@@ -434,14 +466,58 @@ def _make_method_class():
             if getattr(layer, "_num_local_routed", None) is not None:
                 layer._num_local_routed = self.num_resident
                 layer._num_global_routed = self.num_resident
-            self.base_method.create_weights(
-                layer=layer,
-                num_experts=self.num_resident,
-                hidden_size=hidden_size,
-                intermediate_size_per_partition=intermediate_size_per_partition,
-                params_dtype=params_dtype,
-                **extra,
-            )
+            # Some base methods size SOME per-expert params from the ``num_experts`` arg (K) but OTHERS
+            # from ``layer.num_experts`` (still the global E here) — e.g. ModelOpt NVFP4 registers the
+            # packed weights [K,...] but the input/global scale scalars [E,...] (modelopt_quant.py:1917).
+            # That inconsistency breaks the cutlass fp4 expert-quant, which derives n_experts from the
+            # input-scale length and checks it against the K-sized expert_offsets (nvfp4_expert_quant.cuh:
+            # n_experts+1 == offset_size). Swap ``layer.num_experts`` to K for the base call so EVERY param
+            # sizes to the K-slot pool consistently; restore E afterward (routing/topk still needs E).
+            saved_ne = getattr(layer, "num_experts", None)
+            if saved_ne is not None:
+                layer.num_experts = self.num_resident
+            try:
+                self.base_method.create_weights(
+                    layer=layer,
+                    num_experts=self.num_resident,
+                    hidden_size=hidden_size,
+                    intermediate_size_per_partition=intermediate_size_per_partition,
+                    params_dtype=params_dtype,
+                    **extra,
+                )
+            finally:
+                if saved_ne is not None:
+                    layer.num_experts = saved_ne
+            # ModelOpt NVFP4 marks its per-expert global/input scale params ``_sglang_require_global_experts``
+            # (load all E) and does not always stamp a FusedMoE ``quant_method`` granularity on them. Under
+            # paging the pool is only K, so those all-E loads overflow the K-slot param, and the loader falls
+            # to the per-tensor scale path which then rejects the missing granularity ("quant method must be
+            # one of ..."). These K-slot scalars are VESTIGIAL for paging anyway — the pager supplies the
+            # authoritative resident scalars via ``method._nvfp4_full_e`` (scattered per-step by
+            # ``_refresh_nvfp4_scalars``). So make them load benignly K-local: per-tensor granularity, no
+            # global-experts requirement. Their loaded values are overwritten at forward time.
+            for _n, _p in list(layer.named_parameters(recurse=False)):
+                if "scale" not in _n or getattr(_p, "quant_method", None) is not None:
+                    continue
+                # ModelOpt nvfp4 create_weights never stamps a FusedMoE granularity on its scale params
+                # (its quant_method .update()s are dead — no set_weight_attrs), so the FusedMoE loader's
+                # per-expert scale path rejects them under paging. Stamp the intended granularity: the raw
+                # block scale is per-group (BLOCK); the per-expert global/input scalars are per-tensor.
+                if _n.endswith("weight_scale"):  # block scale (not *_scale_2)
+                    _p.quant_method = "block"
+                elif _n.endswith(("weight_scale_2", "input_scale")):
+                    _p.quant_method = "tensor"
+                else:
+                    continue
+                # These K-slot scale params are VESTIGIAL for paging (the in-place store swizzles block
+                # scales at page-in; the pager supplies the resident scalars via _nvfp4_full_e), so their
+                # loaded values are overwritten — they only need to load without erroring.
+                if hasattr(_p, "_sglang_require_global_experts"):
+                    _p._sglang_require_global_experts = False
+            # Shared pool: alias the packed WEIGHTS now (they exist post-base-create_weights) so 75 layers'
+            # K-slot weights don't accumulate in VRAM during construction. Scales/alphas alias in PWAL.
+            if _SHARED_POOL_ON:
+                _alias_shared_pool(layer, self.num_resident)
 
         def create_moe_runner(self, layer, moe_runner_config):
             from dataclasses import replace
@@ -468,6 +544,12 @@ def _make_method_class():
                 finally:
                     if saved_ne is not None:
                         layer.num_experts = saved_ne
+            # Shared pool: alias the swizzled scales + resident scalars (born in the base PWAL above) to the
+            # module singleton, and force the streaming placement (one grouped GEMM/layer, no keep-warm).
+            if _SHARED_POOL_ON:
+                _alias_shared_pool(layer, self.num_resident)
+                self.window = 0
+                self._placement = SharedStreamingPlacement()
             if self.window is None:
                 # Deferred window sizing: the ceiling probe runs here, after the loader — cached, so the
                 # first layer resolves it and every layer shares the same W.
@@ -541,7 +623,9 @@ def make_for_layer(
     _MOE_LAYER_ORD += 1
     if num_resident == "auto":
         K = resolve_num_resident_experts(E, nonexpert_reserve_gb=nonexpert_reserve_gb)
-        alloc = resolve_k_alloc(E)
+        # Streaming mode uses a minimal uniform K (floor 1); the per-layer waterfill (L4) is a full-pin
+        # budget-allocation lever that doesn't apply to a 1-slot streaming pool.
+        alloc = None if getattr(server_args, "paged_experts_stream", False) else resolve_k_alloc(E)
         if alloc is not None and _ord < len(alloc):
             K = int(alloc[_ord])  # L4: waterfilled per-layer K (same total budget as uniform)
     else:

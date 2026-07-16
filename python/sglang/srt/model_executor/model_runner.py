@@ -32,6 +32,25 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+# Paged-experts wall-clock bracket (SGLANG_PE_TIMING=1): lazily resolve the shared _stage accumulator to
+# attribute per-token time to the sampling step (logits preprocess + sampler).
+_PE_SAMPLE_STAGE = "unset"
+
+
+def _pe_sample_stage():
+    global _PE_SAMPLE_STAGE
+    if _PE_SAMPLE_STAGE == "unset":
+        try:
+            from sglang.srt.layers.moe.paged_experts.inplace_nvfp4_store import (
+                _PE_TIMING,
+                _stage,
+            )
+
+            _PE_SAMPLE_STAGE = _stage if _PE_TIMING else None
+        except Exception:
+            _PE_SAMPLE_STAGE = None
+    return _PE_SAMPLE_STAGE
+
 from sglang.jit_kernel.ngram_embedding import update_token_table_decode
 from sglang.srt.configs import (
     BailingHybridConfig,
@@ -3198,6 +3217,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
+        _stg = _pe_sample_stage()
+        if _stg is not None:
+            import time as _pet
+
+            _s0 = _pet.perf_counter_ns()
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
@@ -3215,6 +3239,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ),
         )
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
+        if _stg is not None:
+            torch.cuda.current_stream().synchronize()
+            _stg("sampling", _pet.perf_counter_ns() - _s0)
         return next_token_ids
 
     def compute_logprobs_only(

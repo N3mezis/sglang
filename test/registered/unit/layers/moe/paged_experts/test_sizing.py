@@ -94,6 +94,31 @@ class TestPagedExpertsSizing(CustomTestCase):
         K_ss = compute_num_resident_experts(kv_reserve_bytes=single_stream, **common)
         self.assertGreater(K_ss, 8)  # ~92/128 — not starved by a phantom KV reserve
 
+    def test_stream_min_k_relaxes_topk_floor(self):
+        # --paged-experts-stream (min_k=1): a store too large to keep even top_k experts resident sizes
+        # DOWN to a minimal pool and streams K-at-a-time via the windowed wave, instead of clamping to a
+        # top_k pool that won't fit (OOM). GLM-5.2-NVFP4 geometry: 256 experts, top_k 8, 75 MoE layers,
+        # ~2.9 GB/expert across layers, non-expert 11.24 GB — on a 16 GB card a top_k=8 pool needs ~23 GB.
+        glm = dict(
+            mem_fraction=0.9,
+            nonexpert_bytes=11.24e9,
+            kv_reserve_bytes=0,
+            moe_layers=75,
+            per_expert_layer_bytes=38.88e6,
+            top_k=8,
+            num_experts=256,
+        )
+        # Default floor (top_k): clamps UP to 8 even though only ~1 fits the 3.16 GB budget -> OOM at load.
+        self.assertEqual(compute_num_resident_experts(free_vram_bytes=16e9, **glm), 8)
+        # Streaming floor (min_k=1): sizes to the 1 expert that fits -> the model boots and streams.
+        self.assertEqual(
+            compute_num_resident_experts(free_vram_bytes=16e9, min_k=1, **glm), 1
+        )
+        # min_k does NOT force K down when the budget allows more — a fitting model keeps its large K.
+        self.assertGreater(
+            compute_num_resident_experts(free_vram_bytes=200e9, min_k=1, **glm), 8
+        )
+
 
 class TestComputeWindowExperts(CustomTestCase):
     # 48 moe layers, ~0.47 GB per expert across all layers (bf16-30B-ish: 9.72 MB/layer).

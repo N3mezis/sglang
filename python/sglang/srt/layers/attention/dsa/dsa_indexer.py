@@ -780,6 +780,12 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
+        # Breakable/piecewise CUDA graph passes metadata=None (forward_cuda defers the fetch to avoid a
+        # Dynamo identity guard). The breakable decode backend uses tc_compiler='eager' (no Dynamo), so it
+        # is safe to fetch it here — mirrors the prefill split op (get_attn_backend().get_indexer_metadata).
+        if metadata is None:
+            metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
+
         page_size = get_token_to_kv_pool().page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
         if _is_hip:
@@ -843,7 +849,12 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
-        if _is_cuda:
+        from sglang.srt.utils.common import is_sm120_supported
+
+        _is_sm120 = is_sm120_supported()
+        if _is_cuda and not _is_sm120:
+            # SM120 (consumer Blackwell) skips this: deep_gemm's paged-MQA-logits kernel is sm100-only
+            # (Unsupported architecture), and the SM120 torch fallback below ignores the schedule metadata.
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
@@ -859,7 +870,25 @@ class Indexer(MultiPlatformOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        if _is_hip:
+        if _is_sm120:
+            # deep_gemm's fp8_paged_mqa_logits is sm100-only; use the DSv4 pure-torch equivalent
+            # (same signature; bmm-based, CUDA-graph-safe). Decode path: next_n=1.
+            from sglang.srt.layers.attention.dsv4.indexer import (
+                fp8_paged_mqa_logits_torch_sm120,
+            )
+
+            q_fp8 = q_fp8.unsqueeze(1)
+            logits = fp8_paged_mqa_logits_torch_sm120(
+                q_fp8[:q_offset],
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_32_2d,
+                block_tables,
+                None,
+                max_seq_len,
+                clean_logits=False,
+            )
+        elif _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
             q_fp8 = q_fp8.unsqueeze(1)

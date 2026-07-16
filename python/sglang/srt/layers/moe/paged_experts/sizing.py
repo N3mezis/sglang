@@ -26,8 +26,10 @@ def compute_num_resident_experts(
     per_expert_layer_bytes: float,
     top_k: int,
     num_experts: int,
+    min_k: int = 0,
 ) -> int:
-    """Largest K that fits, clamped to ``[top_k, num_experts]``.
+    """Largest K that fits, clamped to ``[floor, num_experts]`` where ``floor`` = ``min_k`` if given
+    (streaming mode, ``--paged-experts-stream``, uses 1) else ``top_k``.
 
     ``free_vram_bytes`` is the PRE-load free memory: sglang reserves ``free*(1-mem_fraction)`` for
     activations + cuda graphs and gives the rest to weights + KV, and the K-slot pool is "weights", so
@@ -45,9 +47,14 @@ def compute_num_resident_experts(
     budget = (
         free_vram_bytes * mem_fraction - nonexpert_bytes
     )  # shared by the K-slot pool AND the KV pool
-    kv_reserve_bytes = max(0.0, min(kv_reserve_bytes, budget - top_k * per_expert_pool))
+    # ``min_k`` (streaming mode) relaxes the resident floor from top_k to 1: a store too large to keep even
+    # top_k experts resident sizes down to a minimal pool and streams the routed experts K-at-a-time through
+    # the windowed/disk wave (lossless), instead of clamping to a top_k pool that won't fit. Default 0 -> the
+    # top_k floor (keep-warm needs top_k resident to serve a token in one GEMM).
+    floor = min_k if min_k > 0 else top_k
+    kv_reserve_bytes = max(0.0, min(kv_reserve_bytes, budget - floor * per_expert_pool))
     k = int((budget - kv_reserve_bytes) / per_expert_pool)
-    return max(top_k, min(num_experts, k))
+    return max(floor, min(num_experts, k))
 
 
 def compute_window_experts(
