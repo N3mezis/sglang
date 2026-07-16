@@ -76,14 +76,15 @@ class ChunkCache(BasePrefixCache):
         # ChunkCache does not support prefix caching, so insert is a no-op
         return InsertResult(prefix_len=0)
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        kv_committed_len = req.pop_committed_kv_cache()
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
         # KV-streaming 4b'-2: a windowed request's low range [0, _kvwin_freed_upto) was already freed
         # per-step by the device-slot ring hook (alloc_for_decode); skip it to avoid a double-free.
         start = getattr(req, "_kvwin_freed_upto", 0)
         # For decode server: if req.output_ids is empty, we want to free all req.origin_input_ids
         kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, start:kv_committed_len
+            req.req_pool_idx, start:kv_len_to_handle
         ]
         self.token_to_kv_pool_allocator.free(kv_indices)
 
@@ -153,13 +154,15 @@ class PureSWAChunkCache(SWAChunkCache):
     prefix is released here when the request finishes.
     """
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True):
-        kv_committed_len = req.pop_committed_kv_cache()
+    def cache_finished_req(
+        self, req: Req, is_insert: bool = True, *, kv_len_to_handle: int
+    ):
+        kv_committed_len = kv_len_to_handle
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
         evict_floor = req.swa_evict_floor
-        evicted_seqlen = req.swa_evicted_seqlen
+        evicted_seqlen = req.kv.swa_evicted_seqlen
         if evicted_seqlen > evict_floor:
             parts = []
             if evict_floor > 0:
