@@ -195,6 +195,19 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
             return [self._alloc_full_buffer(o, size) for o in output]
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            # e.g. LogitsProcessorOutput (logits-outside-graph capture): a same-structure buffer with
+            # `size` leading rows for the per-token tensor fields; non-tensor fields carried as-is.
+            return dataclasses.replace(
+                output,
+                **{
+                    f.name: getattr(output, f.name).new_empty(
+                        (size, *getattr(output, f.name).shape[1:])
+                    )
+                    for f in dataclasses.fields(output)
+                    if torch.is_tensor(getattr(output, f.name))
+                },
+            )
         raise TypeError(f"Unsupported BCG output type: {type(output)}")
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
