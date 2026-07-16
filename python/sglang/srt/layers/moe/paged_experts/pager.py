@@ -1363,10 +1363,12 @@ class ExpertPager:
         ids = pair[0].tolist()
         slots = pair[1].tolist()
         self._stage_cold_into_slots(ids, slots)
+        # Ring Stage 1: the CROSS-STEP temporal prefetch was measured net-negative here (4.04 -> 4.86 s/tok:
+        # ~40% Jaccard coverage leaves most reads synchronous while the prefetched set competes for the disk
+        # and the step-boundary drain blocks). The WITHIN-STEP prefetch (parallelize the layer's distinct
+        # cold set at the first break, all consumed same-step) is the path — see docs/design/paged-experts-ring.md.
         if _PROF["on"]:
-            # Measurement only: let the per-step [pe-prof] printer report the WAVE regime (token time +
-            # eager staging gather/h2d fraction) — the deterministic split that gates wave double-buffering.
-            _ensure_bcg_post_step_hook()
+            _ensure_bcg_post_step_hook()  # measurement-only, as before
 
     def reset_residency_ondevice(self) -> None:
         """Clear the keep-warm residency maps after a windowed wave step. A windowed wave stages only the

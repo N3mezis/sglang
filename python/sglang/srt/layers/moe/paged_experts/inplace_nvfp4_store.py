@@ -677,6 +677,11 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
 
     def prefetch_cold(self, experts, force=False):
         return  # cold reads are synchronous in gather_rows_into; no mmap read-ahead tier
+        # Ring Stage 1 (TODO, within-step): an async deep-QD staging tier here (submit _read_cold_tensor on
+        # a pool into a bounded LRU pinned pool; gather_rows_into waits+copies) would overlap the layer's
+        # distinct cold reads. Kick it at the FIRST break with the full distinct set (read _cur_topk_ids) so
+        # all reads run same-step in parallel. The CROSS-STEP temporal variant was measured net-negative
+        # (4.04->4.86 s/tok, ~40% Jaccard + disk contention + step-boundary drain). See paged-experts-ring.md.
 
     # ---- eager fallback (off-graph prefill / eager decode) -----------------------------------------
     def page_in(self, src_experts, dst_slots, *, stage_bank=0, async_h2d=False, src_host=None):
