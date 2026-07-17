@@ -688,7 +688,13 @@ class ExpertPager:
         return ctx
 
     def distinct_active(self, topk_ids: torch.Tensor):
-        """Sorted distinct active (>=0) expert ids this step, as a host list (one host sync)."""
+        """Sorted distinct active (>=0) expert ids this step, as a host list (one host sync).
+
+        NOTE (2026-07-17): a bs=1 CPU-dedup fast-path (skip torch.unique) was tried and MEASURED WORSE in a
+        same-box A/B (1.69→1.91 s/tok) + changed the greedy trajectory. torch.unique's ~14% py-spy self-time
+        is overlapped CPU dispatch, NOT critical-path wall-clock (the standing py-spy caveat), and its SORTED
+        order gives better expert-paging locality than insertion order. Kept torch.unique. Do not "optimize"
+        this off a profiler self-time number without an A/B."""
         return [int(e) for e in torch.unique(topk_ids).tolist() if e >= 0]
 
     def decide_keep_warm(self, topk_ids: torch.Tensor, distinct=None):

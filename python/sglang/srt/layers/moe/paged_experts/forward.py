@@ -664,6 +664,8 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
         ts.wait_stream(cs)
     out = None
     group, base = [], 0
+    _cap = _diff_wave_active(layer, dispatch_output)  # Hole-A per-wave capture (decode only)
+    _capw = [] if _cap else None
     for i, group in enumerate(groups):
         b = i & 1
         base = b * half if banked else 0
@@ -717,6 +719,10 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
         if banked:
             ev_gemm[b].record(cs)
         out = partial if out is None else out + partial
+        if _cap:
+            _capw.append((int(group[0]), partial))  # (expert_id, weighted cutlass output w_e*f_e(h))
+    if _cap:
+        _diff_record_wave(layer, dispatch_output, _capw)
     if banked:
         # the NEXT step's page_in gathers into the shared staging buffers from the CPU side, which no
         # stream ordering protects — drain this step's H2D before returning (GEMMs stay async)
@@ -831,6 +837,54 @@ def _ondevice_bounded_wave_apply(method, layer, dispatch_output, topk_ids):
         out = partial if out is None else out + partial
     pager.reset_residency_ondevice()
     return out
+
+
+_DIFF_CAP = os.environ.get("SGLANG_DIFF_CAPTURE", "0") == "1"
+_DIFF_LAYERS = {
+    int(x) for x in os.environ.get("SGLANG_DIFF_LAYERS", "10,40,70").split(",") if x.strip()
+}
+_DIFF_OUT = os.environ.get("SGLANG_DIFF_OUT", "/root/.cache/huggingface/_diff")  # HF mount -> persists to host
+_DIFF_NTOK = int(os.environ.get("SGLANG_DIFF_NTOK", "40"))
+_diff_done: dict = {}
+_diff_tokens: dict = {}
+
+
+def _diff_record_wave(layer, dispatch_output, partials) -> None:
+    """Hole-A PER-WAVE capture (decode; the wave loop runs per decode token, one expert per wave at K=1).
+    Accumulates, per target layer, up to _DIFF_NTOK decode tokens of {h, native top-8 ids+weights, per-expert
+    cutlass WEIGHTED partial (w_e·f_e(h)) per wave}. Offline divides by w_e -> cutlass f_e(h), compares to a
+    bf16-dequant reference PER RANK (rank-1 = positive control, must match; rank-5-8 = the Hole-A test)."""
+    import logging
+
+    lid = getattr(layer, "layer_id", None)
+    lst = _diff_tokens.setdefault(lid, [])
+    try:
+        to = dispatch_output.topk_output
+        lst.append({
+            "h": dispatch_output.hidden_states.detach().float().cpu(),
+            "topk_ids": to.topk_ids.detach().cpu(),
+            "topk_weights": to.topk_weights.detach().float().cpu(),
+            "partials": [(int(e), p.detach().float().cpu()) for e, p in partials],
+        })
+        if len(lst) >= _DIFF_NTOK:
+            import os as _os
+            _os.makedirs(_DIFF_OUT, exist_ok=True)
+            torch.save({"layer_id": int(lid), "tokens": lst}, _os.path.join(_DIFF_OUT, f"wave_{int(lid)}.pt"))
+            _diff_done[lid] = True
+            logging.getLogger(__name__).info(
+                "[diff-capture] layer %s: %d decode tokens x %d waves -> %s [%d/%d]",
+                lid, len(lst), len(partials), _DIFF_OUT, len(_diff_done), len(_DIFF_LAYERS))
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).error("[diff-capture] layer %s failed: %r", lid, e)
+
+
+def _diff_wave_active(layer, dispatch_output) -> bool:
+    lid = getattr(layer, "layer_id", None)
+    return (
+        _DIFF_CAP and lid in _DIFF_LAYERS and lid not in _diff_done
+        and dispatch_output.hidden_states.shape[0] == 1  # decode (per-wave loop runs here, not prefill)
+        and not torch.cuda.is_current_stream_capturing()
+    )
 
 
 def paged_apply(method, layer, dispatch_output):
