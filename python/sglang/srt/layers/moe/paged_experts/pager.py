@@ -1024,6 +1024,9 @@ def _experts_prefix(wmap: Dict[str, str], layer_idx: int) -> str:
     for pre in (
         f"model.layers.{layer_idx}.mlp.experts.",
         f"model.language_model.layers.{layer_idx}.mlp.experts.",
+        # Gemma-4 VL MoE: text tower nested under model.language_model, experts directly under the
+        # layer (no .mlp.) as stacked fused tensors (experts.gate_up_proj / experts.down_proj).
+        f"model.language_model.layers.{layer_idx}.experts.",
         # Mistral consolidated native layout (Mistral-Small-4 nvfp4): no model./mlp. nesting.
         f"layers.{layer_idx}.experts.",
     ):
@@ -1147,6 +1150,16 @@ def _fill_bf16_from_checkpoint(
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
     dt = store.gpu["w13_weight"].dtype
+    # Gemma-4-style STACKED FUSED experts: one tensor per projection holding all E experts, gate+up
+    # already fused. gate_up_proj [E, 2*inter, hidden] == w13, down_proj [E, hidden, inter] == w2 (same
+    # orientation as the store), so copy each expert row straight across.
+    if f"{pre}gate_up_proj" in wmap:
+        for stem, dst in (("gate_up_proj", "w13_weight"), ("down_proj", "w2_weight")):
+            with safe_open(os.path.join(snap, wmap[f"{pre}{stem}"]), framework="pt") as f:
+                stacked = f.get_tensor(f"{pre}{stem}")  # [E, ...]
+            for e in range(store.E):
+                store.row(dst, e).copy_(stacked[e].to(dt))
+        return
     by_shard: Dict[str, list] = {}
     for e in range(store.E):
         for proj in ("gate_proj", "up_proj", "down_proj"):
