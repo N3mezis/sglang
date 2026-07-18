@@ -115,9 +115,13 @@ def check_paged_experts_quant(hf_text_config: Any) -> None:
             f"checkpoint uses format={fmt or 'unknown'!r}. Use an nvfp4-pack, block-quant fp8, "
             "GPTQ int4, or unquantized checkpoint, or run without --enable-paged-experts."
         )
+    if quant_method == "mxfp4":
+        # MXFP4 (gpt-oss): packed fp4 weights + per-group-of-32 e8m0 block scales + per-expert bf16
+        # biases, filled via the Marlin mxfp4 repack (SM90/SM120). See _fill_mxfp4_from_checkpoint.
+        return
     raise RuntimeError(
         f"Paged Experts does not support quant_method={quant_method or 'unknown'!r}: the host "
-        "store handles unquantized (bf16/fp16), gptq-marlin int4, and fp8 block-quant checkpoints "
-        "only. Other packings (e.g. AWQ) would be routed through the wrong fill and load wrong "
-        "weights. Use a supported checkpoint, or run without --enable-paged-experts."
+        "store handles unquantized (bf16/fp16), gptq-marlin int4, fp8 block-quant, and mxfp4 "
+        "checkpoints only. Other packings (e.g. AWQ) would be routed through the wrong fill and load "
+        "wrong weights. Use a supported checkpoint, or run without --enable-paged-experts."
     )

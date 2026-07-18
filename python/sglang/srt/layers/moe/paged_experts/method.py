@@ -150,6 +150,10 @@ def _moe_geometry():
             # 4-bit packed weights + one fp8 block scale per 16 weights (8/16 = 0.5 bit-equiv);
             # tiny per-expert global scalars are negligible. ~4.5 effective bits/weight.
             bits = 4.5
+        elif qm == "mxfp4":
+            # 4-bit packed weights + one e8m0 (1 byte) block scale per 32 weights (8/32 = 0.25);
+            # per-expert bf16 biases ride the ~3% margin. ~4.25 effective bits/weight.
+            bits = 4.25
         else:
             bits = qc.get("bits") or qc.get("weights", {}).get("num_bits") or 16
     # Most MoE configs expose ``moe_intermediate_size``; some (e.g. gpt-oss) only carry

@@ -1140,6 +1140,91 @@ def _fill_gptq_marlin_from_checkpoint(
         store.fill_tensor(name, t)
 
 
+def _fill_mxfp4_from_checkpoint(
+    store: ExpertStore, model_path: str, layer_idx: int
+) -> None:
+    """MXFP4 (gpt-oss): reproduce the Mxfp4MarlinMoEMethod load+repack for ALL E experts into the host
+    store. The checkpoint stores STACKED FUSED experts under ``...experts.``:
+    ``gate_up_proj_blocks`` u8 [E, 2*inter, hidden//32, 16] (packed fp4, 16 B = 32 vals), ``_scales``
+    u8 [E, 2*inter, hidden//32] (e8m0), ``_bias`` bf16 [E, 2*inter]; ``down_proj_*`` likewise on
+    [E, hidden, ...]. Load them into the base method's PADDED pre-repack buffers (hidden->round_up(256),
+    inter->round_up(128); gate/up occupy the two intermediate halves with per-half padding), run
+    ``prepare_moe_mxfp4_layer_for_marlin``, then fill every store tensor from the repacked result. All
+    tensors (marlin weights + scales + permuted biases) page per-expert.
+    """
+    from safetensors import safe_open
+
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        deinterleave_moe_mxfp4_w13_for_marlin,
+        prepare_moe_mxfp4_layer_for_marlin,
+    )
+    from sglang.srt.utils import round_up
+
+    snap = _snapshot_dir(model_path)
+    cfg = json.load(open(os.path.join(snap, "config.json")))
+    tcfg = cfg.get("text_config", cfg)
+    hidden = tcfg["hidden_size"]
+    inter = tcfg.get("moe_intermediate_size") or tcfg["intermediate_size"]
+    wmap = _weight_map(snap)
+    pre = _experts_prefix(wmap, layer_idx)
+    E = store.E
+    p_inter, p_hidden = round_up(inter, 128), round_up(hidden, 256)
+
+    def load(stem: str) -> torch.Tensor:
+        name = f"{pre}{stem}"
+        with safe_open(os.path.join(snap, wmap[name]), framework="pt") as f:
+            return f.get_tensor(name)
+
+    gu_b = load("gate_up_proj_blocks").reshape(E, 2 * inter, hidden // 2).view(torch.int8)
+    dn_b = load("down_proj_blocks").reshape(E, hidden, inter // 2).view(torch.int8)
+    gu_s = load("gate_up_proj_scales").view(torch.uint8)  # [E, 2*inter, hidden//32]
+    dn_s = load("down_proj_scales").view(torch.uint8)  # [E, hidden, inter//32]
+    gu_bias = load("gate_up_proj_bias")  # [E, 2*inter] bf16
+    dn_bias = load("down_proj_bias")  # [E, hidden]
+
+    e8 = torch.float8_e8m0fnu
+    # Match the base method's create_weights buffers (intermediate padded to p_inter, hidden to p_hidden).
+    # gpt-oss's gate/up rows are INTERLEAVED [g0,u0,g1,u1,...]; the loader places the 2*inter real rows
+    # contiguously in [:2*inter] (rest is pad), then deinterleave_moe_mxfp4_w13_for_marlin (below) views
+    # [.., p_inter, 2, ..] to split into [gate; up]. w2 (down) has no gate/up split.
+    w13 = torch.zeros(E, 2 * p_inter, p_hidden // 2, dtype=torch.int8)
+    w2 = torch.zeros(E, p_hidden, p_inter // 2, dtype=torch.int8)
+    w13_s = torch.full((E, 2 * p_inter, p_hidden // 32), 127, dtype=torch.uint8)
+    w2_s = torch.full((E, p_hidden, p_inter // 32), 127, dtype=torch.uint8)
+    w13_bias = torch.zeros(E, 2 * p_inter, dtype=gu_bias.dtype)
+    w2_bias = torch.zeros(E, p_hidden, dtype=dn_bias.dtype)
+    w13[:, : 2 * inter, : hidden // 2] = gu_b
+    w13_s[:, : 2 * inter, : hidden // 32] = gu_s
+    w13_bias[:, : 2 * inter] = gu_bias
+    w2[:, :hidden, : inter // 2] = dn_b
+    w2_s[:, :hidden, : inter // 32] = dn_s
+    w2_bias[:, :hidden] = dn_bias
+
+    dev = store.device
+    mock = torch.nn.Module()
+    mock.hidden_size = hidden
+    mock.orig_dtype = gu_bias.dtype
+    for n, t in (
+        ("w13_weight", w13),
+        ("w2_weight", w2),
+        ("w13_weight_scale_inv", w13_s.view(e8)),
+        ("w2_weight_scale_inv", w2_s.view(e8)),
+        ("w13_weight_bias", w13_bias),
+        ("w2_weight_bias", w2_bias),
+    ):
+        setattr(mock, n, torch.nn.Parameter(t.to(dev), requires_grad=False))
+    # gpt-oss stores gate/up interleaved (swiglu with gemm1_alpha); match the base method's
+    # deinterleave-then-repack order so the paged weights equal the native load.
+    deinterleave_moe_mxfp4_w13_for_marlin(mock)
+    prepare_moe_mxfp4_layer_for_marlin(mock)
+
+    for name in store.gpu:
+        t = getattr(mock, name).data.contiguous().cpu()
+        expected = (E, *store.gpu[name].shape[1:])
+        assert tuple(t.shape) == expected, (name, tuple(t.shape), expected)
+        store.fill_tensor(name, t)
+
+
 def _fill_bf16_from_checkpoint(
     store: ExpertStore, model_path: str, layer_idx: int
 ) -> None:
@@ -1467,6 +1552,11 @@ def setup_pager(method, layer) -> ExpertPager:
             "w13_weight_scale_inv" in store.gpu
         ):  # fp8 block-quant (weights + block scales)
             _fill_fp8_block_from_checkpoint(store, model_path, layer_idx)
+        elif (
+            "w13_weight_bias" in store.gpu
+        ):  # mxfp4 (marlin: packed weights + e8m0 scales + per-expert biases) — checked before
+            # nvfp4 because the post-repack store also has w13_weight_scale; the biases are mxfp4-only.
+            _fill_mxfp4_from_checkpoint(store, model_path, layer_idx)
         elif (
             "w13_weight_scale" in store.gpu
         ):  # nvfp4 (packed uint8 + swizzled fp8 block scales)

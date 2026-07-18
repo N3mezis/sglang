@@ -949,6 +949,15 @@ class GptOssForCausalLM(nn.Module):
         assert self.config.num_local_experts % moe_ep_size == 0
         moe_num_global_experts = self.config.num_local_experts
         moe_num_local_experts = self.config.num_local_experts // moe_ep_size
+        # Paged Experts wraps the FusedMoE with a K-slot resident table (num_local_experts=K < E), so
+        # the base expert buffers this loader fills are sized to K. Cap the per-rank expert count to the
+        # param's actual first dim so the [start:end] narrow matches (no-op when K == E / not paged).
+        _paged_k = next(
+            (p.shape[0] for n, p in params_dict.items() if n.endswith("experts.w13_weight")),
+            None,
+        )
+        if _paged_k is not None and _paged_k < moe_num_local_experts:
+            moe_num_local_experts = _paged_k
 
         moe_tp_rank_start = moe_tp_rank * per_rank_intermediate_size
         moe_tp_rank_end = min(
