@@ -152,7 +152,11 @@ def _moe_geometry():
             bits = 4.5
         else:
             bits = qc.get("bits") or qc.get("weights", {}).get("num_bits") or 16
-    per_el = 3 * htc.moe_intermediate_size * htc.hidden_size * (bits / 8.0) * 1.03
+    # Most MoE configs expose ``moe_intermediate_size``; some (e.g. gpt-oss) only carry
+    # ``intermediate_size``. Fall back so this sizing estimate — which runs before the quant guard —
+    # doesn't AttributeError on an unsupported arch/quant before the guard can reject it cleanly.
+    moe_inter = getattr(htc, "moe_intermediate_size", None) or htc.intermediate_size
+    per_el = 3 * moe_inter * htc.hidden_size * (bits / 8.0) * 1.03
     return mc, htc, moe_layers, per_el
 
 
