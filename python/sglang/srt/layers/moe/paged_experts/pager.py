@@ -1027,6 +1027,8 @@ def _experts_prefix(wmap: Dict[str, str], layer_idx: int) -> str:
         # Gemma-4 VL MoE: text tower nested under model.language_model, experts directly under the
         # layer (no .mlp.) as stacked fused tensors (experts.gate_up_proj / experts.down_proj).
         f"model.language_model.layers.{layer_idx}.experts.",
+        # Mixtral / Mistral MoE: experts under block_sparse_moe (proj stems w1/w3/w2).
+        f"model.layers.{layer_idx}.block_sparse_moe.experts.",
         # Mistral consolidated native layout (Mistral-Small-4 nvfp4): no model./mlp. nesting.
         f"layers.{layer_idx}.experts.",
     ):
@@ -1073,7 +1075,7 @@ def _fill_gptq_marlin_from_checkpoint(
     snap = _snapshot_dir(model_path)
     cfg = json.load(open(os.path.join(snap, "config.json")))
     tcfg = cfg.get("text_config", cfg)
-    inter = tcfg["moe_intermediate_size"]
+    inter = tcfg.get("moe_intermediate_size") or tcfg["intermediate_size"]
     qc = cfg["quantization_config"]
     bits, group = qc["bits"], qc["group_size"]
     pack = 32 // bits
@@ -1085,6 +1087,7 @@ def _fill_gptq_marlin_from_checkpoint(
     desc_act = bool(qc.get("desc_act", False)) and group != -1
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)  # (gate,up,down); Mixtral -> (w1,w3,w2)
     dev = store.device
 
     from contextlib import ExitStack
@@ -1105,26 +1108,26 @@ def _fill_gptq_marlin_from_checkpoint(
     for e in range(store.E):
         p = f"{pre}{e}."
         w13_qw.append(
-            torch.cat([get(p + "gate_proj.qweight"), get(p + "up_proj.qweight")], dim=1)
+            torch.cat([get(f"{p}{gate}.qweight"), get(f"{p}{up}.qweight")], dim=1)
         )
-        w2_qw.append(get(p + "down_proj.qweight"))
+        w2_qw.append(get(f"{p}{down}.qweight"))
         w13_s.append(
-            torch.cat([get(p + "gate_proj.scales"), get(p + "up_proj.scales")], dim=1)
+            torch.cat([get(f"{p}{gate}.scales"), get(f"{p}{up}.scales")], dim=1)
         )
-        w2_s.append(get(p + "down_proj.scales"))
+        w2_s.append(get(f"{p}{down}.scales"))
         w13_qz.append(
-            torch.cat([get(p + "gate_proj.qzeros"), get(p + "up_proj.qzeros")], dim=1)
+            torch.cat([get(f"{p}{gate}.qzeros"), get(f"{p}{up}.qzeros")], dim=1)
         )
-        w2_qz.append(get(p + "down_proj.qzeros"))
+        w2_qz.append(get(f"{p}{down}.qzeros"))
         if desc_act:
             # gate & up share the hidden input, so their g_idx is identical; w13 uses that single
-            # g_idx, w2 uses down_proj's. (Verified equal on the checkpoint; assert to be safe.)
-            g_gate = get(p + "gate_proj.g_idx")
-            assert torch.equal(g_gate, get(p + "up_proj.g_idx")), (
+            # g_idx, w2 uses down's. (Verified equal on the checkpoint; assert to be safe.)
+            g_gate = get(f"{p}{gate}.g_idx")
+            assert torch.equal(g_gate, get(f"{p}{up}.g_idx")), (
                 "[paged-experts] gate/up g_idx differ; fused w13 act-order unsupported"
             )
             w13_gi.append(g_gate)
-            w2_gi.append(get(p + "down_proj.g_idx"))
+            w2_gi.append(get(f"{p}{down}.g_idx"))
     _shard_stack.close()  # release shard handles before the (GPU) repack
     w13_qw, w2_qw = torch.stack(w13_qw).to(dev), torch.stack(w2_qw).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
@@ -1187,7 +1190,7 @@ def _fill_ct_wna16_from_checkpoint(
     snap = _snapshot_dir(model_path)
     cfg = json.load(open(os.path.join(snap, "config.json")))
     tcfg = cfg.get("text_config", cfg)
-    inter = tcfg["moe_intermediate_size"]
+    inter = tcfg.get("moe_intermediate_size") or tcfg["intermediate_size"]
     qc = cfg["quantization_config"]
     w = next(iter((qc.get("config_groups") or {}).values()), {}).get("weights", {})
     bits = w["num_bits"]
@@ -1204,6 +1207,7 @@ def _fill_ct_wna16_from_checkpoint(
         )
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)  # (gate,up,down); Mixtral -> (w1,w3,w2)
     dev = store.device
 
     from contextlib import ExitStack
@@ -1231,24 +1235,18 @@ def _fill_ct_wna16_from_checkpoint(
         p = f"{pre}{e}."
         w13_pk.append(
             torch.cat(
-                [
-                    _t(get(p + "gate_proj.weight_packed")),
-                    _t(get(p + "up_proj.weight_packed")),
-                ],
+                [_t(get(f"{p}{gate}.weight_packed")), _t(get(f"{p}{up}.weight_packed"))],
                 dim=1,
             )
         )
-        w2_pk.append(_t(get(p + "down_proj.weight_packed")))
+        w2_pk.append(_t(get(f"{p}{down}.weight_packed")))
         w13_s.append(
             torch.cat(
-                [
-                    _t(get(p + "gate_proj.weight_scale")),
-                    _t(get(p + "up_proj.weight_scale")),
-                ],
+                [_t(get(f"{p}{gate}.weight_scale")), _t(get(f"{p}{up}.weight_scale"))],
                 dim=1,
             )
         )
-        w2_s.append(_t(get(p + "down_proj.weight_scale")))
+        w2_s.append(_t(get(f"{p}{down}.weight_scale")))
     _shard_stack.close()  # release shard handles before the (GPU) repack
     w13_pk, w2_pk = torch.stack(w13_pk).to(dev), torch.stack(w2_pk).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
@@ -1379,23 +1377,24 @@ def _fill_bf16_from_checkpoint(
             for e in range(store.E):
                 store.row(dst, e).copy_(stacked[e].to(dt))
         return
+    gate, up, down = _proj_names(wmap, pre)  # (gate,up,down); Mixtral -> (w1,w3,w2)
     by_shard: Dict[str, list] = {}
     for e in range(store.E):
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+        for proj in (gate, up, down):
             by_shard.setdefault(wmap[f"{pre}{e}.{proj}.weight"], []).append((e, proj))
     for shard, items in by_shard.items():
         with safe_open(os.path.join(snap, shard), framework="pt") as f:
             for e, proj in items:
                 t = f.get_tensor(f"{pre}{e}.{proj}.weight").to(dt)
-                if proj == "down_proj":
+                if proj == down:
                     store.row("w2_weight", e).copy_(t)
                     continue
                 # w13 packs gate (first half of dim 0) then up (second half)
                 row = store.row("w13_weight", e)
                 half = row.shape[0] // 2
-                if proj == "gate_proj":
+                if proj == gate:
                     row[:half].copy_(t)
-                else:  # up_proj
+                else:  # up
                     row[half:].copy_(t)
 
 
@@ -1422,9 +1421,10 @@ def _fill_fp8_block_from_checkpoint(
     snap = _snapshot_dir(model_path)
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)  # (gate,up,down); Mixtral -> (w1,w3,w2)
     by_shard: Dict[str, list] = {}
     for e in range(store.E):
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+        for proj in (gate, up, down):
             for suffix in ("weight", "weight_scale_inv"):
                 by_shard.setdefault(wmap[f"{pre}{e}.{proj}.{suffix}"], []).append(
                     (e, proj, suffix)
@@ -1433,18 +1433,18 @@ def _fill_fp8_block_from_checkpoint(
         with safe_open(os.path.join(snap, shard), framework="pt") as f:
             for e, proj, suffix in items:
                 t = f.get_tensor(f"{pre}{e}.{proj}.{suffix}")
-                base = "w2_weight" if proj == "down_proj" else "w13_weight"
+                base = "w2_weight" if proj == down else "w13_weight"
                 name = base if suffix == "weight" else base + "_scale_inv"
                 row = store.row(name, e)
-                if proj == "down_proj":
+                if proj == down:
                     row.copy_(t)
                     continue
                 # w13 packs gate (first half of dim 0) then up (second half); the block scales
                 # follow the same row split, so the same halving works for both suffixes.
                 half = row.shape[0] // 2
-                if proj == "gate_proj":
+                if proj == gate:
                     row[:half].copy_(t)
-                else:  # up_proj
+                else:  # up
                     row[half:].copy_(t)
 
 
@@ -1468,9 +1468,10 @@ def _fill_ct_fp8_channel_from_checkpoint(
     snap = _snapshot_dir(model_path)
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)  # (gate,up,down); Mixtral -> (w1,w3,w2)
     by_shard: Dict[str, list] = {}
     for e in range(store.E):
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+        for proj in (gate, up, down):
             for suffix in ("weight", "weight_scale"):
                 by_shard.setdefault(wmap[f"{pre}{e}.{proj}.{suffix}"], []).append(
                     (e, proj, suffix)
@@ -1479,20 +1480,20 @@ def _fill_ct_fp8_channel_from_checkpoint(
         with safe_open(os.path.join(snap, shard), framework="pt") as f:
             for e, proj, suffix in items:
                 t = f.get_tensor(f"{pre}{e}.{proj}.{suffix}")
-                base = "w2_weight" if proj == "down_proj" else "w13_weight"
+                base = "w2_weight" if proj == down else "w13_weight"
                 name = base if suffix == "weight" else base + "_scale"
                 if suffix == "weight_scale":
                     t = t.to(sdt)
                 row = store.row(name, e)
-                if proj == "down_proj":
+                if proj == down:
                     row.copy_(t)
                     continue
                 # w13 packs gate (first half of dim 0) then up (second half); the per-channel scales
                 # follow the same row split, so the same halving works for both suffixes.
                 half = row.shape[0] // 2
-                if proj == "gate_proj":
+                if proj == gate:
                     row[:half].copy_(t)
-                else:  # up_proj
+                else:  # up
                     row[half:].copy_(t)
 
 
@@ -1520,12 +1521,13 @@ def _fill_awq_marlin_from_checkpoint(
     snap = _snapshot_dir(model_path)
     cfg = json.load(open(os.path.join(snap, "config.json")))
     tcfg = cfg.get("text_config", cfg)
-    inter = tcfg["moe_intermediate_size"]
+    inter = tcfg.get("moe_intermediate_size") or tcfg["intermediate_size"]
     qc = cfg["quantization_config"]
     bits, group = qc["bits"], qc["group_size"]
     pack = 32 // bits
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)  # (gate,up,down); Mixtral -> (w1,w3,w2)
     dev = store.device
 
     from contextlib import ExitStack
@@ -1546,17 +1548,17 @@ def _fill_awq_marlin_from_checkpoint(
         p = f"{pre}{e}."
         # AWQ packs along output -> gate/up fuse on dim=1 for all three tensors (no transpose).
         w13_qw.append(
-            torch.cat([get(p + "gate_proj.qweight"), get(p + "up_proj.qweight")], dim=1)
+            torch.cat([get(f"{p}{gate}.qweight"), get(f"{p}{up}.qweight")], dim=1)
         )
-        w2_qw.append(get(p + "down_proj.qweight"))
+        w2_qw.append(get(f"{p}{down}.qweight"))
         w13_s.append(
-            torch.cat([get(p + "gate_proj.scales"), get(p + "up_proj.scales")], dim=1)
+            torch.cat([get(f"{p}{gate}.scales"), get(f"{p}{up}.scales")], dim=1)
         )
-        w2_s.append(get(p + "down_proj.scales"))
+        w2_s.append(get(f"{p}{down}.scales"))
         w13_qz.append(
-            torch.cat([get(p + "gate_proj.qzeros"), get(p + "up_proj.qzeros")], dim=1)
+            torch.cat([get(f"{p}{gate}.qzeros"), get(f"{p}{up}.qzeros")], dim=1)
         )
-        w2_qz.append(get(p + "down_proj.qzeros"))
+        w2_qz.append(get(f"{p}{down}.qzeros"))
     _shard_stack.close()  # release shard handles before the (GPU) repack
     w13_qw, w2_qw = torch.stack(w13_qw).to(dev), torch.stack(w2_qw).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
@@ -1604,7 +1606,7 @@ def _fill_moe_wna16_from_checkpoint(
     snap = _snapshot_dir(model_path)
     cfg = json.load(open(os.path.join(snap, "config.json")))
     tcfg = cfg.get("text_config", cfg)
-    inter = tcfg["moe_intermediate_size"]
+    inter = tcfg.get("moe_intermediate_size") or tcfg["intermediate_size"]
     hidden = tcfg["hidden_size"]
     group = cfg["quantization_config"]["group_size"]
     assert inter % group == 0 and hidden % group == 0, (
@@ -1612,6 +1614,7 @@ def _fill_moe_wna16_from_checkpoint(
     )
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)  # (gate,up,down); Mixtral -> (w1,w3,w2)
     sdt = store.gpu["w13_scales"].dtype
 
     from contextlib import ExitStack
@@ -1635,16 +1638,14 @@ def _fill_moe_wna16_from_checkpoint(
         # w13_qweight [2*inter, hidden//2]: gate -> first half of dim 0, up -> second half.
         rw = store.row("w13_qweight", e)
         h = rw.shape[0] // 2
-        rw[:h].copy_(qw(p + "gate_proj.qweight"))
-        rw[h:].copy_(qw(p + "up_proj.qweight"))
-        store.row("w2_qweight", e).copy_(qw(p + "down_proj.qweight"))
+        rw[:h].copy_(qw(f"{p}{gate}.qweight"))
+        rw[h:].copy_(qw(f"{p}{up}.qweight"))
+        store.row("w2_qweight", e).copy_(qw(f"{p}{down}.qweight"))
         # scales [2*inter, hidden//group]: gptq [in//group, out].T -> [out, in//group].
         rs = store.row("w13_scales", e)
-        rs[:h].copy_(get(p + "gate_proj.scales").t().contiguous().to(sdt))
-        rs[h:].copy_(get(p + "up_proj.scales").t().contiguous().to(sdt))
-        store.row("w2_scales", e).copy_(
-            get(p + "down_proj.scales").t().contiguous().to(sdt)
-        )
+        rs[:h].copy_(get(f"{p}{gate}.scales").t().contiguous().to(sdt))
+        rs[h:].copy_(get(f"{p}{up}.scales").t().contiguous().to(sdt))
+        store.row("w2_scales", e).copy_(get(f"{p}{down}.scales").t().contiguous().to(sdt))
     _shard_stack.close()
 
 

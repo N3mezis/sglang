@@ -143,6 +143,24 @@ class TestPagedExpertsGuard(CustomTestCase):
                 ),
                 "act-order",
             ),
+            # ct fp8 float-quantized PER-TENSOR (scalar scales unwired; only per-channel supported)
+            (
+                dict(
+                    quant_method="compressed-tensors",
+                    format="float-quantized",
+                    config_groups={
+                        "group_0": {
+                            "weights": {
+                                "type": "float",
+                                "num_bits": 8,
+                                "strategy": "tensor",
+                            },
+                            "input_activations": {"dynamic": True},
+                        }
+                    },
+                ),
+                "per-channel",
+            ),
             # ct fp8 float-quantized with STATIC input scales (input-scale paging unwired)
             (
                 dict(
