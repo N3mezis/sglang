@@ -62,33 +62,116 @@ class TestPagedExpertsGuard(CustomTestCase):
             )
         self.assertEqual(str(cm.exception).count("\n  - "), 3)
 
-    def test_quant_guard(self):
-        # supported: unquantized, gptq(-marlin int4), and fp8 BLOCK quant
-        check_paged_experts_quant(SimpleNamespace(quantization_config=None))
-        check_paged_experts_quant(
-            SimpleNamespace(quantization_config={"quant_method": "gptq", "bits": 4})
+    def _quant(self, **qc):
+        check_paged_experts_quant(SimpleNamespace(quantization_config=qc or None))
+
+    def _ct_group(self, **weights):
+        # a compressed-tensors config_groups blob with one group's weight-quant args
+        return {"group_0": {"weights": weights}}
+
+    def test_quant_guard_accepts(self):
+        # unquantized
+        self._quant()
+        # gptq marlin int4, incl. runtime act-order (desc_act -> g_idx paging)
+        self._quant(quant_method="gptq", bits=4)
+        self._quant(quant_method="gptq", bits=4, group_size=128, desc_act=True)
+        # fp8 BLOCK quant
+        self._quant(quant_method="fp8", weight_block_size=[128, 128])
+        # mxfp4 (gpt-oss)
+        self._quant(quant_method="mxfp4")
+        # compressed-tensors: nvfp4
+        self._quant(quant_method="compressed-tensors", format="nvfp4-pack-quantized")
+        # compressed-tensors int pack-quantized (sym), no / baked-in act-order, 4 and 8 bit
+        for ao in (None, "static", "weight"):
+            self._quant(
+                quant_method="compressed-tensors",
+                format="pack-quantized",
+                config_groups=self._ct_group(
+                    type="int", num_bits=4, symmetric=True, actorder=ao
+                ),
+            )
+        self._quant(
+            quant_method="compressed-tensors",
+            format="pack-quantized",
+            config_groups=self._ct_group(type="int", num_bits=8, symmetric=True),
         )
-        check_paged_experts_quant(
-            SimpleNamespace(
-                quantization_config={
-                    "quant_method": "fp8",
-                    "weight_block_size": [128, 128],
+        # compressed-tensors fp8 float-quantized, per-channel + DYNAMIC activations
+        self._quant(
+            quant_method="compressed-tensors",
+            format="float-quantized",
+            config_groups={
+                "group_0": {
+                    "weights": {"type": "float", "num_bits": 8, "strategy": "channel"},
+                    "input_activations": {"dynamic": True},
                 }
-            )
+            },
         )
-        # per-tensor fp8 (no weight_block_size) has unpageable scalar scales -> rejected
-        with self.assertRaises(RuntimeError) as cm:
-            check_paged_experts_quant(
-                SimpleNamespace(quantization_config={"quant_method": "fp8"})
-            )
-        self.assertIn("block", str(cm.exception))
-        # anything else would be routed through the wrong fill -> rejected with an actionable error
-        for method in ("awq", "compressed-tensors"):
+        # classic AWQ (asymmetric) + AutoRound (symmetric auto_gptq)
+        self._quant(quant_method="awq", bits=4)
+        self._quant(
+            quant_method="auto-round",
+            packing_format="auto_round:auto_gptq",
+            sym=True,
+            bits=4,
+        )
+
+    def test_quant_guard_rejects(self):
+        cases = [
+            # per-tensor fp8: unpageable scalar scales
+            (dict(quant_method="fp8"), "block"),
+            # ct int8 W8A8: no CUDA fused-MoE (NPU-only)
+            (dict(quant_method="compressed-tensors", format="int-quantized"), "int8"),
+            # ct pack-quantized asymmetric (zero-points unwired)
+            (
+                dict(
+                    quant_method="compressed-tensors",
+                    format="pack-quantized",
+                    config_groups=self._ct_group(
+                        type="int", num_bits=4, symmetric=False
+                    ),
+                ),
+                "symmetric",
+            ),
+            # ct pack-quantized runtime act-order (group g_idx unwired for ct)
+            (
+                dict(
+                    quant_method="compressed-tensors",
+                    format="pack-quantized",
+                    config_groups=self._ct_group(
+                        type="int", num_bits=4, symmetric=True, actorder="group"
+                    ),
+                ),
+                "act-order",
+            ),
+            # ct fp8 float-quantized with STATIC input scales (input-scale paging unwired)
+            (
+                dict(
+                    quant_method="compressed-tensors",
+                    format="float-quantized",
+                    config_groups={
+                        "group_0": {
+                            "weights": {"type": "float", "num_bits": 8},
+                            "input_activations": {"dynamic": False},
+                        }
+                    },
+                ),
+                "dynamic",
+            ),
+            # AutoRound asymmetric / auto_awq (wna16 zero-point path unwired)
+            (
+                dict(
+                    quant_method="auto-round",
+                    packing_format="auto_round:auto_awq",
+                    sym=False,
+                    bits=4,
+                ),
+                "AutoRound",
+            ),
+        ]
+        for qc, fragment in cases:
             with self.assertRaises(RuntimeError) as cm:
-                check_paged_experts_quant(
-                    SimpleNamespace(quantization_config={"quant_method": method})
-                )
-            self.assertIn(method, str(cm.exception))
+                check_paged_experts_quant(SimpleNamespace(quantization_config=qc))
+            self.assertIn(fragment, str(cm.exception))
 
 
 if __name__ == "__main__":
