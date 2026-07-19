@@ -1589,6 +1589,65 @@ def _fill_awq_marlin_from_checkpoint(
         store.fill_tensor(name, t)
 
 
+def _fill_moe_wna16_from_checkpoint(
+    store: ExpertStore, model_path: str, layer_idx: int
+) -> None:
+    """moe_wna16 uint8 triton path (Intel AutoRound auto_gptq lands here on SM120: sglang's AutoRound
+    MoE gates marlin off via check_moe_marlin_supports_layer). The store holds uint8-packed weights
+    [E, 2*inter, hidden//2] and per-group fp scales — NOT the marlin int32 layout. This replicates
+    MoeWNA16Method's gptq weight_loader conversion (no process_weights_after_loading, so the loaded
+    state IS the final state): qweight = gptq_int32[in//8, out].T.view(uint8) -> [out, in//2];
+    scales = gptq_scales[in//group, out].T -> [out, in//group]. Symmetric only (has_zp=False -> no
+    qzeros paged; group divides hidden/inter here so no group_size_div_factor rescale)."""
+    from safetensors import safe_open
+
+    snap = _snapshot_dir(model_path)
+    cfg = json.load(open(os.path.join(snap, "config.json")))
+    tcfg = cfg.get("text_config", cfg)
+    inter = tcfg["moe_intermediate_size"]
+    hidden = tcfg["hidden_size"]
+    group = cfg["quantization_config"]["group_size"]
+    assert inter % group == 0 and hidden % group == 0, (
+        "[paged-experts] moe_wna16 fill assumes group_size divides hidden/inter (no rescale)"
+    )
+    wmap = _weight_map(snap)
+    pre = _experts_prefix(wmap, layer_idx)
+    sdt = store.gpu["w13_scales"].dtype
+
+    from contextlib import ExitStack
+
+    _shard_stack = ExitStack()
+    open_shards: Dict[str, object] = {}
+
+    def get(name: str) -> torch.Tensor:
+        sh = wmap[name]
+        if sh not in open_shards:
+            open_shards[sh] = _shard_stack.enter_context(
+                safe_open(os.path.join(snap, sh), framework="pt")
+            )
+        return open_shards[sh].get_tensor(name)
+
+    def qw(name):  # gptq int32 [in//8, out] -> uint8 [out, in//2]
+        return get(name).t().contiguous().view(torch.uint8)
+
+    for e in range(store.E):
+        p = f"{pre}{e}."
+        # w13_qweight [2*inter, hidden//2]: gate -> first half of dim 0, up -> second half.
+        rw = store.row("w13_qweight", e)
+        h = rw.shape[0] // 2
+        rw[:h].copy_(qw(p + "gate_proj.qweight"))
+        rw[h:].copy_(qw(p + "up_proj.qweight"))
+        store.row("w2_qweight", e).copy_(qw(p + "down_proj.qweight"))
+        # scales [2*inter, hidden//group]: gptq [in//group, out].T -> [out, in//group].
+        rs = store.row("w13_scales", e)
+        rs[:h].copy_(get(p + "gate_proj.scales").t().contiguous().to(sdt))
+        rs[h:].copy_(get(p + "up_proj.scales").t().contiguous().to(sdt))
+        store.row("w2_scales", e).copy_(
+            get(p + "down_proj.scales").t().contiguous().to(sdt)
+        )
+    _shard_stack.close()
+
+
 _STORE_CACHE_VERSION = 2  # v2: gptq store may include paged g_idx/sort_indices (desc_act)
 _STORE_CACHE_LOGGED = False
 
@@ -1819,7 +1878,10 @@ def setup_pager(method, layer) -> ExpertPager:
                     "quantization_config"
                 ) or {}).get("quant_method") or ""
             ).lower()
-            if _qm == "awq":  # classic AWQ (asymmetric zero-points) — no repack cache
+            if store.gpu["w13_qweight"].dtype == torch.uint8:
+                # moe_wna16 uint8 triton layout (e.g. AutoRound auto_gptq on SM120), not marlin int32.
+                _fill_moe_wna16_from_checkpoint(store, model_path, layer_idx)
+            elif _qm == "awq":  # classic AWQ (asymmetric zero-points) — no repack cache
                 _fill_awq_marlin_from_checkpoint(store, model_path, layer_idx)
             else:  # gptq-marlin int4 (cached repack)
                 cache_dir = _store_cache_dir(model_path)
