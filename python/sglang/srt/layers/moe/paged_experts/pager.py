@@ -1077,10 +1077,12 @@ def _fill_gptq_marlin_from_checkpoint(
     qc = cfg["quantization_config"]
     bits, group = qc["bits"], qc["group_size"]
     pack = 32 // bits
-    if qc.get("desc_act", False):
-        raise RuntimeError(
-            "[paged-experts] desc_act=True needs g_idx paging, which is unsupported."
-        )
+    # desc_act (act-order): the checkpoint stores a per-expert g_idx (input-channel -> group map). The
+    # marlin repack permutes qweight rows by argsort(g_idx), and the kernel reads the sorted g_idx +
+    # sort_indices at gather time. We compute both for ALL E and page them into slots (they are live
+    # per-expert tensors — see store._NONPAGED_SUFFIXES). desc_act with group_size==-1 degenerates to
+    # no act-order (the config loader forces desc_act=False there), so it can't reach here.
+    desc_act = bool(qc.get("desc_act", False)) and group != -1
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
     dev = store.device
@@ -1099,6 +1101,7 @@ def _fill_gptq_marlin_from_checkpoint(
         return open_shards[sh].get_tensor(name)
 
     w13_qw, w2_qw, w13_s, w2_s, w13_qz, w2_qz = [], [], [], [], [], []
+    w13_gi, w2_gi = [], []
     for e in range(store.E):
         p = f"{pre}{e}."
         w13_qw.append(
@@ -1113,16 +1116,34 @@ def _fill_gptq_marlin_from_checkpoint(
             torch.cat([get(p + "gate_proj.qzeros"), get(p + "up_proj.qzeros")], dim=1)
         )
         w2_qz.append(get(p + "down_proj.qzeros"))
+        if desc_act:
+            # gate & up share the hidden input, so their g_idx is identical; w13 uses that single
+            # g_idx, w2 uses down_proj's. (Verified equal on the checkpoint; assert to be safe.)
+            g_gate = get(p + "gate_proj.g_idx")
+            assert torch.equal(g_gate, get(p + "up_proj.g_idx")), (
+                "[paged-experts] gate/up g_idx differ; fused w13 act-order unsupported"
+            )
+            w13_gi.append(g_gate)
+            w2_gi.append(get(p + "down_proj.g_idx"))
     _shard_stack.close()  # release shard handles before the (GPU) repack
     w13_qw, w2_qw = torch.stack(w13_qw).to(dev), torch.stack(w2_qw).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
-    sort = torch.empty((store.E, 0), dtype=torch.int32, device=dev)
+    if desc_act:
+        # per-expert argsort(g_idx) -> sort_indices (perm for the repack + kernel) and sorted g_idx.
+        w13_gi = torch.stack(w13_gi).to(dev)
+        w2_gi = torch.stack(w2_gi).to(dev)
+        w13_sort = torch.argsort(w13_gi, dim=1).to(torch.int32)
+        w2_sort = torch.argsort(w2_gi, dim=1).to(torch.int32)
+        w13_gsorted = torch.gather(w13_gi, 1, w13_sort.to(torch.int64))
+        w2_gsorted = torch.gather(w2_gi, 1, w2_sort.to(torch.int64))
+    else:
+        w13_sort = w2_sort = torch.empty((store.E, 0), dtype=torch.int32, device=dev)
     marlin = {
         "w13_qweight": gptq_marlin_moe_repack(
-            w13_qw, sort, w13_qw.shape[1] * pack, w13_qw.shape[2], bits
+            w13_qw, w13_sort, w13_qw.shape[1] * pack, w13_qw.shape[2], bits
         ),
         "w2_qweight": gptq_marlin_moe_repack(
-            w2_qw, sort, w2_qw.shape[1] * pack, w2_qw.shape[2], bits
+            w2_qw, w2_sort, w2_qw.shape[1] * pack, w2_qw.shape[2], bits
         ),
         "w13_scales": marlin_moe_permute_scales(
             s=w13_s, size_k=inter, size_n=w13_s.shape[2], group_size=group
@@ -1133,6 +1154,11 @@ def _fill_gptq_marlin_from_checkpoint(
         "w13_qzeros": torch.stack(w13_qz),  # carried unrepacked (sym); kernel ignores
         "w2_qzeros": torch.stack(w2_qz),
     }
+    if desc_act:
+        marlin["w13_g_idx"] = w13_gsorted
+        marlin["w2_g_idx"] = w2_gsorted
+        marlin["w13_g_idx_sort_indices"] = w13_sort
+        marlin["w2_g_idx_sort_indices"] = w2_sort
     for name in store.gpu:
         t = marlin[name].contiguous().cpu()
         expected = (store.E, *store.gpu[name].shape[1:])
@@ -1470,7 +1496,7 @@ def _fill_ct_fp8_channel_from_checkpoint(
                     row[half:].copy_(t)
 
 
-_STORE_CACHE_VERSION = 1
+_STORE_CACHE_VERSION = 2  # v2: gptq store may include paged g_idx/sort_indices (desc_act)
 _STORE_CACHE_LOGGED = False
 
 

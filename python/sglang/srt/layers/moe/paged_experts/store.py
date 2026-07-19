@@ -71,9 +71,13 @@ def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
 # (sub-8/16-byte rows). The four runtime nvfp4 scalars (g*_alphas, w*_input_scale_quant) are refreshed
 # per-step into the K slots from a resident full-E table (see forward._gemm_hidden); the rest are dead
 # after the nvfp4 method's process_weights_after_loading.
+#
+# NB: ``_g_idx`` / ``_g_idx_sort_indices`` are NOT excluded — for act-order (gptq desc_act=True /
+# ct actorder='group') they are live per-expert [in] int32 tensors the marlin kernel reads at gather
+# time, so they must page into slots alongside the qweight. For non-act-order the method's
+# process_weights_after_loading replaces them with empty tensors, which discover_paged_params drops
+# via its ``numel() > 0`` check — so leaving them pageable is safe for both.
 _NONPAGED_SUFFIXES = (
-    "_g_idx",
-    "_g_idx_sort_indices",
     "_weight_shape",
     "_global_scale",
     "_scale_2",
