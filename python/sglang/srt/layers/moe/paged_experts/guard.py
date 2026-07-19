@@ -190,6 +190,26 @@ def check_paged_experts_quant(hf_text_config: Any) -> None:
         # MXFP4 (gpt-oss): packed fp4 weights + per-group-of-32 e8m0 block scales + per-expert bf16
         # biases, filled via the Marlin mxfp4 repack (SM90/SM120). See _fill_mxfp4_from_checkpoint.
         return
+    if quant_method == "awq":
+        # classic AWQ (asymmetric, per-group zero-points). sglang converts it to the awq-marlin MoE
+        # layout; the paged fill mirrors that repack (awq_marlin_moe_repack + zero-point conversion).
+        # See _fill_awq_marlin_from_checkpoint. Serve with --dtype float16 (marlin scales are fp16).
+        bits = qc.get("bits") if isinstance(qc, dict) else None
+        if bits in (4, 8):
+            return
+        raise RuntimeError(
+            f"Paged Experts supports AWQ only at 4 or 8 bits; this checkpoint uses bits={bits!r}."
+        )
+    if quant_method == "auto-round":
+        # Intel AutoRound. Despite auto_gptq packing, sglang's AutoRound MoE path gates marlin on
+        # check_moe_marlin_supports_layer (auto_round.py) which declines for this geometry — so it
+        # falls to the moe_wna16 uint8 triton method, NOT gptq-marlin. Our fills produce the marlin
+        # layout, so AutoRound would load wrong weights. Reject until a moe_wna16 uint8 fill exists.
+        raise RuntimeError(
+            "Paged Experts does not support AutoRound MoE yet: sglang routes it to the moe_wna16 "
+            "uint8 triton path (not gptq-marlin), which needs a dedicated fill. Use a native gptq "
+            "(quant_method='gptq') or compressed-tensors int4 checkpoint instead."
+        )
     raise RuntimeError(
         f"Paged Experts does not support quant_method={quant_method or 'unknown'!r}: the host "
         "store handles unquantized (bf16/fp16), gptq-marlin int4, fp8 block-quant, and mxfp4 "

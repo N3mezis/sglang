@@ -1496,6 +1496,99 @@ def _fill_ct_fp8_channel_from_checkpoint(
                     row[half:].copy_(t)
 
 
+def _fill_awq_marlin_from_checkpoint(
+    store: ExpertStore, model_path: str, layer_idx: int
+) -> None:
+    """classic AWQ (quant_method='awq', asymmetric: real per-group zero-points). The store keys
+    (w13_qweight/scales/qzeros) collide with gptq-marlin, so setup_pager routes here by the config's
+    quant_method. AWQ packs along the OUTPUT dim: checkpoint qweight [in, out//pack], scales
+    [in//group, out], qzeros [in//group, out//pack]; gate/up fuse on the output dim (dim=1, no
+    transpose). Repack ALL E via sglang's own awq marlin ops (awq_marlin_moe_repack +
+    marlin_moe_permute_scales + moe_awq_to_marlin_zero_points), mirroring the awq MoE kernel's
+    process_weights_after_loading exactly."""
+    from safetensors import safe_open
+
+    import sglang.srt.layers.quantization  # noqa: F401
+    from sglang.srt.hardware_backend.gpu.quantization.awq_kernels import (
+        awq_marlin_moe_repack,
+    )
+    from sglang.srt.layers.quantization.marlin_utils import (
+        marlin_moe_permute_scales,
+        moe_awq_to_marlin_zero_points,
+    )
+
+    snap = _snapshot_dir(model_path)
+    cfg = json.load(open(os.path.join(snap, "config.json")))
+    tcfg = cfg.get("text_config", cfg)
+    inter = tcfg["moe_intermediate_size"]
+    qc = cfg["quantization_config"]
+    bits, group = qc["bits"], qc["group_size"]
+    pack = 32 // bits
+    wmap = _weight_map(snap)
+    pre = _experts_prefix(wmap, layer_idx)
+    dev = store.device
+
+    from contextlib import ExitStack
+
+    _shard_stack = ExitStack()
+    open_shards: Dict[str, object] = {}
+
+    def get(name: str) -> torch.Tensor:
+        sh = wmap[name]
+        if sh not in open_shards:
+            open_shards[sh] = _shard_stack.enter_context(
+                safe_open(os.path.join(snap, sh), framework="pt")
+            )
+        return open_shards[sh].get_tensor(name)
+
+    w13_qw, w2_qw, w13_s, w2_s, w13_qz, w2_qz = [], [], [], [], [], []
+    for e in range(store.E):
+        p = f"{pre}{e}."
+        # AWQ packs along output -> gate/up fuse on dim=1 for all three tensors (no transpose).
+        w13_qw.append(
+            torch.cat([get(p + "gate_proj.qweight"), get(p + "up_proj.qweight")], dim=1)
+        )
+        w2_qw.append(get(p + "down_proj.qweight"))
+        w13_s.append(
+            torch.cat([get(p + "gate_proj.scales"), get(p + "up_proj.scales")], dim=1)
+        )
+        w2_s.append(get(p + "down_proj.scales"))
+        w13_qz.append(
+            torch.cat([get(p + "gate_proj.qzeros"), get(p + "up_proj.qzeros")], dim=1)
+        )
+        w2_qz.append(get(p + "down_proj.qzeros"))
+    _shard_stack.close()  # release shard handles before the (GPU) repack
+    w13_qw, w2_qw = torch.stack(w13_qw).to(dev), torch.stack(w2_qw).to(dev)
+    w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
+    w13_qz, w2_qz = torch.stack(w13_qz).to(dev), torch.stack(w2_qz).to(dev)
+    sort = torch.empty((store.E, 0), dtype=torch.int32, device=dev)
+    marlin = {
+        "w13_qweight": awq_marlin_moe_repack(
+            w13_qw, sort, size_k=w13_qw.shape[1], size_n=w13_qw.shape[2] * pack, num_bits=bits
+        ),
+        "w2_qweight": awq_marlin_moe_repack(
+            w2_qw, sort, size_k=w2_qw.shape[1], size_n=w2_qw.shape[2] * pack, num_bits=bits
+        ),
+        "w13_scales": marlin_moe_permute_scales(
+            s=w13_s, size_k=inter, size_n=w13_s.shape[2], group_size=group
+        ),
+        "w2_scales": marlin_moe_permute_scales(
+            s=w2_s, size_k=inter, size_n=w2_s.shape[2], group_size=group
+        ),
+        "w13_qzeros": moe_awq_to_marlin_zero_points(
+            w13_qz, size_k=w13_qz.shape[1], size_n=w13_qz.shape[2] * pack, num_bits=bits
+        ),
+        "w2_qzeros": moe_awq_to_marlin_zero_points(
+            w2_qz, size_k=w2_qz.shape[1], size_n=w2_qz.shape[2] * pack, num_bits=bits
+        ),
+    }
+    for name in store.gpu:
+        t = marlin[name].contiguous().to(store.gpu[name].dtype).cpu()
+        expected = (store.E, *store.gpu[name].shape[1:])
+        assert tuple(t.shape) == expected, (name, t.shape, expected)
+        store.fill_tensor(name, t)
+
+
 _STORE_CACHE_VERSION = 2  # v2: gptq store may include paged g_idx/sort_indices (desc_act)
 _STORE_CACHE_LOGGED = False
 
@@ -1717,19 +1810,30 @@ def setup_pager(method, layer) -> ExpertPager:
     layer_idx = getattr(layer, "layer_id", getattr(layer, "layer_idx", 0))
     model_path = get_global_server_args().model_path
     try:
-        if any(n.endswith("qweight") for n in store.gpu):  # gptq-marlin int4
-            cache_dir = _store_cache_dir(model_path)
-            if _fill_store_from_cache(store, cache_dir, layer_idx):
-                global _STORE_CACHE_LOGGED
-                if not _STORE_CACHE_LOGGED:
-                    _STORE_CACHE_LOGGED = True
-                    logger.info(
-                        "[paged-experts] host store loading from the repack cache (%s)",
-                        cache_dir,
-                    )
-            else:
-                _fill_gptq_marlin_from_checkpoint(store, model_path, layer_idx)
-                _save_store_to_cache(store, cache_dir, layer_idx)
+        if any(n.endswith("qweight") for n in store.gpu):  # gptq / awq marlin int4
+            # gptq and awq marlin produce the SAME store keys (w13_qweight/scales/qzeros); the
+            # asymmetric awq zero-point repack differs, so route by the checkpoint's quant_method.
+            _snap = _snapshot_dir(model_path)
+            _qm = (
+                (json.load(open(os.path.join(_snap, "config.json"))).get(
+                    "quantization_config"
+                ) or {}).get("quant_method") or ""
+            ).lower()
+            if _qm == "awq":  # classic AWQ (asymmetric zero-points) — no repack cache
+                _fill_awq_marlin_from_checkpoint(store, model_path, layer_idx)
+            else:  # gptq-marlin int4 (cached repack)
+                cache_dir = _store_cache_dir(model_path)
+                if _fill_store_from_cache(store, cache_dir, layer_idx):
+                    global _STORE_CACHE_LOGGED
+                    if not _STORE_CACHE_LOGGED:
+                        _STORE_CACHE_LOGGED = True
+                        logger.info(
+                            "[paged-experts] host store loading from the repack cache (%s)",
+                            cache_dir,
+                        )
+                else:
+                    _fill_gptq_marlin_from_checkpoint(store, model_path, layer_idx)
+                    _save_store_to_cache(store, cache_dir, layer_idx)
         elif (
             "w13_weight_scale_inv" in store.gpu
         ):  # fp8 block-quant (weights + block scales)
