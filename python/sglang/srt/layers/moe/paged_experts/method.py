@@ -154,6 +154,17 @@ def _moe_geometry():
             # 4-bit packed weights + one e8m0 (1 byte) block scale per 32 weights (8/32 = 0.25);
             # per-expert bf16 biases ride the ~3% margin. ~4.25 effective bits/weight.
             bits = 4.25
+        elif qm == "compressed-tensors" and "pack-quantized" in fmt:
+            # int pack-quantized (the Hub's "AWQ-4bit"/"w4a16"): num_bits packed weights + one
+            # fp16 group scale per group_size weights (16/group bit-equiv). group_size -1 (channel)
+            # => scale overhead negligible.
+            w = next(iter((qc.get("config_groups") or {}).values()), {}).get("weights", {})
+            nb = w.get("num_bits", 4)
+            gs = w.get("group_size") or -1
+            bits = nb + (16.0 / gs if gs and gs > 0 else 0.0)
+        elif qm == "compressed-tensors" and "float-quantized" in fmt:
+            # fp8 weights + per-output-channel [out,1] scale (~1 scale per row, negligible/weight).
+            bits = 8
         else:
             bits = qc.get("bits") or qc.get("weights", {}).get("num_bits") or 16
     # Most MoE configs expose ``moe_intermediate_size``; some (e.g. gpt-oss) only carry

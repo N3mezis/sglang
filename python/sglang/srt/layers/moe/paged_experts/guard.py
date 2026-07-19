@@ -110,10 +110,81 @@ def check_paged_experts_quant(hf_text_config: Any) -> None:
         fmt = (qc.get("format") or "").lower() if isinstance(qc, dict) else ""
         if "nvfp4" in fmt:
             return
+        # pack-quantized int4/int8 (the checkpoints the Hub labels "AWQ-4bit"/"w4a16" — actually
+        # compressed-tensors, not classic AWQ). Bit-layout-compatible with GPTQ marlin, so it fills
+        # via the gptq-marlin repack. See _fill_ct_wna16_from_checkpoint. v1 supports symmetric,
+        # group-wise, no act-order only (asym zero-points / g_idx paging are unwired).
+        if "pack-quantized" in fmt:
+            groups = qc.get("config_groups") or {} if isinstance(qc, dict) else {}
+            w = (next(iter(groups.values()), {}) or {}).get("weights", {}) or {}
+            wtype = (w.get("type") or "").lower()
+            bits = w.get("num_bits")
+            actorder = w.get("actorder")
+            if wtype != "int":
+                raise RuntimeError(
+                    f"Paged Experts supports compressed-tensors pack-quantized only with int "
+                    f"weights; this checkpoint has weights.type={wtype or 'unknown'!r}."
+                )
+            if bits not in (4, 8):
+                raise RuntimeError(
+                    f"Paged Experts supports compressed-tensors int pack-quantized at 4 or 8 bits; "
+                    f"this checkpoint uses num_bits={bits!r}."
+                )
+            if not w.get("symmetric", True):
+                raise RuntimeError(
+                    "Paged Experts supports compressed-tensors pack-quantized only with symmetric "
+                    "weights (no zero-points); this checkpoint is asymmetric. Use a symmetric quant "
+                    "or run without --enable-paged-experts."
+                )
+            # actorder "weight"/"static" bake the channel permutation into the weights at quant time
+            # (no g_idx stored) — the fill handles them like plain grouped quant. Only "group" stores a
+            # runtime g_idx (would need per-expert g_idx paging) and "dynamic" recomputes it online.
+            if actorder not in (None, "", "static", "weight"):
+                raise RuntimeError(
+                    f"Paged Experts does not support runtime act-order (g_idx paging) for "
+                    f"compressed-tensors pack-quantized; this checkpoint uses actorder={actorder!r} "
+                    f"(only baked-in 'weight'/'static' act-order or none is supported)."
+                )
+            return
+        # float-quantized: per-channel (or per-tensor) fp8 weights with DYNAMIC activations. The fp8
+        # weights + per-output-channel [out,1] scales page as ordinary per-expert rows (no repack, no
+        # resident-scalar table needed). Static input scales would need input-scale paging — reject.
+        # See _fill_ct_fp8_channel_from_checkpoint.
+        if "float-quantized" in fmt:
+            groups = qc.get("config_groups") or {} if isinstance(qc, dict) else {}
+            g = next(iter(groups.values()), {}) or {}
+            w = g.get("weights", {}) or {}
+            act = g.get("input_activations") or {}
+            strat = (w.get("strategy") or "").lower()
+            if (w.get("num_bits") or 8) != 8 or (w.get("type") or "float").lower() != "float":
+                raise RuntimeError(
+                    f"Paged Experts supports compressed-tensors float-quantized only as 8-bit fp8; "
+                    f"this checkpoint uses num_bits={w.get('num_bits')!r} type={w.get('type')!r}."
+                )
+            if strat not in ("channel", "tensor", ""):
+                raise RuntimeError(
+                    f"Paged Experts supports compressed-tensors fp8 float-quantized only with "
+                    f"per-channel or per-tensor weight scales; this checkpoint uses strategy={strat!r}."
+                )
+            if act and not act.get("dynamic", False):
+                raise RuntimeError(
+                    "Paged Experts supports compressed-tensors fp8 float-quantized only with dynamic "
+                    "activation quantization; this checkpoint has static input scales."
+                )
+            return
+        if "int-quantized" in fmt:
+            # int8 W8A8 (per-channel int8 weights + dynamic int8 activations). sglang's compressed-
+            # tensors int8 fused-MoE scheme is NPU-only (CUDA raises NotImplementedError in
+            # get_moe_scheme) — there is no GPU method for paging to wrap. Blocked upstream, not by us.
+            raise RuntimeError(
+                "Paged Experts cannot serve compressed-tensors int-quantized (int8 W8A8) MoE: sglang "
+                "has no CUDA fused-MoE for it (the W8A8Int8 MoE scheme is NPU-only). Use an nvfp4, int "
+                "pack-quantized, fp8 float-quantized, block-quant fp8, or GPTQ int4 checkpoint instead."
+            )
         raise RuntimeError(
-            f"Paged Experts supports compressed-tensors only with the nvfp4 packing; this "
-            f"checkpoint uses format={fmt or 'unknown'!r}. Use an nvfp4-pack, block-quant fp8, "
-            "GPTQ int4, or unquantized checkpoint, or run without --enable-paged-experts."
+            f"Paged Experts supports compressed-tensors with nvfp4, int pack-quantized, or fp8 "
+            f"float-quantized packings; this checkpoint uses format={fmt or 'unknown'!r}. Use one of "
+            "those, block-quant fp8, GPTQ int4, or unquantized, or run without --enable-paged-experts."
         )
     if quant_method == "mxfp4":
         # MXFP4 (gpt-oss): packed fp4 weights + per-group-of-32 e8m0 block scales + per-expert bf16

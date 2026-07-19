@@ -1140,6 +1140,114 @@ def _fill_gptq_marlin_from_checkpoint(
         store.fill_tensor(name, t)
 
 
+def _fill_ct_wna16_from_checkpoint(
+    store: ExpertStore, model_path: str, layer_idx: int
+) -> None:
+    """compressed-tensors int pack-quantized (the checkpoints the Hub labels "AWQ-4bit"/"w4a16" —
+    which are compressed-tensors, not classic autoawq). The packed layout is bit-compatible with
+    GPTQ, so this is the gptq-marlin fill with the compressed-tensors tensor names: per-projection
+    ``.weight_packed`` (int32, gptq-layout) + ``.weight_scale`` (fp16 group scales), symmetric
+    (no zero-points), group-wise, no act-order. Repack ALL E via sglang's own marlin ops into the
+    store keys ``w13_weight_packed``/``w2_weight_packed`` + ``w13_weight_scale``/``w2_weight_scale``
+    (exactly the paged params discover_paged_params keeps for this method)."""
+    from safetensors import safe_open
+
+    import sglang.srt.layers.quantization  # noqa: F401  (break the gptq_kernels import cycle)
+    from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
+        gptq_marlin_moe_repack,
+    )
+    from sglang.srt.layers.quantization.marlin_utils import marlin_moe_permute_scales
+
+    snap = _snapshot_dir(model_path)
+    cfg = json.load(open(os.path.join(snap, "config.json")))
+    tcfg = cfg.get("text_config", cfg)
+    inter = tcfg["moe_intermediate_size"]
+    qc = cfg["quantization_config"]
+    w = next(iter((qc.get("config_groups") or {}).values()), {}).get("weights", {})
+    bits = w["num_bits"]
+    group = w.get("group_size") or -1
+    pack = 32 // bits
+    if w.get("actorder") not in (None, "", "static", "weight"):
+        raise RuntimeError(
+            "[paged-experts] compressed-tensors runtime act-order (group/dynamic) needs g_idx "
+            "paging, unsupported; baked-in 'weight'/'static' act-order is fine."
+        )
+    if not w.get("symmetric", True):
+        raise RuntimeError(
+            "[paged-experts] compressed-tensors asymmetric (zero-point) pack-quantized unsupported."
+        )
+    wmap = _weight_map(snap)
+    pre = _experts_prefix(wmap, layer_idx)
+    dev = store.device
+
+    from contextlib import ExitStack
+
+    _shard_stack = ExitStack()
+    open_shards: Dict[str, object] = {}
+
+    def get(name: str) -> torch.Tensor:
+        sh = wmap[name]
+        if sh not in open_shards:
+            open_shards[sh] = _shard_stack.enter_context(
+                safe_open(os.path.join(snap, sh), framework="pt")
+            )
+        return open_shards[sh].get_tensor(name)
+
+    # compressed-tensors stores weight_packed as [out, in//pack] and weight_scale as [out, in//group]
+    # (is_transposed=True in create_weights; the native weight_loader transposes on load). GPTQ stores
+    # [in//pack, out]/[in//group, out] directly, and gptq_marlin_moe_repack expects [in//pack, out].
+    # So transpose each ct tensor to the gptq orientation, then fuse gate/up on the output dim (dim=1).
+    def _t(t):
+        return t.t().contiguous()
+
+    w13_pk, w2_pk, w13_s, w2_s = [], [], [], []
+    for e in range(store.E):
+        p = f"{pre}{e}."
+        w13_pk.append(
+            torch.cat(
+                [
+                    _t(get(p + "gate_proj.weight_packed")),
+                    _t(get(p + "up_proj.weight_packed")),
+                ],
+                dim=1,
+            )
+        )
+        w2_pk.append(_t(get(p + "down_proj.weight_packed")))
+        w13_s.append(
+            torch.cat(
+                [
+                    _t(get(p + "gate_proj.weight_scale")),
+                    _t(get(p + "up_proj.weight_scale")),
+                ],
+                dim=1,
+            )
+        )
+        w2_s.append(_t(get(p + "down_proj.weight_scale")))
+    _shard_stack.close()  # release shard handles before the (GPU) repack
+    w13_pk, w2_pk = torch.stack(w13_pk).to(dev), torch.stack(w2_pk).to(dev)
+    w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
+    sort = torch.empty((store.E, 0), dtype=torch.int32, device=dev)
+    marlin = {
+        "w13_weight_packed": gptq_marlin_moe_repack(
+            w13_pk, sort, w13_pk.shape[1] * pack, w13_pk.shape[2], bits
+        ),
+        "w2_weight_packed": gptq_marlin_moe_repack(
+            w2_pk, sort, w2_pk.shape[1] * pack, w2_pk.shape[2], bits
+        ),
+        "w13_weight_scale": marlin_moe_permute_scales(
+            s=w13_s, size_k=inter, size_n=w13_s.shape[2], group_size=group
+        ),
+        "w2_weight_scale": marlin_moe_permute_scales(
+            s=w2_s, size_k=w2_s.shape[1] * group, size_n=w2_s.shape[2], group_size=group
+        ),
+    }
+    for name in store.gpu:
+        t = marlin[name].contiguous().cpu()
+        expected = (store.E, *store.gpu[name].shape[1:])
+        assert tuple(t.shape) == expected, (name, t.shape, expected)
+        store.fill_tensor(name, t)
+
+
 def _fill_mxfp4_from_checkpoint(
     store: ExpertStore, model_path: str, layer_idx: int
 ) -> None:
@@ -1306,6 +1414,54 @@ def _fill_fp8_block_from_checkpoint(
                     row.copy_(t)
                     continue
                 # w13 packs gate (first half of dim 0) then up (second half); the block scales
+                # follow the same row split, so the same halving works for both suffixes.
+                half = row.shape[0] // 2
+                if proj == "gate_proj":
+                    row[:half].copy_(t)
+                else:  # up_proj
+                    row[half:].copy_(t)
+
+
+def _fill_ct_fp8_channel_from_checkpoint(
+    store: ExpertStore, model_path: str, layer_idx: int
+) -> None:
+    """compressed-tensors fp8 float-quantized, per-channel (or per-tensor) weights with DYNAMIC
+    activations (BCCard/…-FP8-Dynamic). Like the fp8-block fill but the scales are per-output-channel
+    ``[out,1]`` (not block ``_scale_inv``): host ``w13_weight=[E,2*inter,hidden]`` e4m3 (concat
+    gate,up) + ``w13_weight_scale=[E,2*inter,1]`` fp32, ``w2_weight``/``w2_weight_scale`` likewise.
+    Weights are stored ``[out,in]`` — same orientation as the store — so no transpose; gate/up fuse on
+    dim 0. No post-load transform for per-channel dynamic on CUDA, so a direct row copy matches the
+    native load. Scales are bf16 in the checkpoint; the store buffer is fp32 (cast on copy)."""
+    from safetensors import safe_open
+
+    assert store.gpu["w13_weight"].dtype == torch.float8_e4m3fn, (
+        "ct fp8 fill expects e4m3fn weights",
+        store.gpu["w13_weight"].dtype,
+    )
+    sdt = store.gpu["w13_weight_scale"].dtype  # fp32 buffer; checkpoint scale is bf16
+    snap = _snapshot_dir(model_path)
+    wmap = _weight_map(snap)
+    pre = _experts_prefix(wmap, layer_idx)
+    by_shard: Dict[str, list] = {}
+    for e in range(store.E):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            for suffix in ("weight", "weight_scale"):
+                by_shard.setdefault(wmap[f"{pre}{e}.{proj}.{suffix}"], []).append(
+                    (e, proj, suffix)
+                )
+    for shard, items in by_shard.items():
+        with safe_open(os.path.join(snap, shard), framework="pt") as f:
+            for e, proj, suffix in items:
+                t = f.get_tensor(f"{pre}{e}.{proj}.{suffix}")
+                base = "w2_weight" if proj == "down_proj" else "w13_weight"
+                name = base if suffix == "weight" else base + "_scale"
+                if suffix == "weight_scale":
+                    t = t.to(sdt)
+                row = store.row(name, e)
+                if proj == "down_proj":
+                    row.copy_(t)
+                    continue
+                # w13 packs gate (first half of dim 0) then up (second half); the per-channel scales
                 # follow the same row split, so the same halving works for both suffixes.
                 half = row.shape[0] // 2
                 if proj == "gate_proj":
@@ -1557,6 +1713,20 @@ def setup_pager(method, layer) -> ExpertPager:
         ):  # mxfp4 (marlin: packed weights + e8m0 scales + per-expert biases) — checked before
             # nvfp4 because the post-repack store also has w13_weight_scale; the biases are mxfp4-only.
             _fill_mxfp4_from_checkpoint(store, model_path, layer_idx)
+        elif (
+            "w13_weight_packed" in store.gpu
+        ):  # compressed-tensors int pack-quantized (the Hub's "AWQ-4bit"/"w4a16") — checked before
+            # nvfp4 because the post-repack store also has w13_weight_scale; the _packed key is
+            # ct-only (same distinguisher pattern mxfp4 uses with w13_weight_bias).
+            _fill_ct_wna16_from_checkpoint(store, model_path, layer_idx)
+        elif (
+            "w13_weight_scale" in store.gpu
+            and "w13_weight" in store.gpu
+            and store.gpu["w13_weight"].dtype == torch.float8_e4m3fn
+        ):  # compressed-tensors fp8 float-quantized (per-channel/per-tensor, dynamic act) — before
+            # nvfp4, which also carries w13_weight_scale but whose w13_weight is uint8-packed fp4;
+            # here w13_weight is real fp8 e4m3, which is the distinguisher.
+            _fill_ct_fp8_channel_from_checkpoint(store, model_path, layer_idx)
         elif (
             "w13_weight_scale" in store.gpu
         ):  # nvfp4 (packed uint8 + swizzled fp8 block scales)
