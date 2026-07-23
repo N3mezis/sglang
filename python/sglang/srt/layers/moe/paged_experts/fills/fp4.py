@@ -236,3 +236,198 @@ class Nvfp4Fill(ExpertFill):
     def fill(self, store, model_path, layer_idx, device):
         # returns the resident full-E scalar table -> method._nvfp4_full_e
         return _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device)
+
+
+def _fill_dsv4_fp4_from_checkpoint(
+    store: ExpertStore, model_path: str, layer_idx: int
+) -> None:
+    """DeepSeek-V4 MXFP4 routed experts: int8-packed fp4 weights + e8m0 block scales (block 32),
+    filled by a direct per-expert copy — mirrors the Fp8MoEMethod ``is_fp4_experts`` branch on the
+    non-DeepGEMM (Hopper) path, which keeps weights int8-packed and casts the e8m0 scale to float32 at
+    load with no repack. Host ``w13_weight=[E,2*I,H//2]`` int8 (concat gate=w1 then up=w3 on dim 0),
+    ``w2_weight=[E,H,I//2]`` int8; ``w13_weight_scale_inv=[E,2*I,H//32]`` and
+    ``w2_weight_scale_inv=[E,H,I//32]`` float32. No biases, no per-expert scalars.
+
+    Checkpoint keys are the RAW DSV4 layout ``layers.N.ffn.experts.{e}.{w1|w3|w2}.{weight|scale}`` (w1
+    gate, w3 up, w2 down) — NOT the model-side remapped ``mlp...gate_proj.weight_scale_inv`` names.
+
+    The resident scale is float32 only off the DeepGEMM ue8m0 path (Hopper / non-Blackwell). On a
+    Blackwell + DeepGEMM build the resident scale is a packed ue8m0 layout this direct copy would not
+    reproduce, so assert against it rather than silently mis-fill.
+    """
+    from safetensors import safe_open
+
+    assert store.gpu["w13_weight"].dtype == torch.int8, (
+        "dsv4-fp4 fill expects int8-packed fp4 weights",
+        store.gpu["w13_weight"].dtype,
+    )
+    assert store.gpu["w13_weight_scale_inv"].dtype == torch.float32, (
+        "dsv4-fp4 fill expects float32 block scales (packed-ue8m0/DeepGEMM layout unsupported)",
+        store.gpu["w13_weight_scale_inv"].dtype,
+    )
+    snap = _snapshot_dir(model_path)
+    wmap = _weight_map(snap)
+    pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)  # DSV4 -> (w1, w3, w2)
+    by_shard: Dict[str, list] = {}
+    for e in range(store.E):
+        for proj in (gate, up, down):
+            for suffix in ("weight", "scale"):
+                by_shard.setdefault(wmap[f"{pre}{e}.{proj}.{suffix}"], []).append(
+                    (e, proj, suffix)
+                )
+    for shard, items in by_shard.items():
+        _shard_path = os.path.join(snap, shard)
+        with safe_open(_shard_path, framework="pt") as f:
+            for e, proj, suffix in items:
+                t = f.get_tensor(f"{pre}{e}.{proj}.{suffix}")
+                base = "w2_weight" if proj == down else "w13_weight"
+                # checkpoint '.scale' (e8m0) -> store '..._scale_inv' (float32; cast on copy, exactly
+                # as the resident weight_loader does)
+                name = base if suffix == "weight" else base + "_scale_inv"
+                row = store.row(name, e)
+                if proj == down:
+                    row.copy_(t)
+                    continue
+                # w13 packs gate (first half of dim 0) then up (second half); the block scales follow
+                # the same row split, so the same halving works for both weight and scale.
+                half = row.shape[0] // 2
+                if proj == gate:
+                    row[:half].copy_(t)
+                else:  # up
+                    row[half:].copy_(t)
+        _drop_file_cache(_shard_path)  # release this shard's page cache before the next
+
+
+class Dsv4Fp4Fill(ExpertFill):
+    name = "dsv4-fp4"
+
+    def matches(self, store, quant_method: str) -> bool:
+        # DSV4 mxfp4 (Fp8MoEMethod is_fp4_experts): int8-packed weights + block scales under the
+        # _scale_inv name. Distinct from fp8-block (e4m3 weights), mxfp4 (has w13_weight_bias), and
+        # nvfp4 (uint8 weights + w13_weight_scale, not _scale_inv).
+        return (
+            "w13_weight_scale_inv" in store.gpu
+            and store.gpu["w13_weight"].dtype == torch.int8
+        )
+
+    def fill(self, store, model_path, layer_idx, device):
+        _fill_dsv4_fp4_from_checkpoint(store, model_path, layer_idx)
+        return None
+
+
+def _fill_dsv4_mxfp4_marlin_from_checkpoint(
+    store: ExpertStore, model_path: str, layer_idx: int
+) -> None:
+    """DeepSeek-V4 MXFP4 routed experts served through ``Mxfp4MarlinMoEMethod`` (``--moe-runner-backend
+    marlin`` — the working SM90/SM120 path; ``auto`` falls to triton, which can't consume packed fp4).
+    Reproduces that method's load+repack for ALL E experts into the host store, whose paged params are the
+    POST-repack marlin layout: ``w13_weight``/``w2_weight`` int8 + ``w13_weight_scale``/``w2_weight_scale``
+    ``float8_e8m0fnu`` (no ``_scale_inv``, no bias).
+
+    Unlike gpt-oss (``_fill_mxfp4_from_checkpoint``), DSV4 stores SEPARATE, PER-EXPERT gate/up tensors
+    (``w1``=gate, ``w3``=up, ``w2``=down; ``.weight`` int8-packed fp4, ``.scale`` e8m0) and has no bias, so
+    we place w1/w3 straight into the two padded intermediate halves (gate ``[0:I]``, up ``[p_inter:p_inter+I]``
+    — exactly the deinterleaved layout the loader produces) and SKIP ``deinterleave_moe_mxfp4_w13_for_marlin``
+    (DSV4 is silu, ``gemm1_alpha is None``). ``prepare_moe_mxfp4_layer_for_marlin`` then repacks + renames the
+    scales, matching the resident K-slot layout exactly. For DSV4 the padding is a no-op (p_inter=I=2048,
+    p_hidden=H=4096).
+    """
+    from safetensors import safe_open
+
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+        prepare_moe_mxfp4_layer_for_marlin,
+    )
+    from sglang.srt.utils import round_up
+
+    # Post-repack the marlin qweight is int32; the stable signature is the e8m0 scale.
+    assert store.gpu["w13_weight_scale"].dtype == torch.float8_e8m0fnu, (
+        "dsv4-mxfp4-marlin fill expects e8m0 marlin scales",
+        store.gpu["w13_weight_scale"].dtype,
+    )
+
+    snap = _snapshot_dir(model_path)
+    cfg = json.load(open(os.path.join(snap, "config.json")))
+    tcfg = cfg.get("text_config", cfg)
+    hidden = tcfg["hidden_size"]
+    inter = tcfg.get("moe_intermediate_size") or tcfg["intermediate_size"]
+    wmap = _weight_map(snap)
+    pre = _experts_prefix(wmap, layer_idx)
+    gate, up, down = _proj_names(wmap, pre)  # DSV4 -> (w1, w3, w2)
+    E = store.E
+    p_inter, p_hidden = round_up(inter, 128), round_up(hidden, 256)
+    e8 = torch.float8_e8m0fnu
+
+    # Pre-repack buffers matching Mxfp4MarlinMoEMethod.create_weights (scales default 127 == e8m0 1.0).
+    w13 = torch.zeros(E, 2 * p_inter, p_hidden // 2, dtype=torch.int8)
+    w2 = torch.zeros(E, p_hidden, p_inter // 2, dtype=torch.int8)
+    w13_s = torch.full((E, 2 * p_inter, p_hidden // 32), 127, dtype=torch.uint8)
+    w2_s = torch.full((E, p_hidden, p_inter // 32), 127, dtype=torch.uint8)
+
+    by_shard: Dict[str, list] = {}
+    for e in range(E):
+        for proj in (gate, up, down):
+            for suffix in ("weight", "scale"):
+                by_shard.setdefault(wmap[f"{pre}{e}.{proj}.{suffix}"], []).append(
+                    (e, proj, suffix)
+                )
+    for shard, items in by_shard.items():
+        _shard_path = os.path.join(snap, shard)
+        with safe_open(_shard_path, framework="pt") as f:
+            for e, proj, suffix in items:
+                t = f.get_tensor(f"{pre}{e}.{proj}.{suffix}")
+                if proj == down:
+                    if suffix == "weight":
+                        w2[e, :hidden, : inter // 2] = t
+                    else:
+                        w2_s[e, :hidden, : inter // 32] = t.view(torch.uint8)
+                else:
+                    # gate (w1) -> first padded half [0:I]; up (w3) -> second half [p_inter:p_inter+I]
+                    start = 0 if proj == gate else p_inter
+                    if suffix == "weight":
+                        w13[e, start : start + inter, : hidden // 2] = t
+                    else:
+                        w13_s[e, start : start + inter, : hidden // 32] = t.view(
+                            torch.uint8
+                        )
+        _drop_file_cache(_shard_path)  # release this shard's page cache before the next
+
+    dev = store.device
+    mock = torch.nn.Module()
+    mock.hidden_size = hidden
+    mock.orig_dtype = torch.bfloat16  # == params_dtype; drives the scale repack path
+    for n, t in (
+        ("w13_weight", w13),
+        ("w2_weight", w2),
+        ("w13_weight_scale_inv", w13_s.view(e8)),  # _inv name -> prepare renames + deletes it
+        ("w2_weight_scale_inv", w2_s.view(e8)),
+    ):
+        setattr(mock, n, torch.nn.Parameter(t.to(dev), requires_grad=False))
+    # DSV4 is silu (gemm1_alpha is None) -> no deinterleave; no biases.
+    prepare_moe_mxfp4_layer_for_marlin(mock)
+
+    for name in store.gpu:
+        t = getattr(mock, name).data.contiguous().cpu()
+        expected = (E, *store.gpu[name].shape[1:])
+        assert tuple(t.shape) == expected, (name, tuple(t.shape), expected)
+        store.fill_tensor(name, t)
+
+
+class Dsv4Mxfp4MarlinFill(ExpertFill):
+    name = "dsv4-mxfp4-marlin"
+
+    def matches(self, store, quant_method: str) -> bool:
+        # DSV4 mxfp4 via Mxfp4MarlinMoEMethod: marlin-repacked weights (int32) + e8m0 w*_weight_scale,
+        # no _scale_inv, no bias. The e8m0 scale dtype is the discriminator: nvfp4 uses e4m3/uint8
+        # scales, ct-fp8-channel float32; gpt-oss mxfp4 has w13_weight_bias; Dsv4Fp4Fill has _scale_inv.
+        g = store.gpu
+        return (
+            "w13_weight_scale" in g
+            and "w13_weight_scale_inv" not in g
+            and "w13_weight_bias" not in g
+            and g["w13_weight_scale"].dtype == torch.float8_e8m0fnu
+        )
+
+    def fill(self, store, model_path, layer_idx, device):
+        _fill_dsv4_mxfp4_marlin_from_checkpoint(store, model_path, layer_idx)
+        return None

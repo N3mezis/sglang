@@ -11,7 +11,7 @@ Adding a format = one ExpertFill subclass + one entry here.
 """
 
 from .base import ExpertFill
-from .fp4 import Mxfp4Fill, Nvfp4Fill
+from .fp4 import Dsv4Fp4Fill, Dsv4Mxfp4MarlinFill, Mxfp4Fill, Nvfp4Fill
 from .fp8 import CtFp8ChannelFill, Fp8BlockFill
 from .marlin_int4 import (
     AwqMarlinFill,
@@ -32,6 +32,8 @@ FILLS = [
     CtFp8ChannelFill(),
     Mxfp4Fill(),
     Nvfp4Fill(),
+    Dsv4Fp4Fill(),
+    Dsv4Mxfp4MarlinFill(),
     Bf16Fill(),
 ]
 
@@ -45,7 +47,7 @@ def select_fill(store, quant_method: str) -> ExpertFill:
             f"[paged-experts] expected exactly one expert fill for params {list(store.gpu)} "
             f"(quant_method={quant_method!r}); matched {[f.name for f in hits] or 'none'}. "
             "Supported: gptq/awq/moe-wna16 int4, ct int pack-quantized, fp8 block, ct fp8-channel, "
-            "mxfp4, nvfp4, unquantized bf16."
+            "mxfp4, nvfp4, dsv4-fp4 (int8-packed + e8m0), unquantized bf16."
         )
     return hits[0]
 

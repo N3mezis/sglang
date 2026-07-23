@@ -126,7 +126,12 @@ class Fp8BlockFill(ExpertFill):
     name = "fp8-block"
 
     def matches(self, store, quant_method: str) -> bool:
-        return "w13_weight_scale_inv" in store.gpu
+        # DSV4 mxfp4 also registers w13_weight_scale_inv, but with int8-packed weights (Dsv4Fp4Fill);
+        # gate on the e4m3 weight dtype so the two predicates stay mutually exclusive.
+        return (
+            "w13_weight_scale_inv" in store.gpu
+            and store.gpu["w13_weight"].dtype == torch.float8_e4m3fn
+        )
 
     def fill(self, store, model_path, layer_idx, device):
         _fill_fp8_block_from_checkpoint(store, model_path, layer_idx)

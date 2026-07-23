@@ -73,6 +73,10 @@ def _experts_prefix(wmap: Dict[str, str], layer_idx: int) -> str:
         f"model.layers.{layer_idx}.block_sparse_moe.experts.",
         # Mistral consolidated native layout (Mistral-Small-4 nvfp4): no model./mlp. nesting.
         f"layers.{layer_idx}.experts.",
+        # DeepSeek-V4: routed experts under .ffn.experts. (proj stems w1/w3/w2 = gate/up/down),
+        # weights + .scale (mxfp4 int8-packed + e8m0). Raw checkpoint keys carry no model. prefix.
+        f"model.layers.{layer_idx}.ffn.experts.",
+        f"layers.{layer_idx}.ffn.experts.",
     ):
         if any(
             k.startswith(pre) for k in (wmap.keys() if hasattr(wmap, "keys") else wmap)
