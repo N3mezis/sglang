@@ -1,13 +1,14 @@
 """Unquantized (bf16/fp16) expert fill."""
 
 import os  # noqa: E402  (used by the verbatim body below)
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 
 from ..store import ExpertStore
 from .base import ExpertFill
 from .checkpoint import (
+    _drop_file_cache,
     _experts_prefix,
     _proj_names,
     _snapshot_dir,
@@ -43,7 +44,8 @@ def _fill_bf16_from_checkpoint(
         for proj in (gate, up, down):
             by_shard.setdefault(wmap[f"{pre}{e}.{proj}.weight"], []).append((e, proj))
     for shard, items in by_shard.items():
-        with safe_open(os.path.join(snap, shard), framework="pt") as f:
+        _shard_path = os.path.join(snap, shard)
+        with safe_open(_shard_path, framework="pt") as f:
             for e, proj in items:
                 t = f.get_tensor(f"{pre}{e}.{proj}.weight").to(dt)
                 if proj == down:
@@ -56,6 +58,7 @@ def _fill_bf16_from_checkpoint(
                     row[:half].copy_(t)
                 else:  # up
                     row[half:].copy_(t)
+        _drop_file_cache(_shard_path)  # release this shard's page cache before the next
 
 
 class Bf16Fill(ExpertFill):

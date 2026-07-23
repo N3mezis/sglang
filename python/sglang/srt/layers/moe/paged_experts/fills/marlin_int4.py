@@ -7,13 +7,14 @@ lands on the uint8 wna16 layout, split by the qweight dtype."""
 import json
 import logging
 import os  # noqa: E402  (used by verbatim bodies)
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 
 from ..store import ExpertStore
 from .base import ExpertFill
 from .checkpoint import (
+    _drop_file_cache,
     _experts_prefix,
     _proj_names,
     _snapshot_dir,
@@ -100,6 +101,8 @@ def _fill_gptq_marlin_from_checkpoint(
             w13_gi.append(g_gate)
             w2_gi.append(get(f"{p}{down}.g_idx"))
     _shard_stack.close()  # release shard handles before the (GPU) repack
+    for _sh in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
+        _drop_file_cache(os.path.join(snap, _sh))
     w13_qw, w2_qw = torch.stack(w13_qw).to(dev), torch.stack(w2_qw).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
     if desc_act:
@@ -222,6 +225,8 @@ def _fill_ct_wna16_from_checkpoint(
         )
         w2_s.append(_t(get(f"{p}{down}.weight_scale")))
     _shard_stack.close()  # release shard handles before the (GPU) repack
+    for _sh in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
+        _drop_file_cache(os.path.join(snap, _sh))
     w13_pk, w2_pk = torch.stack(w13_pk).to(dev), torch.stack(w2_pk).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
     sort = torch.empty((store.E, 0), dtype=torch.int32, device=dev)
@@ -309,6 +314,8 @@ def _fill_awq_marlin_from_checkpoint(
         )
         w2_qz.append(get(f"{p}{down}.qzeros"))
     _shard_stack.close()  # release shard handles before the (GPU) repack
+    for _sh in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
+        _drop_file_cache(os.path.join(snap, _sh))
     w13_qw, w2_qw = torch.stack(w13_qw).to(dev), torch.stack(w2_qw).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
     w13_qz, w2_qz = torch.stack(w13_qz).to(dev), torch.stack(w2_qz).to(dev)
@@ -407,6 +414,8 @@ def _fill_moe_wna16_from_checkpoint(
             get(f"{p}{down}.scales").t().contiguous().to(sdt)
         )
     _shard_stack.close()
+    for _sh in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
+        _drop_file_cache(os.path.join(snap, _sh))
 
 
 class GptqMarlinFill(ExpertFill):

@@ -5,7 +5,29 @@ fills that produce the same store keys (gptq vs awq marlin)."""
 
 import json
 import os
-from typing import Dict, Optional
+from typing import Dict
+
+
+def _drop_file_cache(path: str) -> None:
+    """Best-effort ``POSIX_FADV_DONTNEED`` on a checkpoint shard AFTER its experts have been copied into
+    the store. ``safe_open`` mmaps each shard, so without this the read pages accumulate in the OS page
+    cache across all shards/layers — up to the FULL model size — alongside the (separate) host store,
+    doubling peak RAM during load. Dropping each shard as it's consumed keeps the source-side cache to
+    ~one shard. Each layer reads DISJOINT byte ranges of a shared shard, so this drops almost nothing
+    another layer reuses (only bounded read-ahead). Linux-only; a no-op where posix_fadvise is
+    unavailable."""
+    fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or dontneed is None:
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            fadvise(fd, 0, 0, dontneed)  # (offset=0, len=0) => whole file
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
 
 
 def _snapshot_dir(model_path: str) -> str:

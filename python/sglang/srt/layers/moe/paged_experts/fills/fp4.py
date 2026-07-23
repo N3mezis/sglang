@@ -4,13 +4,14 @@ nvfp4-pack, swizzled fp8 block scales + a resident full-E scalar table returned 
 
 import json
 import os
-from typing import Dict, Optional
+from typing import Dict
 
 import torch
 
 from ..store import ExpertStore
 from .base import ExpertFill
 from .checkpoint import (
+    _drop_file_cache,
     _experts_prefix,
     _proj_names,
     _snapshot_dir,
@@ -48,9 +49,13 @@ def _fill_mxfp4_from_checkpoint(
     E = store.E
     p_inter, p_hidden = round_up(inter, 128), round_up(hidden, 256)
 
+    _loaded_shards: set = set()
+
     def load(stem: str) -> torch.Tensor:
         name = f"{pre}{stem}"
-        with safe_open(os.path.join(snap, wmap[name]), framework="pt") as f:
+        path = os.path.join(snap, wmap[name])
+        _loaded_shards.add(path)
+        with safe_open(path, framework="pt") as f:
             return f.get_tensor(name)
 
     gu_b = (
@@ -61,6 +66,8 @@ def _fill_mxfp4_from_checkpoint(
     dn_s = load("down_proj_scales").view(torch.uint8)  # [E, hidden, inter//32]
     gu_bias = load("gate_up_proj_bias")  # [E, 2*inter] bf16
     dn_bias = load("down_proj_bias")  # [E, hidden]
+    for _p in _loaded_shards:  # release the consumed shards' page cache (bound peak load RAM)
+        _drop_file_cache(_p)
 
     e8 = torch.float8_e8m0fnu
     # Match the base method's create_weights buffers (intermediate padded to p_inter, hidden to p_hidden).
@@ -144,7 +151,8 @@ def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
                     (e, proj, suf)
                 )
     for shard, items in by_shard.items():
-        with safe_open(os.path.join(snap, shard), framework="pt") as f:
+        _shard_path = os.path.join(snap, shard)
+        with safe_open(_shard_path, framework="pt") as f:
             for e, proj, suf in items:
                 t = f.get_tensor(f"{pre}{e}.{proj}.{suf}")
                 is_down = proj == down
@@ -179,6 +187,7 @@ def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
                 else:  # input_global_scale
                     dst = w1_igs if proj == gate else (w2_igs if is_down else w3_igs)
                     dst[e] = t.flatten()[0]
+        _drop_file_cache(_shard_path)  # release this shard's page cache before the next
 
     # swizzle block scales to the cutlass 128x4 layout (same transform the method's PWAL applies)
     store.fill_tensor(

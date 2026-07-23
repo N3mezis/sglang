@@ -64,6 +64,22 @@ _PRE_LOAD_HOST_AVAIL = _host_available_bytes()
 # estimated reserve happened to sit ~0.2 GB above their true non-expert weights booted reliably.
 _NONEXPERT_RUNTIME_RESERVE = 0.5e9
 
+# 'max' auto-K (--paged-experts-num-resident max). The two concurrency-scaled safety margins — the
+# mem_fraction activation headroom (~10% of VRAM) and the non-expert runtime padding above — are
+# over-provisioned by ~a GB, capping K well below the physical ceiling. Aggressive mode reclaims them: a
+# MEASURED activation reserve (below) replaces the percentage, and the non-expert padding shrinks to a small
+# real-workspace slack. The KV reserve still floors the pool to one prefill chunk (+ window).
+#
+# Batch: chunked prefill caps the PREFILL activation peak at chunked_prefill_size regardless of batch (chunks
+# are scheduled, not run as one forward), so activations barely scale with bs — verified stable at bs=2 with
+# the bs=1 reserve. What does scale with bs is decode-time logits/workspaces + the captured-graph pool, so the
+# reserve carries a small per-running-request term. base + per_req*mrr; bs=1 == 0.5 GB (the tuned value).
+# Higher mrr also grows the KV reserve, which squeezes K on its own — so aggressive at high concurrency
+# self-limits. Validated for modest bs (≤~4 on this card); the linear term errs toward safety beyond that.
+_AGGRESSIVE_ACT_BASE = 0.4e9  # bs-independent: prefill-chunk activation + fragmentation slack
+_AGGRESSIVE_ACT_PER_REQ = 0.1e9  # per running request: decode logits/workspaces + captured-graph pool
+_AGGRESSIVE_WORKSPACE_SLACK = 0.2e9  # real loader/quant workspace kept on top of the EXACT non-expert bytes
+
 
 def _nonexpert_weight_bytes_from_checkpoint(model_path: str) -> Optional[int]:
     """EXACT non-expert weight bytes, summed from the checkpoint's safetensors headers (8-byte length
@@ -178,14 +194,18 @@ def _moe_geometry():
 @functools.lru_cache(maxsize=None)
 def resolve_num_resident_experts(
     num_experts_E: int,
+    num_resident: str = "auto",
     *,
     nonexpert_reserve_gb: float = 2.5,
 ) -> int:
-    """Resolve K when the method is built, from sglang's OWN already-derived config (no CLI re-parse):
-    read ``mem_fraction_static`` / ``context_length`` / ``kv_cache_dtype`` off
-    ``get_global_server_args()`` and the arch off ``ModelConfig``, then call the pure sizing formula.
-    Reading the SAME mem_fraction the server runs at keeps K and the KV pool coherent by construction.
-    Cached: every MoE layer resolves the same K.
+    """Resolve K when the method is built, from sglang's OWN already-derived config (no CLI re-parse): read
+    ``mem_fraction_static`` / ``context_length`` / ``kv_cache_dtype`` off ``get_global_server_args()`` and the
+    arch off ``ModelConfig``, then call the pure sizing formula.
+
+    ``num_resident`` is the ``--paged-experts-num-resident`` value: ``"auto"`` (conservative, respects
+    mem_fraction) or ``"max"`` (reclaim the concurrency-scaled safety margins). Reading the SAME mem_fraction
+    the server runs at keeps K and the KV pool coherent by construction. Cached: every MoE layer resolves the
+    same K. (Only called for ``auto``/``max``; a pinned int K bypasses this.)
     """
     from sglang.srt.server_args import get_global_server_args
 
@@ -193,21 +213,52 @@ def resolve_num_resident_experts(
     mc, htc, moe_layers, per_el = _moe_geometry()
     layers = mc.num_hidden_layers
 
-    # KV headroom to reserve when sizing K. The K-slot pool is FIXED (it does not grow with concurrency);
-    # sglang sizes the real KV pool from the post-weights leftover and derives max_running_requests from
-    # THAT. So reserving the worst case (max_running_requests x full context) here double-counts and
-    # starves K — a footgun on the constrained cards Paged Experts targets (a high --max-running-requests
-    # silently floored K to top_k). Reserve a SINGLE-STREAM context by default; sglang's actual KV pool
-    # (the leftover) then supports real concurrency. --paged-experts-kv-reserve-gb overrides to reserve a
-    # larger guaranteed KV pool (smaller K). sizing.compute_num_resident_experts clamps it to physical.
+    # KV headroom to reserve when sizing K — the K-slot pool and the KV pool compete for the SAME VRAM,
+    # so the reserve is the KV/K split knob. Reserve for the ACTUALLY-declared concurrency
+    # (``max_running_requests`` x context): low concurrency (single-stream) reserves little -> K claims
+    # the surplus (fewer expert page-ins, the single-stream win); high concurrency reserves more -> the
+    # KV pool rightly stays large. ``compute_num_resident_experts`` clamps the reserve to what's left
+    # after a top_k pool, so a pathologically high max_running_requests floors K to top_k instead of
+    # going negative. --paged-experts-kv-reserve-gb overrides with an explicit total KV budget.
     kv_elt = 1 if "fp8" in (sa.kv_cache_dtype or "").lower() else 2
     ctx = sa.context_length or getattr(mc, "context_len", None) or 2048
+    free = _PRE_LOAD_FREE_BYTES or torch.cuda.mem_get_info()[0]
+    top_k = getattr(htc, "num_experts_per_tok", 8) or 8
+    mem_frac = sa.mem_fraction_static or 0.85
+    mrr = max(1, int(getattr(sa, "max_running_requests", 1) or 1))
+
+    # Non-expert weights: exact from the checkpoint safetensors headers when available (+ runtime reserve),
+    # else a config estimate floored at the default.
+    exact = _nonexpert_weight_bytes_from_checkpoint(sa.model_path)
+    if exact is not None:
+        nonexpert_bytes = exact + _NONEXPERT_RUNTIME_RESERVE
+    else:
+        vocab = getattr(htc, "vocab_size", 0) or 0
+        tied = bool(getattr(htc, "tie_word_embeddings", False))
+        embed_bytes = vocab * htc.hidden_size * 2 * (1 if tied else 2)
+        _NONEXPERT_BASE = 2.0e9
+        if getattr(mc.hf_config, "vision_config", None) is not None:
+            embed_bytes += int(1.0e9)  # VL checkpoints load a vision tower + projector
+        nonexpert_bytes = max(nonexpert_reserve_gb * 1e9, _NONEXPERT_BASE + embed_bytes)
+
+    # 'max' reclaim (--paged-experts-num-resident max): replace the mem_fraction activation headroom with a
+    # measured, batch-scaled reserve and shrink the non-expert padding to a small workspace slack (see
+    # _AGGRESSIVE_* above). Works at bs>1 — the reserve carries a per-running-request term. (To override the
+    # reserve, pin K explicitly with --paged-experts-num-resident <int>.)
+    aggressive = num_resident == "max"
+    act_reserve = None
+    if aggressive:
+        if exact is not None:
+            nonexpert_bytes = exact + _AGGRESSIVE_WORKSPACE_SLACK
+        act_reserve = _AGGRESSIVE_ACT_BASE + _AGGRESSIVE_ACT_PER_REQ * mrr
+
+    # KV reserve (the K/KV split): mrr x context x per-token, MLA cell or MHA/GQA per-token.
     kv_gb = getattr(sa, "paged_experts_kv_reserve_gb", -1.0)
     if kv_gb is not None and kv_gb >= 0:
         kv_reserve = kv_gb * 1e9
     elif getattr(mc, "kv_lora_rank", None):  # MLA
         cell = (mc.kv_lora_rank + mc.qk_rope_head_dim) * layers * kv_elt
-        kv_reserve = ctx * cell  # single-stream
+        kv_reserve = mrr * ctx * cell
     else:  # MHA / GQA — reuse the pure helper (get_num_kv_heads handles GQA + TP)
         tp = getattr(sa, "tp_size", 1) or 1
         kv_reserve = kv_reserve_bytes_mha(
@@ -215,7 +266,7 @@ def resolve_num_resident_experts(
             num_kv_heads=mc.get_num_kv_heads(tp),
             head_dim=(mc.head_dim + mc.v_head_dim) // 2,  # combined K+V per-head width
             kv_dtype_bytes=kv_elt,
-            max_running_requests=1,  # single-stream headroom, NOT worst-case concurrency
+            max_running_requests=mrr,  # size KV for the declared concurrency; single-stream -> small
             context_length=ctx,
         )
 
@@ -237,33 +288,6 @@ def resolve_num_resident_experts(
         # (the documented knob for hybrid concurrency) — don't stack the automatic reserve on top.
         kv_reserve += mamba_per_req * _HYBRID_STATE_SLOTS
 
-    # Non-expert weights: read EXACTLY from the checkpoint's safetensors headers when available —
-    # embeddings, lm_head, attention/dense/shared-expert weights, vision towers, at their true
-    # (possibly quantized) sizes — plus a runtime reserve for the serving process's own allocations
-    # (workspaces, capture pools). Falls back to a config estimate when the checkpoint isn't locally
-    # readable; both floored at the passed default so smaller models keep their K.
-    exact = _nonexpert_weight_bytes_from_checkpoint(sa.model_path)
-    if exact is not None:
-        nonexpert_bytes = max(
-            nonexpert_reserve_gb * 1e9, exact + _NONEXPERT_RUNTIME_RESERVE
-        )
-    else:
-        # The fixed base underestimates big-vocab / VL checkpoints (a 248k untied vocab is ~2 GB of
-        # embeddings + lm_head alone) — estimate the dominant variable term from config. The 2.0 GB
-        # base covers attention/dense weights + the runtime reserve.
-        vocab = getattr(htc, "vocab_size", 0) or 0
-        tied = bool(getattr(htc, "tie_word_embeddings", False))
-        embed_bytes = vocab * htc.hidden_size * 2 * (1 if tied else 2)
-        _NONEXPERT_BASE = 2.0e9
-        if getattr(mc.hf_config, "vision_config", None) is not None:
-            embed_bytes += int(
-                1.0e9
-            )  # VL checkpoints load a vision tower + projector alongside the text model
-        nonexpert_bytes = max(nonexpert_reserve_gb * 1e9, _NONEXPERT_BASE + embed_bytes)
-
-    free = _PRE_LOAD_FREE_BYTES or torch.cuda.mem_get_info()[0]
-    top_k = getattr(htc, "num_experts_per_tok", 8) or 8
-    mem_frac = sa.mem_fraction_static or 0.85
     k = compute_num_resident_experts(
         free_vram_bytes=free,
         mem_fraction=mem_frac,
@@ -273,10 +297,11 @@ def resolve_num_resident_experts(
         per_expert_layer_bytes=per_el,
         top_k=top_k,
         num_experts=num_experts_E,
+        activation_reserve_bytes=act_reserve,
     )
     logger.info(
         "[paged-experts] resident K=%d/%d (%d%%): free=%.2fGB mem_fraction=%.3f "
-        "nonexpert=%.2fGB(%s) KV_reserve=%.2fGB per_expert=%.2fMB moe_layers=%d",
+        "nonexpert=%.2fGB(%s) KV_reserve=%.2fGB per_expert=%.2fMB moe_layers=%d%s",
         k,
         num_experts_E,
         k * 100 // num_experts_E,
@@ -287,6 +312,7 @@ def resolve_num_resident_experts(
         kv_reserve / 1e9,
         per_el / 1e6,
         moe_layers,
+        (f" MAX act_reserve={act_reserve / 1e9:.2f}GB" if aggressive else ""),
     )
     return k
 
@@ -479,8 +505,10 @@ def make_for_layer(
     _geo_mc, _geo_htc = _moe_geometry()[:2]
     check_paged_experts_quant(_quant_source(_geo_mc, _geo_htc))
     E = int(getattr(layer, "num_local_experts", None) or layer.num_experts)
-    if num_resident == "auto":
-        K = resolve_num_resident_experts(E, nonexpert_reserve_gb=nonexpert_reserve_gb)
+    if num_resident in ("auto", "max"):
+        K = resolve_num_resident_experts(
+            E, str(num_resident), nonexpert_reserve_gb=nonexpert_reserve_gb
+        )
     else:
         K = int(num_resident)
     pin_host = getattr(server_args, "paged_experts_store", "pinned") != "paged"
