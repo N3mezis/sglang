@@ -3,6 +3,7 @@ nvfp4-pack, swizzled fp8 block scales + a resident full-E scalar table returned 
 """
 
 import json
+import logging
 import os
 from typing import Dict
 
@@ -10,6 +11,8 @@ import torch
 
 from ..store import ExpertStore
 from .base import ExpertFill
+
+logger = logging.getLogger(__name__)
 from .checkpoint import (
     _drop_file_cache,
     _experts_prefix,
@@ -429,5 +432,19 @@ class Dsv4Mxfp4MarlinFill(ExpertFill):
         )
 
     def fill(self, store, model_path, layer_idx, device):
-        _fill_dsv4_mxfp4_marlin_from_checkpoint(store, model_path, layer_idx)
+        # Cache the repacked store like gptq-marlin: the DSV4 marlin repack is expensive (~seconds/layer),
+        # deterministic, and independent of K, so persisting it turns later boots' read+repack into a
+        # straight sequential read.
+        from . import cache
+
+        cache_dir = cache._store_cache_dir(model_path)
+        if cache._fill_store_from_cache(store, cache_dir, layer_idx):
+            if not cache._STORE_CACHE_LOGGED:
+                cache._STORE_CACHE_LOGGED = True
+                logger.info(
+                    "[paged-experts] host store loading from the repack cache (%s)", cache_dir
+                )
+        else:
+            _fill_dsv4_mxfp4_marlin_from_checkpoint(store, model_path, layer_idx)
+            cache._save_store_to_cache(store, cache_dir, layer_idx)
         return None

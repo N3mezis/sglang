@@ -64,21 +64,28 @@ _PRE_LOAD_HOST_AVAIL = _host_available_bytes()
 # estimated reserve happened to sit ~0.2 GB above their true non-expert weights booted reliably.
 _NONEXPERT_RUNTIME_RESERVE = 0.5e9
 
-# 'max' auto-K (--paged-experts-num-resident max). The two concurrency-scaled safety margins — the
-# mem_fraction activation headroom (~10% of VRAM) and the non-expert runtime padding above — are
-# over-provisioned by ~a GB, capping K well below the physical ceiling. Aggressive mode reclaims them: a
-# MEASURED activation reserve (below) replaces the percentage, and the non-expert padding shrinks to a small
-# real-workspace slack. The KV reserve still floors the pool to one prefill chunk (+ window).
-#
-# Batch: chunked prefill caps the PREFILL activation peak at chunked_prefill_size regardless of batch (chunks
-# are scheduled, not run as one forward), so activations barely scale with bs — verified stable at bs=2 with
-# the bs=1 reserve. What does scale with bs is decode-time logits/workspaces + the captured-graph pool, so the
-# reserve carries a small per-running-request term. base + per_req*mrr; bs=1 == 0.5 GB (the tuned value).
-# Higher mrr also grows the KV reserve, which squeezes K on its own — so aggressive at high concurrency
-# self-limits. Validated for modest bs (≤~4 on this card); the linear term errs toward safety beyond that.
-_AGGRESSIVE_ACT_BASE = 0.4e9  # bs-independent: prefill-chunk activation + fragmentation slack
-_AGGRESSIVE_ACT_PER_REQ = 0.1e9  # per running request: decode logits/workspaces + captured-graph pool
+# 'max' auto-K (--paged-experts-num-resident max). auto respects --mem-fraction-static, holding back
+# pre_free*(1-mem_fraction) (~10% of VRAM) as capture/activation slack; on a model that only partly fits,
+# that headroom caps K below the physical ceiling. 'max' reclaims MOST of it — but NOT by bypassing
+# mem_fraction: sglang's KV configurator reserves exactly that slack for the CUDA-graph capture pool and
+# REJECTS weights above mem_fraction*pre_free, so bypassing it OOMs capture / gets rejected on a near-fitting
+# model (e.g. DSV4, which already sits ~78% resident under auto). Instead 'max' leaves a small, explicit
+# SAFE SLACK for the capture pool and RAISES the served mem_fraction to match, so the configurator permits
+# the larger weight budget while capture still fits. The slack scales with the captured decode-graph batch
+# (heavier graphs -> bigger pool; DSA/indexer models capture a lot, hence the conservative base). It never
+# pushes past _MAX_MEM_FRACTION_CEIL (always >=1-ceil left for capture) and never drops below the served
+# fraction (max is >= auto). This is a K/capture split, not the old free-minus-tiny-reserve edge-gamble.
+_MAX_CAPTURE_BASE = 2.5e9  # capture/activation slack floor (covers a single captured decode graph)
+_MAX_CAPTURE_PER_GRAPH = 0.5e9  # extra slack per captured decode-graph batch (cuda_graph_max_bs_decode)
+_MAX_MEM_FRACTION_CEIL = 0.96  # hardest 'max' pushes weights; the remaining >=4% stays as capture slack
 _AGGRESSIVE_WORKSPACE_SLACK = 0.2e9  # real loader/quant workspace kept on top of the EXACT non-expert bytes
+# Small slop on the MEASURED per-expert checkpoint size (below). The supported repacks are size-
+# preserving — marlin re-lays-out 4-bit weights (same bytes) and keeps e8m0 scales; bf16/fp8 fills are
+# direct copies — so the measured on-disk size IS the resident size (verified: DSV4 marlin resident
+# 14.38MB == measured 14.37MB). This margin only covers store 8-byte-alignment padding + estimate slop;
+# it is NOT a repack-inflation fudge (that was a wrong ~10% guess) and NOT the capture-pool reserve
+# (that is act_reserve, sized separately).
+_MEASURED_EXPERT_MARGIN = 1.05
 
 
 def _nonexpert_weight_bytes_from_checkpoint(model_path: str) -> Optional[int]:
@@ -130,6 +137,61 @@ def _nonexpert_weight_bytes_from_checkpoint(model_path: str) -> Optional[int]:
     return total
 
 
+def _routed_expert_bytes_from_checkpoint(model_path: str) -> Optional[int]:
+    """MEASURED total ROUTED-expert weight bytes from the safetensors headers (``data_offsets`` give
+    exact per-tensor sizes — no tensor data read). The complement of
+    ``_nonexpert_weight_bytes_from_checkpoint``: it SUMS the ``.experts.`` tensors (routed experts + their
+    scales, at their real on-disk dtype), while ``.shared_experts.`` does not match (shared experts stay
+    resident) and MTP/nextn draft layers are skipped. Divided by ``num_experts * moe_layers`` this yields
+    the per-expert-per-layer size WITHOUT trusting the ``quant_method`` label — the fix for checkpoints
+    whose declared quant differs from the routed-expert dtype (e.g. DSV4: quant_method=fp8, experts
+    mxfp4). Returns ``None`` when the checkpoint isn't a locally readable safetensors layout."""
+    import glob
+    import json
+    import struct
+
+    folder = model_path
+    if not folder:
+        return None
+    if not os.path.isdir(folder):
+        try:
+            from huggingface_hub import snapshot_download
+
+            folder = snapshot_download(
+                model_path, local_files_only=True, allow_patterns=["*.safetensors*"]
+            )
+        except Exception:
+            return None
+    files = sorted(glob.glob(os.path.join(folder, "*.safetensors")))
+    if not files:
+        return None
+    index = os.path.join(folder, "model.safetensors.index.json")
+    if os.path.exists(index):
+        try:
+            with open(index) as f:
+                need = set(json.load(f)["weight_map"].values())
+            if not need.issubset({os.path.basename(p) for p in files}):
+                return None
+        except Exception:
+            return None
+    total = 0
+    try:
+        for path in files:
+            with open(path, "rb") as f:
+                (hdr_len,) = struct.unpack("<Q", f.read(8))
+                header = json.loads(f.read(hdr_len))
+            for name, entry in header.items():
+                if name == "__metadata__" or ".experts." not in name:
+                    continue
+                if "mtp" in name or "nextn" in name:  # skip MTP / nextn draft expert layers
+                    continue
+                begin, end = entry["data_offsets"]
+                total += end - begin
+    except Exception:
+        return None
+    return total or None
+
+
 def _quant_source(mc, htc):
     """The config object carrying ``quantization_config``. VL checkpoints (e.g. Qwen3.5/3.6 MoE) put it
     on the TOP-level config while ``hf_text_config`` is the nested text config — reading only the text
@@ -159,9 +221,17 @@ def _moe_geometry():
         qm = (qc.get("quant_method") or "").lower()
         fmt = (qc.get("format") or "").lower()
         if qm == "fp8":
-            bits = (
-                8  # fp8 configs carry no "bits" key; block scales ride in the 3% margin
-            )
+            # DSV4 reports quant_method="fp8" but its ROUTED experts are mxfp4 (fp4-packed int8 +
+            # e8m0 block scales, ~4.25 bit-equiv, no biases) — the resident marlin store keeps them
+            # 4-bit. Sizing at 8 bits doubles the per-expert estimate and ~halves auto/max K (more
+            # paging). Use the real fp4 width, unless SGLANG_DSV4_FP4_DEQUANT upconverts them to fp8.
+            from sglang.srt.environ import envs
+
+            if getattr(mc, "is_fp4_experts", False) and not envs.SGLANG_DSV4_FP4_DEQUANT.get():
+                bits = 4.25
+            else:
+                bits = 8  # true fp8 block-quant (or fp4 dequantized to fp8); no "bits" key
+
         elif qm == "compressed-tensors" and "nvfp4" in fmt:
             # 4-bit packed weights + one fp8 block scale per 16 weights (8/16 = 0.5 bit-equiv);
             # tiny per-expert global scalars are negligible. ~4.5 effective bits/weight.
@@ -187,7 +257,23 @@ def _moe_geometry():
     # ``intermediate_size``. Fall back so this sizing estimate — which runs before the quant guard —
     # doesn't AttributeError on an unsupported arch/quant before the guard can reject it cleanly.
     moe_inter = getattr(htc, "moe_intermediate_size", None) or htc.intermediate_size
-    per_el = 3 * moe_inter * htc.hidden_size * (bits / 8.0) * 1.03
+    per_el_estimate = 3 * moe_inter * htc.hidden_size * (bits / 8.0) * 1.03
+
+    # ROBUST path: MEASURE the real per-expert bytes from the checkpoint headers (actual dtype + shapes +
+    # scale tensors) instead of trusting the quant_method bit-width guess. The guess is wrong when the
+    # label misdescribes the expert dtype (DSV4 declares fp8 but stores fp4 -> 2x over-estimate -> ~half
+    # K) or misjudges scale overhead. A margin covers the repacked resident layout running larger than the
+    # on-disk packing. Falls back to the config estimate when the checkpoint isn't locally readable.
+    num_experts = (
+        getattr(htc, "n_routed_experts", None)
+        or getattr(htc, "num_experts", None)
+        or getattr(htc, "num_local_experts", None)
+    )
+    routed_bytes = _routed_expert_bytes_from_checkpoint(getattr(mc, "model_path", "") or "")
+    if routed_bytes and num_experts and moe_layers:
+        per_el = (routed_bytes / (num_experts * moe_layers)) * _MEASURED_EXPERT_MARGIN
+    else:
+        per_el = per_el_estimate
     return mc, htc, moe_layers, per_el
 
 
@@ -247,10 +333,29 @@ def resolve_num_resident_experts(
     # reserve, pin K explicitly with --paged-experts-num-resident <int>.)
     aggressive = num_resident == "max"
     act_reserve = None
+    max_slack = None
     if aggressive:
+        # Shrink the non-expert padding to a real-workspace slack, then reclaim auto's mem_fraction
+        # headroom by RAISING the served fraction, leaving only a small capture-sized SAFE SLACK that
+        # sglang's KV configurator keeps for the capture pool. Sizing then goes through the normal
+        # mem_fraction path (act_reserve stays None) with the raised fraction — no bypass.
         if exact is not None:
             nonexpert_bytes = exact + _AGGRESSIVE_WORKSPACE_SLACK
-        act_reserve = _AGGRESSIVE_ACT_BASE + _AGGRESSIVE_ACT_PER_REQ * mrr
+        graph_bs = max(
+            1,
+            int(
+                getattr(sa, "cuda_graph_max_bs_decode", 0)
+                or getattr(sa, "cuda_graph_max_bs", 0)
+                or 1
+            ),
+        )
+        max_slack = _MAX_CAPTURE_BASE + _MAX_CAPTURE_PER_GRAPH * graph_bs
+        raised = min(_MAX_MEM_FRACTION_CEIL, 1.0 - max_slack / max(free, 1.0))
+        mem_frac = max(mem_frac, raised)  # >= served fraction: max is never less aggressive than auto
+        # The KV configurator reads mem_fraction_static LIVE (weight ceiling = fraction*pre_free, capture
+        # slack = pre_free*(1-fraction)); raise it so the larger weight budget is permitted and the slack
+        # is exactly our capture reserve.
+        sa.mem_fraction_static = mem_frac
 
     # KV reserve (the K/KV split): mrr x context x per-token, MLA cell or MHA/GQA per-token.
     kv_gb = getattr(sa, "paged_experts_kv_reserve_gb", -1.0)
@@ -312,7 +417,11 @@ def resolve_num_resident_experts(
         kv_reserve / 1e9,
         per_el / 1e6,
         moe_layers,
-        (f" MAX act_reserve={act_reserve / 1e9:.2f}GB" if aggressive else ""),
+        (
+            f" MAX capture_slack={max_slack / 1e9:.2f}GB mem_fraction->{mem_frac:.3f}"
+            if aggressive
+            else ""
+        ),
     )
     return k
 
