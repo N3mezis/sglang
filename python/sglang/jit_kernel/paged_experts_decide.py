@@ -60,6 +60,7 @@ def paged_experts_decide(
     dst: torch.Tensor,
     n_out: torch.Tensor,
     idx: torch.Tensor,
+    pin: int = 0,
 ) -> None:
     """On-device keep-warm + LRU/LFU residency decision for Paged Experts (distinct active experts <= K).
 
@@ -84,6 +85,7 @@ def paged_experts_decide(
         slot_lastuse,
         freq,
         int(lfu),
+        int(pin),
         src,
         dst,
         n_out,

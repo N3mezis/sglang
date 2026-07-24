@@ -589,41 +589,69 @@ class ExpertPager:
         if windowed:
             self._setup_window_ondevice()
 
-    def _setup_window_ondevice(self) -> None:
-        """Device state for the captured windowed (bounded) path: the static hot/cold membership maps the
-        decide_bounded kernel reads, the deferred-cold plan buffers + needed[] mask, and this layer's slot
-        in the shared replay-twice miss-vector (registers the post-replay hook on first call).
-        """
+    # LFU frequency sentinel for pinned experts: large enough to never be the min-freq victim under any
+    # realistic organic use count, with headroom below int32 max so the per-use atomicAdd can't overflow.
+    def seed_from_recording(self, counts: torch.Tensor) -> None:
+        """Warm-start + optional PINNED HOT TIER from an expert-distribution recording (this layer's
+        per-expert selection counts):
+        (1) physically page the hottest-K experts into the slot pool at init so the FIRST request hits them
+        instead of paging the hot set in as it goes (freq priors alone can't do this — the pool boots
+        holding experts 0..K-1, so the hot set would still page in on first use);
+        (2) seed the LFU frequency priors so eviction protects them from step 1;
+        (3) if ``pin_count`` > 0, set the hottest ``pin_count`` experts' freq to a sentinel so LFU never
+        evicts them while any non-pinned non-needed slot exists — a static hot tier + dynamic remainder that
+        removes the churn keeping LFU below the top-K coverage ceiling. SOFT: under pressure (a step needing
+        more non-pinned slots than the dynamic pool has) ``pick_victim`` still evicts the least-hot pinned
+        slot, so an expert is never masked. Runs EAGERLY at setup (before capture); reuses the capture-safe
+        UVA gather. No-op unless the on-device state exists."""
+        if self._freq_d is None or self._gm_stores is None or self._src_d is None:
+            return
+        from sglang.jit_kernel.paged_experts_decide import paged_experts_gather_multi
+
         dev, i32 = self.device, torch.int32
-        self._windowed = True
-        # log2hot[e] = hot-block index (or -1 if cold; a cold miss defers by logical id).
-        self._log2hot_d = self.store.hot_pos.to(dtype=i32, device=dev)
-        self._cold_log_d = torch.zeros(self.K, dtype=i32, device=dev)
-        self._needed_d = torch.zeros(self.K, dtype=i32, device=dev)
-        self._miss_idx, self._cold_n_d, self._doorbell, self._doorbell_ptr = (
-            _alloc_miss_slot(dev)
-        )
-        self._doorbell_np = self._doorbell.numpy()  # zero-copy view for the spin read
-        # Preallocated snapshot path for the break's batched D2H (device cat target + pinned host).
-        self._snap_dev = torch.empty(4 * self.K, dtype=i32, device=dev)
-        self._snap_pin = torch.empty(4 * self.K, dtype=i32, pin_memory=True)
-        # Fused refill scatter: SHARED device staging rows per tensor shape (module-level — refills
-        # are sequential across layers, and per-layer copies would cost rows*bytes*layers of VRAM the
-        # auto-K sizing doesn't know about) + a pinned/device pair for the destination-slot plan.
-        # Reuses _gm_slots/_gm_e16s (same tensor order). Bursts past the cap fall back to per-row copies.
-        self._sc_cap = min(self.K, _SC_STAGE_CAP)
-        self._sc_stage = {
-            name: _sc_stage_buf(name, p.shape[1:], p.dtype, dev)
-            for name, p in self.gpu.items()
-        }
-        names = list(self.gpu)
-        self._sc_stage_ptrs = torch.tensor(
-            [self._sc_stage[n].data_ptr() for n in names], dtype=torch.int64, device=dev
-        )
-        self._sc_dst_pin = torch.empty(self.K, dtype=i32, pin_memory=True)
-        self._sc_dst_np = self._sc_dst_pin.numpy()
-        self._sc_dst_d = torch.zeros(self.K, dtype=i32, device=dev)
-        _register_replay_pager(self)
+        counts = counts.to(device=dev, dtype=torch.float32)
+        self._freq_d.copy_(counts.to(i32))  # LFU priors
+        # DELTA reseed: keep hot experts already resident where they sit; page only the missing hot
+        # experts into slots whose occupant is NOT hot. Eager-only (host sync OK) — reads the LIVE device
+        # maps (the wave resync updates only the device side). A full-K unconditional reseed cost ~75MB x
+        # layers per prefill and sank short generations; the delta is usually a small fraction.
+        hot_l = counts.topk(self.K).indices.cpu().tolist()
+        hotset = set(hot_l)
+        cur_slot_exp = self._slot_expert_d.cpu().tolist()  # slot -> expert (live)
+        resident = set(x for x in cur_slot_exp if x >= 0)
+        free = [s for s, e in enumerate(cur_slot_exp) if e not in hotset]
+        missing = [e for e in hot_l if e not in resident]  # hottest-first order
+        src, dst = missing[: len(free)], free[: len(missing)]
+        n = len(src)
+        if n == 0:
+            # pool already holds the hot set (repeat prompt / later chunk): just sync the host mirrors
+            self.slot_expert = cur_slot_exp
+            self.logical_to_gpu_index.fill_(-1)
+            for s_, e in enumerate(cur_slot_exp):
+                if e >= 0:
+                    self.logical_to_gpu_index[e] = s_
+            return
+        if n:
+            self._src_d[:n].copy_(torch.tensor(src, dtype=i32, device=dev))
+            self._dst_d[:n].copy_(torch.tensor(dst, dtype=i32, device=dev))
+            self._n_out_d.fill_(n)
+            paged_experts_gather_multi(
+                self._gm_stores, self._gm_slots, self._gm_e16s, self._src_d, self._dst_d, self._n_out_d
+            )
+        # rebuild maps host-side from the reconciled layout, push once
+        for e, s_ in zip(src, dst):
+            cur_slot_exp[s_] = e
+        self.slot_expert = cur_slot_exp
+        self.logical_to_gpu_index.fill_(-1)
+        for s_, e in enumerate(cur_slot_exp):
+            if e >= 0:
+                self.logical_to_gpu_index[e] = s_
+        self.logical_to_gpu_index_cuda.copy_(self.logical_to_gpu_index)
+        self._slot_expert_d.copy_(torch.tensor(cur_slot_exp, dtype=i32, device=dev))
+        # reset recency uniformly: after prefill the kept residents' lastuse is ancient, and mixed-age
+        # state made LRU evict the kept hot residents first (measured: killed the warm-up win).
+        self._slot_lastuse_d.zero_()
+        hot = torch.tensor(hot_l, dtype=i32, device=dev)
 
     def _prep_topk_ondevice(self, topk_ids: torch.Tensor) -> None:
         """Copy the router's topk ids into the persistent int32 buffer the kernels read (casts int64 ->
@@ -941,7 +969,8 @@ class ExpertPager:
     ) -> None:
         """One static wave (distinct > K, e.g. prefill): plan + gather the in-wave experts on-device. The
         caller runs ceil(E/wave_k) waves and sums the per-wave GEMM partials, then calls
-        ``resync_residency_ondevice`` so the keep-warm state matches the slots. The banked
+        ``resync_residency_ondevice`` so the keep-warm state matches the slots (zero-copy mode instead
+        restores its static hot tier afterwards via ``reseed_hot``). The banked
         (double-buffered) caller passes ``wave_k = K//2`` with alternating ``slot_base`` and a per-bank
         ``idx_out`` (so the next wave's decide cannot race this wave's remap); the captured caller uses
         the defaults (full-K waves into ``logical_to_gpu_index_cuda``)."""
