@@ -121,9 +121,13 @@ __global__ void decide_kernel(
     *n_out = n;
   }
   __syncwarp();
-  // map snapshot (warp-parallel)
-  for (int e = lane; e < E; e += 32)
-    idx[e] = expert_slot[e];
+  // map snapshot (warp-parallel) — SKIP when idx aliases expert_slot. The captured decode path passes the
+  // same logical_to_gpu_index_cuda buffer for both expert_slot and idx, and pass 2 already mutated it in
+  // place, so this loop would be a 256-wide uncoalesced self-copy on one warp every MoE layer every step
+  // (measured ~6% of decode). Preserved for any non-aliased caller that needs a distinct snapshot.
+  if (idx != expert_slot)
+    for (int e = lane; e < E; e += 32)
+      idx[e] = expert_slot[e];
 }
 
 // Bounded keep-warm + LRU/LFU decision for the pinned-WINDOW store (distinct active experts <= K). Same
@@ -208,9 +212,11 @@ __global__ void decide_bounded_kernel(
     }
   }
   __syncwarp();
-  // map snapshot + needed[] scan (warp-parallel over E and K; inner topk scan is short)
-  for (int e = lane; e < E; e += 32)
-    idx[e] = expert_slot[e];
+  // map snapshot (skip when idx aliases expert_slot — decode passes one buffer for both, pass 2 already
+  // mutated it in place) + needed[] scan (warp-parallel over E and K; inner topk scan is short)
+  if (idx != expert_slot)
+    for (int e = lane; e < E; e += 32)
+      idx[e] = expert_slot[e];
   for (int s = lane; s < K; s += 32) {
     const int se = slot_expert[s];
     int nd = 0;
