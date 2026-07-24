@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 
+from sglang.srt.server_args import get_global_server_args
+
 logger = logging.getLogger(__name__)
 
 
@@ -122,6 +124,8 @@ class CapturedPlacement(Placement):
     needs_ondevice_store = True
 
     def apply(self, method, layer, dispatch_output):
+        import torch
+
         from sglang.srt.layers.moe.paged_experts.forward import _ondevice_wave_apply
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
@@ -134,6 +138,15 @@ class CapturedPlacement(Placement):
         else:  # distinct can exceed K (prefill / big batch): static waves, summed
             _warn_wave_capture_once(pager, topk_ids)
             hidden = _ondevice_wave_apply(method, layer, dispatch_output, topk_ids)
+            if not torch.cuda.is_current_stream_capturing() and getattr(
+                get_global_server_args(), "paged_experts_prompt_warmup", False
+            ):
+                # Prompt-aware warm-up: seed the pool from THIS chunk's routing counts (the prompt tail —
+                # the most recency-relevant prior for the coming generation) instead of the last wave's
+                # arbitrary leftovers. Delta-aware: pages only the missing hot experts (one small gather).
+                flat = topk_ids.reshape(-1).long()
+                counts = torch.bincount(flat[flat >= 0], minlength=pager.E).float()
+                pager.seed_from_recording(counts)
         return StandardCombineInput(hidden_states=hidden)
 
 

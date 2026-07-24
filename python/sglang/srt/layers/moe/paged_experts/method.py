@@ -192,6 +192,61 @@ def _routed_expert_bytes_from_checkpoint(model_path: str) -> Optional[int]:
     return total or None
 
 
+# fp4-packed (int8, 0.5 B/weight) MTP experts DEQUANTIZE to bf16 (2 B/weight) when the nextn layer runs
+# the triton bf16 MoE path -> ~4x the on-disk packed bytes resident.
+_MTP_EXPERT_DEQUANT = 4.0
+
+
+def _mtp_resident_bytes_from_checkpoint(model_path: str) -> Optional[int]:
+    """Estimated RESIDENT bytes of the built-in MTP / nextn DRAFT layer — the K reserve to apply when
+    speculative decoding uses it. Paged experts SKIPS mtp/nextn experts, so the draft layer loads
+    RESIDENT, and its MoE runs the triton bf16 path, so the fp4-packed on-disk experts dequantize to
+    bf16 (``_MTP_EXPERT_DEQUANT`` x the packed bytes); the (fp8) non-expert weights roughly double. Sum
+    the ``mtp``/``nextn`` tensors from the safetensors headers and scale. Returns None when the
+    checkpoint ships no built-in draft (no mtp/nextn tensors) or isn't locally readable — the caller
+    then adds no reserve."""
+    import glob
+    import json
+    import struct
+
+    folder = model_path
+    if not folder:
+        return None
+    if not os.path.isdir(folder):
+        try:
+            from huggingface_hub import snapshot_download
+
+            folder = snapshot_download(
+                model_path, local_files_only=True, allow_patterns=["*.safetensors*"]
+            )
+        except Exception:
+            return None
+    files = sorted(glob.glob(os.path.join(folder, "*.safetensors")))
+    if not files:
+        return None
+    exp = other = 0
+    try:
+        for path in files:
+            with open(path, "rb") as f:
+                (hdr_len,) = struct.unpack("<Q", f.read(8))
+                header = json.loads(f.read(hdr_len))
+            for name, entry in header.items():
+                if name == "__metadata__":
+                    continue
+                if "mtp" not in name and "nextn" not in name:
+                    continue
+                begin, end = entry["data_offsets"]
+                nb = end - begin
+                if ".experts." in name:
+                    exp += nb
+                else:
+                    other += nb
+    except Exception:
+        return None
+    est = int(exp * _MTP_EXPERT_DEQUANT + other * 2.0)
+    return est or None
+
+
 def _quant_source(mc, htc):
     """The config object carrying ``quantization_config``. VL checkpoints (e.g. Qwen3.5/3.6 MoE) put it
     on the TOP-level config while ``hf_text_config`` is the nested text config — reading only the text
@@ -392,6 +447,15 @@ def resolve_num_resident_experts(
         # An explicit --paged-experts-kv-reserve-gb is the user's TOTAL budget for KV + hybrid state
         # (the documented knob for hybrid concurrency) — don't stack the automatic reserve on top.
         kv_reserve += mamba_per_req * _HYBRID_STATE_SLOTS
+
+    # Speculative decoding with a BUILT-IN draft (NEXTN/DSPARK from the checkpoint) loads the MTP/nextn
+    # layer RESIDENT (paged experts skips it) — VRAM the K sizing must subtract, or K over-sizes and the
+    # KV configurator / capture pool OOMs when spec is enabled. Reserve its bf16-dequantized resident
+    # bytes as extra non-expert weight. No-op when spec is off or the checkpoint has no built-in draft.
+    mtp_reserve = 0
+    if getattr(sa, "speculative_algorithm", None):
+        mtp_reserve = _mtp_resident_bytes_from_checkpoint(sa.model_path) or 0
+        nonexpert_bytes += mtp_reserve
 
     k = compute_num_resident_experts(
         free_vram_bytes=free,

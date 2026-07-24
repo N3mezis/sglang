@@ -2543,6 +2543,14 @@ class ServerArgs:
         "Directory for the --paged-experts-cold-backing disk cold tier. Must be a real disk with room for "
         "the cold tail (NOT a tmpfs like /tmp). Empty (default) uses the system temp dir.",
     ] = ""
+    paged_experts_prompt_warmup: A[
+        bool,
+        "Warm the resident pool from THE PROMPT'S OWN routing at the end of each prefill chunk: count the "
+        "chunk's expert selections and page the hottest-K in (one gather) instead of leaving the pool "
+        "holding the last wave's arbitrary tail. Same-generation locality makes the prompt's hot set the "
+        "best prior for the generation's working set; biggest effect on short outputs (agent turns), "
+        "which otherwise spend most of their decode re-faulting the working set. LRU adapts from there.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn

@@ -38,9 +38,14 @@ SGL_DEVICE int pick_victim(
     const int32_t* slot_expert,
     const int32_t* slot_lastuse,
     const int32_t* freq,
-    const int32_t* log2hot) {
+    const int32_t* log2hot,
+    int pin_base) {
+  // Slots [0, pin_base) are a STATIC pinned hot tier (seeded with the layer's hottest experts) — never
+  // eviction candidates, so the (K - pin_base) dynamic slots run the chosen policy (LRU/LFU) over the
+  // shifting tail. pin_base=0 -> original all-dynamic behavior. Caller guarantees distinct non-pinned
+  // active <= K - pin_base (pin is small), so a non-pinned victim always exists for a real miss.
   int victim = -1, best_cold = INT_MAX, best_f = INT_MAX, best_lu = INT_MAX;
-  for (int s = 0; s < K; ++s) {
+  for (int s = pin_base; s < K; ++s) {
     const int se = slot_expert[s];
     bool needed = false;
     for (int j = 0; j < topk_n; ++j) {
@@ -73,6 +78,7 @@ __global__ void decide_kernel(
     int E,
     int K,
     int lfu,
+    int pin,                // [0,pin) slots are a static pinned hot tier (never evicted)
     int32_t* step_ctr,      // [1] monotonic step counter, incremented on-device (capture-safe)
     int32_t* slot_expert,   // [K] slot -> expert id (-1 == empty), mutated
     int32_t* expert_slot,   // [E] expert -> slot (-1 == not resident), mutated
@@ -107,8 +113,8 @@ __global__ void decide_kernel(
       const int e = topk[i];
       if (e < 0 || e >= E) continue;
       if (expert_slot[e] >= 0) continue;  // resident (or just assigned this step)
-      const int victim = pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, nullptr);
-      if (victim < 0) continue;  // pool too small (should not happen: distinct <= K)
+      const int victim = pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, nullptr, pin);
+      if (victim < 0) continue;  // pool too small (should not happen: distinct <= K - pin)
       const int old = slot_expert[victim];
       if (old >= 0) expert_slot[old] = -1;
       slot_expert[victim] = e;
@@ -192,7 +198,7 @@ __global__ void decide_bounded_kernel(
         ++nc;
         continue;
       }
-      const int victim = pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, log2hot);
+      const int victim = pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, log2hot, 0);
       if (victim < 0) continue;  // pool too small (should not happen: distinct <= K)
       const int old = slot_expert[victim];
       if (old >= 0) expert_slot[old] = -1;
@@ -377,6 +383,7 @@ void decide(
     tvm::ffi::TensorView slot_lastuse,
     tvm::ffi::TensorView freq,
     int64_t lfu,
+    int64_t pin,
     tvm::ffi::TensorView src,
     tvm::ffi::TensorView dst,
     tvm::ffi::TensorView n_out,
@@ -410,6 +417,7 @@ void decide(
       e,
       k,
       static_cast<int>(lfu),
+      static_cast<int>(pin),
       static_cast<int32_t*>(step_ctr.data_ptr()),
       static_cast<int32_t*>(slot_expert.data_ptr()),
       static_cast<int32_t*>(expert_slot.data_ptr()),
@@ -582,9 +590,15 @@ void gather_multi(
   const int nt = static_cast<int>(Nt.unwrap());
   const DLDevice device = device_.unwrap();
 
-  // The copy is PCIe-bound; 256x256 float4 streams saturate the link while keeping the empty-plan
-  // early-exit cheap (the per-tensor 16-byte alignment is validated at setup, python side).
-  LaunchKernel(256, 256, device)(
+  // The copy is PCIe-bound but LATENCY-bound, not bandwidth-bound: it needs enough float4 loads in
+  // flight to saturate the link. The old 256x256 (65536 threads) under-subscribed it — 8x fewer threads
+  // than the sibling single-tensor gather (2048x256) — and measured only ~44-48 GB/s on H200 (~80% of the
+  // 57.6 GB/s DMA ceiling; identically ~82% on a Gen4 4070). 2048x512 (~1M threads) puts ~16x more
+  // requests in flight and reaches the ceiling (+~12% on Gen4; regime is the same on Gen5). Empty plans
+  // still retire cheaply (cnt==0 early-exit before any addressing). Per-tensor 16-byte alignment is
+  // validated at setup (python side). Layering an MLP-unrolled kernel on top buys ~another ~9% up to the
+  // DMA ceiling but adds register pressure — do that as a separately A/B'd step on the target GPU.
+  LaunchKernel(2048, 512, device)(
       gather_multi_kernel,
       static_cast<const int64_t*>(stores.data_ptr()),
       static_cast<const int64_t*>(slots.data_ptr()),
