@@ -152,29 +152,45 @@ def _prefetch_next_step() -> None:
 # distinct set is already a host list — the captured path is sync-free by design (a host read there would
 # break graph capture), so run the measurement eager (routing stability does not depend on the backend).
 _PRED_STATS_ON = os.environ.get("SGLANG_PE_PRED_STATS") not in (None, "", "0")
-_PRED_HIT = 0
-_PRED_TOTAL = 0
+_PRED_HIT = 0  # routed_t ∩ routed_{t-1}  (routing stability)
+_PRED_TOTAL = 0  # routed_t
+_PRED_MISS_HIT = 0  # missed_t ∩ routed_{t-1}  (predictable misses)
+_PRED_MISS_TOTAL = 0  # missed_t  (experts routed this step but NOT resident = actual page-ins)
 _PRED_LAYER_STEPS = 0
 _PRED_LOG_EVERY = 2000  # layer-steps between readouts
 
 
-def _record_pred_stats(pager, routed) -> None:
-    """Accumulate temporal routing overlap for ``pager`` (one MoE layer) and log the running hit-rate
-    every ``_PRED_LOG_EVERY`` layer-steps. No-op unless ``SGLANG_PE_PRED_STATS`` is set."""
+def _record_pred_stats(pager, routed, missed=None) -> None:
+    """Accumulate two temporal overlaps for ``pager`` (one MoE layer) against the PREVIOUS step's routed
+    set, and log every ``_PRED_LOG_EVERY`` layer-steps. No-op unless ``SGLANG_PE_PRED_STATS`` is set.
+
+    * routing hit-rate  |routed_t ∩ routed_{t-1}| / |routed_t|  — fundamental routing stability; dominated
+      by the resident core LFU already keeps warm.
+    * MISS hit-rate     |missed_t ∩ routed_{t-1}| / |missed_t|  — of the experts that actually MISS (routed
+      but not resident, i.e. the page-ins), the fraction that were routed last step. THIS is the #1
+      incremental signal: how much of the churning tail a "stage last step's set" predictor would catch.
+    """
     if not _PRED_STATS_ON:
         return
-    global _PRED_HIT, _PRED_TOTAL, _PRED_LAYER_STEPS
+    global _PRED_HIT, _PRED_TOTAL, _PRED_MISS_HIT, _PRED_MISS_TOTAL, _PRED_LAYER_STEPS
     cur = routed if isinstance(routed, (set, frozenset)) else set(routed)
     prev = getattr(pager, "_prev_routed", None)
-    if prev is not None and cur:
-        _PRED_HIT += len(prev & cur)
-        _PRED_TOTAL += len(cur)
+    if prev is not None:
+        if cur:
+            _PRED_HIT += len(prev & cur)
+            _PRED_TOTAL += len(cur)
+        if missed:
+            miss = missed if isinstance(missed, (set, frozenset)) else set(missed)
+            _PRED_MISS_HIT += len(prev & miss)
+            _PRED_MISS_TOTAL += len(miss)
     pager._prev_routed = cur
     _PRED_LAYER_STEPS += 1
     if _PRED_LAYER_STEPS % _PRED_LOG_EVERY == 0 and _PRED_TOTAL:
         logger.info(
-            "[pe-pred] temporal routing hit-rate = %.3f  (predicted∩actual/actual over %d layer-steps)",
+            "[pe-pred] routing hit-rate=%.3f | MISS hit-rate=%.3f (%d misses) | over %d layer-steps",
             _PRED_HIT / _PRED_TOTAL,
+            (_PRED_MISS_HIT / _PRED_MISS_TOTAL) if _PRED_MISS_TOTAL else 0.0,
+            _PRED_MISS_TOTAL,
             _PRED_LAYER_STEPS,
         )
 
@@ -554,7 +570,8 @@ class ExpertPager:
             distinct = self.distinct_active(topk_ids)
         l2g = self.logical_to_gpu_index
         needed = set(distinct)
-        _record_pred_stats(self, needed)  # SGLANG_PE_PRED_STATS: temporal routing hit-rate
+        if _PRED_STATS_ON:  # SGLANG_PE_PRED_STATS: routing + miss temporal hit-rate (l2g is pre-step here)
+            _record_pred_stats(self, needed, {e for e in distinct if int(l2g[e]) < 0})
         for e in distinct:  # touch recency/frequency of resident hits
             s = int(l2g[e])
             if s >= 0:
