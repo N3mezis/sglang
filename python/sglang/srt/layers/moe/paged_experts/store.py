@@ -329,7 +329,14 @@ class PageableExpertStore(ExpertStore):
         )
         for name, gpu_param in self.gpu.items():
             rows = self.host[name].index_select(0, src_cpu).to(gpu_param.device)
-            gpu_param.data.index_copy_(0, dst_slots, rows)
+            dst = gpu_param.data
+            # torch has no index_copy_cuda for the 1-byte fp8 scale dtypes (mxfp4 block scales are
+            # float8_e8m0fnu; fp8 weights e4m3fn) — the copy is bytewise, so route those through an
+            # equal-width uint8 view. Standard int/bf16 params take the direct path.
+            if dst.element_size() == 1 and dst.is_floating_point():
+                dst.view(torch.uint8).index_copy_(0, dst_slots, rows.view(torch.uint8))
+            else:
+                dst.index_copy_(0, dst_slots, rows)
 
 
 class WindowedExpertStore(ExpertStore):
