@@ -142,6 +142,43 @@ def _prefetch_next_step() -> None:
             store.prefetch_cold(ids, force=True)
 
 
+# --- temporal routing-stability counter (SGLANG_PE_PRED_STATS) -------------------------------------
+# The make-or-break measurement for temporal-prefetch H2D staging (#1) and the stage-0 signal for
+# pre-gating: of the experts routed THIS step, how many were also routed LAST step
+# (|routed_t ∩ routed_{t-1}| / |routed_t|), aggregated over all layers. High => next-step routing is
+# predictable from this step => proactively staging the prediction into LFU victims between replays would
+# convert predicted misses to hits (kill the replay-twice tax). Measures ROUTING (not the miss set, which
+# the reactive stager confounds), so it is capture-mode-independent. Tapped on the EAGER decide, where the
+# distinct set is already a host list — the captured path is sync-free by design (a host read there would
+# break graph capture), so run the measurement eager (routing stability does not depend on the backend).
+_PRED_STATS_ON = os.environ.get("SGLANG_PE_PRED_STATS") not in (None, "", "0")
+_PRED_HIT = 0
+_PRED_TOTAL = 0
+_PRED_LAYER_STEPS = 0
+_PRED_LOG_EVERY = 2000  # layer-steps between readouts
+
+
+def _record_pred_stats(pager, routed) -> None:
+    """Accumulate temporal routing overlap for ``pager`` (one MoE layer) and log the running hit-rate
+    every ``_PRED_LOG_EVERY`` layer-steps. No-op unless ``SGLANG_PE_PRED_STATS`` is set."""
+    if not _PRED_STATS_ON:
+        return
+    global _PRED_HIT, _PRED_TOTAL, _PRED_LAYER_STEPS
+    cur = routed if isinstance(routed, (set, frozenset)) else set(routed)
+    prev = getattr(pager, "_prev_routed", None)
+    if prev is not None and cur:
+        _PRED_HIT += len(prev & cur)
+        _PRED_TOTAL += len(cur)
+    pager._prev_routed = cur
+    _PRED_LAYER_STEPS += 1
+    if _PRED_LAYER_STEPS % _PRED_LOG_EVERY == 0 and _PRED_TOTAL:
+        logger.info(
+            "[pe-pred] temporal routing hit-rate = %.3f  (predicted∩actual/actual over %d layer-steps)",
+            _PRED_HIT / _PRED_TOTAL,
+            _PRED_LAYER_STEPS,
+        )
+
+
 def _bcg_post_step() -> None:
     """BCG per-step boundary callback, fired once after the full forward + all eager breaks complete and
     before the next step. Does two things, in this order:
@@ -517,6 +554,7 @@ class ExpertPager:
             distinct = self.distinct_active(topk_ids)
         l2g = self.logical_to_gpu_index
         needed = set(distinct)
+        _record_pred_stats(self, needed)  # SGLANG_PE_PRED_STATS: temporal routing hit-rate
         for e in distinct:  # touch recency/frequency of resident hits
             s = int(l2g[e])
             if s >= 0:
