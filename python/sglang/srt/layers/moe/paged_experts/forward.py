@@ -330,7 +330,7 @@ def _lean_single_expert(layer, hidden, masked_tw):
         from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
         # call the cutlass non-grouped fp4 mm DIRECTLY (weight layout [N,K/2]); fp4_gemm()'s auto-dispatch
         # can pick flashinfer mm_fp4 which wants the transposed [K/2,N] layout we don't have.
-        from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm
+        from sglang.kernels.jit.nvfp4 import cutlass_scaled_fp4_mm
     except Exception:
         return None
     import torch.nn.functional as F

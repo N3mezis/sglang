@@ -19,7 +19,7 @@ from typing import List
 import torch
 
 # Reuse the fork's proven mapped-pinned UVA machinery (same as paged-experts + the KV probes):
-from sglang.jit_kernel.paged_experts_decide import paged_experts_host_devptr
+from sglang.kernels.jit.paged_experts_decide import paged_experts_host_devptr
 from sglang.srt.layers.moe.paged_experts.store import _pinned_empty
 
 
