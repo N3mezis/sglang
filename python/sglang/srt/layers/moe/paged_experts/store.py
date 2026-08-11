@@ -77,12 +77,20 @@ def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
 # time, so they must page into slots alongside the qweight. For non-act-order the method's
 # process_weights_after_loading replaces them with empty tensors, which discover_paged_params drops
 # via its ``numel() > 0`` check — so leaving them pageable is safe for both.
+# gpt-oss (mxfp4) adds per-expert SwiGLU scalars — swiglu_alpha/beta/limit, each a CONSTANT broadcast
+# (full((E,), 1.702/1.0/7.0), not per-expert-varying and absent from the checkpoint). At 4 B/expert they
+# are sub-8-byte and would fail the pinned-gather alignment gate; excluding them from paging is correct
+# (the layer's [K] copy keeps the constant for every slot regardless of which expert is resident), and it
+# keeps gpt-oss on the fast pinned + captured path instead of forcing --paged-experts-store paged (eager).
 _NONPAGED_SUFFIXES = (
     "_weight_shape",
     "_global_scale",
     "_scale_2",
     "_alphas",
     "_scale_quant",
+    "swiglu_alpha",
+    "swiglu_beta",
+    "swiglu_limit",
 )
 
 
