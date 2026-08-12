@@ -128,19 +128,33 @@ class Ernie4Moe(nn.Module):
         return self.forward_normal(hidden_states)
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        shared_output = (
-            self.shared_experts(hidden_states)
-            if self.moe_num_shared_experts > 0
-            else None
-        )
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
-        if shared_output is not None:
+        if self.moe_num_shared_experts > 0:
+            # Let the paged keep-warm path run the shared-expert GEMM on the compute stream while the
+            # routed page-in transfers (overlap #4). Off that path (captured / no misses / not paged)
+            # ``_ov.result`` is None and we run the shared expert inline — same result either way.
+            from sglang.srt.layers.moe.paged_experts.forward import (
+                shared_expert_overlap,
+            )
+
+            with shared_expert_overlap(
+                lambda: self.shared_experts(hidden_states)
+            ) as _ov:
+                final_hidden_states = self.experts(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
+            shared_output = (
+                _ov.result
+                if _ov.result is not None
+                else self.shared_experts(hidden_states)
+            )
             final_hidden_states = final_hidden_states + shared_output
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
         if self.tp_size > 1:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states

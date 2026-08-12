@@ -19,7 +19,61 @@ Routing stays E-wide; only the table is K.
 
 from __future__ import annotations
 
+import contextlib
+import os
+import threading
+
 import torch
+
+# Opt-in (SGLANG_PE_SHARED_OVERLAP): default OFF runs the registered work inline (serial, current
+# behavior); ON runs it on the compute stream overlapped with the routed page-in. Gated so the feature
+# ships dark and gives a clean A/B.
+_SHARED_OVERLAP_ON = os.environ.get("SGLANG_PE_SHARED_OVERLAP") not in (None, "", "0")
+
+# Router-independent-work overlap (paged-experts #4): a model with a SHARED expert wraps its paged-experts
+# call in ``shared_expert_overlap(fn)``; the EAGER keep-warm placement then runs ``fn`` (the shared-expert
+# GEMM) on the compute stream while the routed page-in transfers on a dedicated stream, hiding
+# min(shared_gemm, transfer) per missing layer. Transparent no-op otherwise: on the captured path, when
+# there are no misses, or when the model isn't paged, ``handle.result`` stays None and the caller runs
+# ``fn`` itself — so correctness never depends on the overlap firing.
+_OVERLAP = threading.local()
+_OVERLAP_STREAMS: dict = {}
+
+
+class OverlapHandle:
+    __slots__ = ("fn", "result")
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.result = None  # the placement sets this iff it ran fn; else None -> caller runs fn
+
+
+@contextlib.contextmanager
+def shared_expert_overlap(fn):
+    """Register ``fn`` (router-independent work) for the paged keep-warm path to overlap with the routed
+    page-in. Yields a handle whose ``.result`` is ``fn()``'s output when the overlap ran it, else None."""
+    h = OverlapHandle(fn)
+    prev = getattr(_OVERLAP, "handle", None)
+    _OVERLAP.handle = h
+    try:
+        yield h
+    finally:
+        _OVERLAP.handle = prev
+
+
+def _current_overlap():
+    """The overlap handle registered for the in-flight paged call, or None."""
+    return getattr(_OVERLAP, "handle", None)
+
+
+def _overlap_stream(device):
+    """Lazy per-device transfer stream for the shared-expert overlap."""
+    key = torch.device(device).index or 0
+    s = _OVERLAP_STREAMS.get(key)
+    if s is None:
+        s = torch.cuda.Stream(device=device)
+        _OVERLAP_STREAMS[key] = s
+    return s
 
 
 def mask_and_remap_expert_ids(

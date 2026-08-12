@@ -20,6 +20,8 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 
+import torch
+
 from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
@@ -45,7 +47,10 @@ class EagerPlacement(Placement):
 
     def apply(self, method, layer, dispatch_output):
         from sglang.srt.layers.moe.paged_experts.forward import (
+            _SHARED_OVERLAP_ON,
+            _current_overlap,
             _gemm_hidden,
+            _overlap_stream,
             _wave_apply,
             mask_and_remap_expert_ids,
         )
@@ -56,7 +61,21 @@ class EagerPlacement(Placement):
         distinct = pager.distinct_active(topk_ids)
         if len(distinct) <= pager.K:  # keep-warm: page only the misses
             src, dst = pager.decide_keep_warm(topk_ids, distinct=distinct)
-            pager.page_in(src, dst)
+            ov = _current_overlap()
+            if ov is not None and _SHARED_OVERLAP_ON and int(src.numel()) > 0:
+                # #4: run the routed page-in on a transfer stream and the caller's router-independent work
+                # (e.g. the shared expert) on the compute stream, so they overlap; sync before the GEMM.
+                cs = torch.cuda.current_stream()
+                ts = _overlap_stream(pager.device)
+                ts.wait_stream(cs)  # transfer must see src/dst (created on cs)
+                with torch.cuda.stream(ts):
+                    pager.page_in(src, dst)
+                ov.result = ov.fn()  # compute stream — overlaps the H2D
+                cs.wait_stream(ts)  # routed GEMM must see the paged-in experts
+            else:
+                pager.page_in(src, dst)
+                if ov is not None:  # no misses to hide behind: run it inline (still correct)
+                    ov.result = ov.fn()
             remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
             hidden = _gemm_hidden(
                 method, layer, dispatch_output, remap, clone_hidden=False
