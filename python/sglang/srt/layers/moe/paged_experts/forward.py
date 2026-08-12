@@ -390,12 +390,26 @@ def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
     if not banked:
         nwaves = (E + K - 1) // K
         out = None
+        tw = dispatch_output.topk_output.topk_weights
         for w in range(nwaves):
             pager.decide_and_page_wave_ondevice(topk_ids, w)
-            remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
-            partial = _gemm_hidden(
-                method, layer, dispatch_output, remap, clone_hidden=True
-            )
+            # Fuse the remap/mask into one kernel (as the captured keep-warm path does) instead of the
+            # ~6-node python chain per wave: decide_and_page_wave_ondevice sets _topk_i32 (wave 0) and
+            # updates logical_to_gpu_index_cuda for THIS wave — exactly what remap_mask_ondevice reads.
+            # nvfp4 stays on the s2l gather (no logical_to_slot), identical to the unfused call below.
+            fused = pager.remap_mask_ondevice(topk_ids, tw)
+            if fused is not None:
+                safe_ids, masked_tw = fused
+                partial = _gemm_hidden_fused(
+                    method, layer, dispatch_output, safe_ids, masked_tw, clone_hidden=True
+                )
+            else:
+                remap = mask_and_remap_expert_ids(
+                    topk_ids, pager.logical_to_gpu_index_cuda
+                )
+                partial = _gemm_hidden(
+                    method, layer, dispatch_output, remap, clone_hidden=True
+                )
             out = partial if out is None else out + partial
         lo = (nwaves - 1) * K
         pager.resync_residency_ondevice(lo, min(K, E - lo))
