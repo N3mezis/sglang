@@ -831,6 +831,7 @@ class WindowedExpertStore(ExpertStore):
         stage_bank: int = 0,
         async_h2d: bool = False,
         src_host: Optional[list] = None,
+        dst_host: Optional[list] = None,
     ) -> None:
         if src_experts.numel() == 0:
             return
@@ -869,7 +870,14 @@ class WindowedExpertStore(ExpertStore):
             if not getattr(self, "_step_prefetched", False):
                 self.prefetch_cold(cold_ids)
             cold_rows = self.cold_pos[src_cpu[cold_mask]].tolist()
-            cold_dst = dst_slots[cold_mask.to(dst_slots.device)].tolist()
+            # #11: take cold destinations from the caller's host plan when given (eager keep-warm + wave
+            # both have dst as a host list already), avoiding a per-layer dst_slots D2H drain; cold_mask is
+            # host-side (derived from src_cpu), so this is all host work. Device read-back is the fallback.
+            if dst_host is not None:
+                _cm = cold_mask.tolist()
+                cold_dst = [d for d, m in zip(dst_host, _cm) if m]
+            else:
+                cold_dst = dst_slots[cold_mask.to(dst_slots.device)].tolist()
             n = len(cold_rows)
             # Gather into PINNED buffers, then direct async H2D per slot: the old
             # index_select -> pageable .to() -> index_copy_ chain crossed the bytes through a pageable

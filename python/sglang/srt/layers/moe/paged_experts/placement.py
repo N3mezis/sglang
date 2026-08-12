@@ -54,7 +54,11 @@ class EagerPlacement(Placement):
         distinct = pager.distinct_active(topk_ids)
         if len(distinct) <= pager.K:  # keep-warm: page only the misses
             src, dst = pager.decide_keep_warm(topk_ids, distinct=distinct)
-            pager.page_in(src, dst)
+            # #11: pass the host plan so the windowed cold tier skips a per-layer dst_slots D2H
+            # (no-op for non-windowed stores — pager.page_in only forwards dst_host to stores that accept it)
+            pager.page_in(
+                src, dst, src_host=pager._kw_src_host, dst_host=pager._kw_dst_host
+            )
             remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
             hidden = _gemm_hidden(
                 method, layer, dispatch_output, remap, clone_hidden=False

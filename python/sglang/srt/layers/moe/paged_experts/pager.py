@@ -188,6 +188,15 @@ from sglang.srt.layers.moe.paged_experts.store import (  # noqa: E402
 _SC_STAGE: Dict = {}
 _SC_STAGE_CAP = 16
 
+# #9: per-bank completion events for the replay-twice refill. The refill's pinned staging buffers are
+# module-shared; instead of a full-stream drain at the end of every missed layer, double-buffer them
+# (bank = layer_idx & 1) and CPU-wait only on the 2-ago bank's H2D before reuse — so consecutive missed
+# layers' cold gathers pipeline with each other's H2D drain. The single post-loop torch.cuda.synchronize()
+# in _post_replay_refill_all stays as the barrier before the replay, so replay-boundary correctness is
+# unchanged. Only the replay-twice refill defers (passes defer_sync=True); the BCG break keeps the inline
+# sync (its GEMM segment must see the staged experts).
+_REFILL_BANK_EV: Dict[int, torch.cuda.Event] = {}
+
 
 def _sc_stage_buf(name: str, row_shape, dtype, device) -> torch.Tensor:
     key = (name, tuple(row_shape), dtype, str(device))
@@ -410,7 +419,12 @@ def _post_replay_refill_all() -> bool:
         lastuses = torch.stack([p._slot_lastuse_d for p in missed]).cpu().tolist()
         for i, p in enumerate(missed):
             if p._refill_after_replay(
-                counts[p._miss_idx], cold_logs[i], neededs[i], slot_exps[i], lastuses[i]
+                counts[p._miss_idx],
+                cold_logs[i],
+                neededs[i],
+                slot_exps[i],
+                lastuses[i],
+                bank=i & 1,  # #9: double-buffer the pinned staging across missed layers
             ):
                 staged = True
     if staged:
@@ -451,6 +465,7 @@ def reset_paged_experts_state() -> None:
     _profile_done = False
     _STAGE_PIN.clear()
     _SC_STAGE.clear()
+    _REFILL_BANK_EV.clear()  # #9: drop the previous model's refill bank events
 
 
 class ExpertPager:
@@ -729,6 +744,9 @@ class ExpertPager:
             src.append(e)
             dst.append(victim)
         self.logical_to_gpu_index_cuda.copy_(l2g)
+        # #11: expose the host plan so page_in (windowed cold tier) takes cold destinations from here
+        # instead of a per-layer dst_slots D2H read-back.
+        self._kw_src_host, self._kw_dst_host = src, dst
         return (
             torch.tensor(src, dtype=torch.int64, device=self.device),
             torch.tensor(dst, dtype=torch.int64, device=self.device),
@@ -1071,7 +1089,9 @@ class ExpertPager:
         # actual re-pin + the temporal prefetch run there (between steps), NOT here mid-step — see _bcg_post_step.
         _ensure_bcg_post_step_hook()
 
-    def _refill_after_replay(self, cn: int, cold_log, needed, se, lastuse) -> int:
+    def _refill_after_replay(
+        self, cn: int, cold_log, needed, se, lastuse, bank: int = 0
+    ) -> int:
         """Post-replay (out-of-graph): stage the deferred cold experts ``host_cold`` -> their GPU slots and
         mark them resident, so the next replay's ``decide_bounded`` sees them as hits and the loop converges.
         Evicts only slots NOT needed this step (the ``needed[]`` mask), choosing victims TIER- and
@@ -1120,8 +1140,9 @@ class ExpertPager:
         l2g = self.logical_to_gpu_index_cuda
         slots = evictable[:n]
         ids = list(missed[:n])
-        # Shared cold-staging data movement (prefetch + pinned gather + fused scatter + one stream sync).
-        self._stage_cold_into_slots(ids, slots)
+        # Shared cold-staging data movement (prefetch + pinned gather + fused scatter). #9: defer the
+        # per-layer drain to a per-bank event so consecutive missed layers pipeline.
+        self._stage_cold_into_slots(ids, slots, bank=bank, defer_sync=True)
         # Batched residency + recency update (3 indexed writes total, vs 2-3 scalar device writes per
         # staged expert): unmap the evicted occupants, map the staged experts, and stamp the staged slots
         # with the CURRENT step — a staged cold expert must not inherit its victim's stale recency, or the
@@ -1139,7 +1160,9 @@ class ExpertPager:
         self._slot_lastuse_d[slots_dev] = self._step_ctr_d
         return n
 
-    def _stage_cold_into_slots(self, ids, slots) -> None:
+    def _stage_cold_into_slots(
+        self, ids, slots, bank: int = 0, defer_sync: bool = False
+    ) -> None:
         """Shared cold-staging DATA MOVEMENT: read the cold rows for logical ``ids`` from ``host_cold``
         into pinned buffers, then fused-scatter them into device ``slots`` (``ids[i]`` -> ``slots[i]``).
         Ends with one stream sync so the shared pinned buffers are safe to reuse. The residency-map
@@ -1159,8 +1182,16 @@ class ExpertPager:
         # fast pinned transfer instead of a slow synchronous pageable one. The WILLNEED read-ahead above
         # services the disk faults concurrently; the copy itself is a batched indexed gather
         # (store.gather_rows_into), not a per-expert loop.
+        # #9: on the deferred (replay-twice) refill use a per-bank pinned buffer set and CPU-wait on this
+        # bank's last H2D before overwriting it; the BCG break path (defer_sync=False) keeps the single
+        # buffer set + inline sync below.
+        if defer_sync:
+            _pe = _REFILL_BANK_EV.get(bank)
+            if _pe is not None:
+                _pe.synchronize()
+        _bk = (lambda nm: f"{nm}#rb{bank}") if defer_sync else (lambda nm: nm)
         bufs = {
-            name: _stage_pin_buf(name, self.K, p.shape[1:], p.dtype)
+            name: _stage_pin_buf(_bk(name), self.K, p.shape[1:], p.dtype)
             for name, p in self.gpu.items()
         }
         # Cold rows read through the O_DIRECT queue-depth pool (QD ~6) when the store backs cold on
@@ -1214,9 +1245,17 @@ class ExpertPager:
                     gpu_param.data[slot].copy_(buf[i], non_blocking=True)
         if _PROF["on"]:
             _PROF["h2d"] += time.perf_counter() - _th
-        # One sync for all tensors' async H2D: the shared pinned bufs must not be overwritten (by the next
-        # layer's/wave's staging) while copies are in flight.
-        torch.cuda.current_stream().synchronize()
+        # #9: the deferred refill records this bank's H2D-done event (the next reuse of the bank CPU-waits
+        # on it; the post-loop torch.cuda.synchronize() is the replay barrier) instead of a full per-layer
+        # drain. The BCG break path drains inline — its GEMM segment must see the staged experts this step.
+        if defer_sync:
+            _ev = torch.cuda.Event()
+            _ev.record()
+            _REFILL_BANK_EV[bank] = _ev
+        else:
+            # One sync for all tensors' async H2D: the shared pinned bufs must not be overwritten (by the
+            # next layer's/wave's staging) while copies are in flight.
+            torch.cuda.current_stream().synchronize()
 
     def refresh_window_freq(self, margin: float = 0.0) -> int:
         """P3 freq-ranked window: re-pin the hottest W experts (by the on-device use counts ``decide_bounded``

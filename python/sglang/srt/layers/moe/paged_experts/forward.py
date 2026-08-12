@@ -642,9 +642,19 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
         # later waves arrive — roll the read-ahead one wave ahead of the gather instead.
         from sglang.srt.layers.moe.paged_experts.store import _host_available_bytes
 
-        mm_total = sum(len(m) for m in getattr(store, "_cold_mm", {}).values())
-        avail = _host_available_bytes()
-        rolling = bool(mm_total) and bool(avail) and mm_total > avail // 2
+        # #10: mm_total is a store invariant (cold mmaps fixed at setup) — cache it; and sample
+        # /proc/meminfo (avail + the rolling decision) at most once per few dozen calls, not every
+        # wave-layer (the threshold mm_total > avail//2 moves slowly; the open+parse was the cost).
+        mm_total = getattr(store, "_mm_total_bytes", None)
+        if mm_total is None:
+            mm_total = sum(len(m) for m in getattr(store, "_cold_mm", {}).values())
+            store._mm_total_bytes = mm_total
+        _ctr = getattr(store, "_avail_ctr", 0)
+        if _ctr % 48 == 0 or not hasattr(store, "_rolling"):
+            _avail = _host_available_bytes()
+            store._rolling = bool(mm_total) and bool(_avail) and mm_total > _avail // 2
+        store._avail_ctr = _ctr + 1
+        rolling = store._rolling
         if rolling:
             store.prefetch_cold(groups[0])
         else:
