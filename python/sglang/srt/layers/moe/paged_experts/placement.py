@@ -64,6 +64,9 @@ class EagerPlacement(Placement):
         distinct = pager.distinct_active(topk_ids)
         if len(distinct) <= pager.K:  # keep-warm: page only the misses
             src, dst = pager.decide_keep_warm(topk_ids, distinct=distinct)
+            # #11: the host plan decide_keep_warm just built — lets the windowed cold tier skip a
+            # per-layer dst_slots D2H (a no-op for non-windowed stores, which ignore it).
+            sh, dh = pager._kw_src_host, pager._kw_dst_host
             ov = _current_overlap()
             if ov is not None and _SHARED_OVERLAP_ON and int(src.numel()) > 0:
                 # #4: run the routed page-in on a transfer stream and the caller's router-independent work
@@ -72,11 +75,11 @@ class EagerPlacement(Placement):
                 ts = _overlap_stream(pager.device)
                 ts.wait_stream(cs)  # transfer must see src/dst (created on cs)
                 with torch.cuda.stream(ts):
-                    pager.page_in(src, dst)
+                    pager.page_in(src, dst, src_host=sh, dst_host=dh)
                 ov.result = ov.fn()  # compute stream — overlaps the H2D
                 cs.wait_stream(ts)  # routed GEMM must see the paged-in experts
             else:
-                pager.page_in(src, dst)
+                pager.page_in(src, dst, src_host=sh, dst_host=dh)
                 if ov is not None:  # no misses to hide behind: run it inline (still correct)
                     ov.result = ov.fn()
             remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)

@@ -249,6 +249,7 @@ class ExpertStore(ABC):
         stage_bank: int = 0,
         async_h2d: bool = False,
         src_host: Optional[list] = None,
+        dst_host: Optional[list] = None,
     ) -> None:
         """Copy ``host[src_experts[i]] -> gpu[dst_slots[i]]`` for every paged tensor.
 
@@ -297,6 +298,7 @@ class PinnedExpertStore(ExpertStore):
         stage_bank: int = 0,
         async_h2d: bool = False,
         src_host: Optional[list] = None,
+        dst_host: Optional[list] = None,
     ) -> None:
         if src_experts.numel() == 0:
             return
@@ -327,6 +329,7 @@ class PageableExpertStore(ExpertStore):
         stage_bank: int = 0,
         async_h2d: bool = False,
         src_host: Optional[list] = None,
+        dst_host: Optional[list] = None,
     ) -> None:
         if src_experts.numel() == 0:
             return
@@ -648,6 +651,7 @@ class WindowedExpertStore(ExpertStore):
         stage_bank: int = 0,
         async_h2d: bool = False,
         src_host: Optional[list] = None,
+        dst_host: Optional[list] = None,
     ) -> None:
         if src_experts.numel() == 0:
             return
@@ -686,7 +690,14 @@ class WindowedExpertStore(ExpertStore):
             if not getattr(self, "_step_prefetched", False):
                 self.prefetch_cold(cold_ids)
             cold_rows = self.cold_pos[src_cpu[cold_mask]].tolist()
-            cold_dst = dst_slots[cold_mask.to(dst_slots.device)].tolist()
+            # #11: take the cold destinations from the caller's host plan when it passed one (the eager
+            # keep-warm and wave paths both have dst as a host list already), avoiding a per-layer
+            # ``dst_slots[...].tolist()`` D2H drain. Fall back to the device read-back otherwise.
+            if dst_host is not None:
+                cm = cold_mask.tolist()
+                cold_dst = [d for d, m in zip(dst_host, cm) if m]
+            else:
+                cold_dst = dst_slots[cold_mask.to(dst_slots.device)].tolist()
             n = len(cold_rows)
             # Gather into PINNED buffers, then direct async H2D per slot: the old
             # index_select -> pageable .to() -> index_copy_ chain crossed the bytes through a pageable

@@ -315,9 +315,20 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
         # later waves arrive — roll the read-ahead one wave ahead of the gather instead.
         from sglang.srt.layers.moe.paged_experts.store import _host_available_bytes
 
-        mm_total = sum(len(m) for m in getattr(store, "_cold_mm", {}).values())
-        avail = _host_available_bytes()
-        rolling = bool(mm_total) and bool(avail) and mm_total > avail // 2
+        # #10: mm_total is a store invariant (the cold mmaps are fixed at setup) — cache it instead of
+        # re-summing every wave-layer; and sample /proc/meminfo (avail) at most once per few dozen calls
+        # rather than every layer — the rolling threshold (mm_total > avail//2) moves slowly, and the
+        # open+parse was the latency-sensitive part. Both were re-derived on every _wave_apply call.
+        mm_total = getattr(store, "_mm_total_bytes", None)
+        if mm_total is None:
+            mm_total = sum(len(m) for m in getattr(store, "_cold_mm", {}).values())
+            store._mm_total_bytes = mm_total
+        ctr = getattr(store, "_avail_ctr", 0)
+        if ctr % 48 == 0 or not hasattr(store, "_rolling"):
+            avail = _host_available_bytes()
+            store._rolling = bool(mm_total) and bool(avail) and mm_total > avail // 2
+        store._avail_ctr = ctr + 1
+        rolling = store._rolling
         if rolling:
             store.prefetch_cold(groups[0])
         else:
@@ -356,13 +367,25 @@ def _wave_apply(method, layer, dispatch_output, topk_ids: torch.Tensor, distinct
                 )
                 # bank b's slots are free once wave i-2's GEMM finished reading them
                 ts.wait_event(ev_gemm[b])
-                pager.page_in(src, dst, stage_bank=b, async_h2d=True, src_host=group)
+                pager.page_in(
+                    src,
+                    dst,
+                    stage_bank=b,
+                    async_h2d=True,
+                    src_host=group,
+                    dst_host=list(range(base, base + len(group))),
+                )
                 ev_h2d[b].record(ts)
             cs.wait_event(ev_h2d[b])
         else:
             src = torch.tensor(group, dtype=torch.int64, device=dev)
             dst = torch.arange(base, base + len(group), dtype=torch.int64, device=dev)
-            pager.page_in(src, dst, src_host=group)
+            pager.page_in(
+                src,
+                dst,
+                src_host=group,
+                dst_host=list(range(base, base + len(group))),
+            )
         l2g.fill_(-1)
         l2g[src] = dst.to(torch.int32)
         partial = _gemm_hidden(
