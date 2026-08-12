@@ -384,6 +384,11 @@ class ExpertPager:
         # and the remap_mask output buffers (allocated at the captured shape).
         self._gm_stores = self._gm_slots = self._gm_e16s = None
         self._safe_ids_d = self._masked_tw_d = None
+        # True after decide_and_page_ondevice fused the forward remap into the decide launch (#4), so
+        # remap_mask_ondevice returns the already-computed buffers instead of a second launch. Set per step
+        # by the plain captured keep-warm path only; the windowed/BCG paths leave it False (they remap after
+        # their out-of-graph cold-staging break).
+        self._remap_prefused = False
         # Windowed (bounded) captured path — set up by setup_ondevice when the store is a WindowedExpertStore:
         # static hot/cold membership maps the decide_bounded kernel reads, the cold (deferred-miss) plan
         # buffers, the needed[] mask, and this layer's slot in the shared replay-twice miss-vector.
@@ -760,6 +765,12 @@ class ExpertPager:
                     topk_weights.is_contiguous(),
                 )
             return None
+        if self._remap_prefused:
+            # #4: decide_and_page_ondevice already emitted the remap in the decide launch this step.
+            return (
+                self._safe_ids_d.view(topk_ids.shape),
+                self._masked_tw_d.view(topk_weights.shape),
+            )
         t = topk_ids.numel()
         if self._safe_ids_d is None or self._safe_ids_d.numel() != t:
             self._safe_ids_d = torch.empty(t, dtype=torch.int32, device=self.device)
@@ -776,29 +787,73 @@ class ExpertPager:
             self._masked_tw_d.view(topk_weights.shape),
         )
 
-    def decide_and_page_ondevice(self, topk_ids: torch.Tensor) -> None:
+    def decide_and_page_ondevice(
+        self, topk_ids: torch.Tensor, topk_weights: torch.Tensor = None
+    ) -> None:
         """Capture-safe keep-warm: decide residency + page the misses entirely on-device (no host sync).
         Mutates the persistent state buffers and ``logical_to_gpu_index_cuda`` (the remap table) in place;
         gathers exactly the chosen experts. Requires distinct active experts <= K (the caller guarantees it
-        via the shape guard ``num_tokens * top_k <= K``)."""
-        from sglang.kernels.jit.paged_experts_decide import paged_experts_decide
+        via the shape guard ``num_tokens * top_k <= K``).
 
+        When ``topk_weights`` is passed and remap-fusable (float32, contiguous), the decide launch ALSO
+        emits the forward remap (``paged_experts_decide_remap``, #4) — one launch replacing decide + a
+        separate ``remap_mask`` — and ``remap_mask_ondevice`` returns the buffers without relaunching. Safe
+        only here (the plain path): idx aliases ``logical_to_gpu_index_cuda`` and nothing runs between the
+        decide and the remap. The windowed/BCG paths call the non-fusing variants (they must remap after
+        their out-of-graph cold-staging break)."""
         self._prep_topk_ondevice(topk_ids)
         l2g = self.logical_to_gpu_index_cuda  # serves as both expert_slot and idx
-        paged_experts_decide(
-            self._topk_i32,
-            self._step_ctr_d,
-            self._slot_expert_d,
-            l2g,
-            self._slot_lastuse_d,
-            self._freq_d,
-            self.policy.name
-            == "lfu",  # --paged-experts-eviction, same as the host path
-            self._src_d,
-            self._dst_d,
-            self._n_out_d,
-            l2g,
+        lfu = self.policy.name == "lfu"  # --paged-experts-eviction, same as the host path
+        fusable = (
+            topk_weights is not None
+            and topk_weights.dtype == torch.float32
+            and topk_weights.is_contiguous()
         )
+        if fusable:
+            from sglang.kernels.jit.paged_experts_decide import (
+                paged_experts_decide_remap,
+            )
+
+            t = topk_ids.numel()
+            if self._safe_ids_d is None or self._safe_ids_d.numel() != t:
+                self._safe_ids_d = torch.empty(t, dtype=torch.int32, device=self.device)
+                self._masked_tw_d = torch.empty(
+                    t, dtype=torch.float32, device=self.device
+                )
+            paged_experts_decide_remap(
+                self._topk_i32,
+                self._step_ctr_d,
+                self._slot_expert_d,
+                l2g,
+                self._slot_lastuse_d,
+                self._freq_d,
+                lfu,
+                self._src_d,
+                self._dst_d,
+                self._n_out_d,
+                l2g,
+                topk_weights.reshape(-1),
+                self._safe_ids_d,
+                self._masked_tw_d,
+            )
+            self._remap_prefused = True
+        else:
+            from sglang.kernels.jit.paged_experts_decide import paged_experts_decide
+
+            paged_experts_decide(
+                self._topk_i32,
+                self._step_ctr_d,
+                self._slot_expert_d,
+                l2g,
+                self._slot_lastuse_d,
+                self._freq_d,
+                lfu,
+                self._src_d,
+                self._dst_d,
+                self._n_out_d,
+                l2g,
+            )
+            self._remap_prefused = False
         self._gather_planned_ondevice()
 
     def decide_and_page_bounded_ondevice(self, topk_ids: torch.Tensor) -> None:

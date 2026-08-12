@@ -87,7 +87,10 @@ __global__ void decide_kernel(
     int32_t* src,           // [>=K] out: page-in source experts
     int32_t* dst,           // [>=K] out: page-in destination slots
     int32_t* n_out,         // [1]  out: number of page-ins
-    int32_t* idx) {         // [E]  out: logical -> slot map snapshot
+    int32_t* idx,           // [E]  out: logical -> slot map snapshot
+    const float* tw,        // [T]  in : routing weights, or nullptr to skip the fused remap (#4)
+    int32_t* safe_ids,      // [T]  out: fused remap slot ids (masked -> 0); nullptr = off
+    float* masked_tw) {     // [T]  out: fused masked routing weights; nullptr = off
   if (blockIdx.x || threadIdx.x >= 32) return;
   const int lane = threadIdx.x;
   // The step counter lives on-device and is bumped here so a captured graph advances LRU recency on every
@@ -134,6 +137,19 @@ __global__ void decide_kernel(
   if (idx != expert_slot)
     for (int e = lane; e < E; e += 32)
       idx[e] = expert_slot[e];
+  // Fused remap+mask (paged-experts #4): the plain captured keep-warm path aliases idx==expert_slot==the
+  // live logical->slot map this kernel just finalized (pass 2 assigned every miss; the __syncwarp above
+  // makes lane 0's writes visible), so emit the forward remap HERE and skip the separate remap_mask launch.
+  // Reads expert_slot (the live map). Off (nullptr) for the plain ``decide`` launcher and for the
+  // windowed/BCG paths, which must remap AFTER their out-of-graph cold-staging break.
+  if (safe_ids) {
+    for (int i = lane; i < topk_n; i += 32) {
+      const int e = topk[i];
+      const int s = (e >= 0 && e < E) ? expert_slot[e] : -1;
+      safe_ids[i] = s >= 0 ? s : 0;
+      masked_tw[i] = s >= 0 ? tw[i] : 0.0f;
+    }
+  }
 }
 
 // Bounded keep-warm + LRU/LFU decision for the pinned-WINDOW store (distinct active experts <= K). Same
@@ -426,7 +442,73 @@ void decide(
       static_cast<int32_t*>(src.data_ptr()),
       static_cast<int32_t*>(dst.data_ptr()),
       static_cast<int32_t*>(n_out.data_ptr()),
-      static_cast<int32_t*>(idx.data_ptr()));
+      static_cast<int32_t*>(idx.data_ptr()),
+      nullptr,
+      nullptr,
+      nullptr);
+}
+
+// decide + fused forward remap (paged-experts #4): same residency decision as ``decide``, but the same
+// launch also emits (safe_ids, masked_tw) from the just-finalized live map — one launch replacing
+// decide + a separate remap_mask on the plain captured keep-warm path. Only valid where idx aliases
+// expert_slot (the captured keep-warm caller); tw/safe_ids/masked_tw are [T] like the flattened topk.
+void decide_remap(
+    tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView step_ctr,
+    tvm::ffi::TensorView slot_expert,
+    tvm::ffi::TensorView expert_slot,
+    tvm::ffi::TensorView slot_lastuse,
+    tvm::ffi::TensorView freq,
+    int64_t lfu,
+    int64_t pin,
+    tvm::ffi::TensorView src,
+    tvm::ffi::TensorView dst,
+    tvm::ffi::TensorView n_out,
+    tvm::ffi::TensorView idx,
+    tvm::ffi::TensorView tw,
+    tvm::ffi::TensorView safe_ids,
+    tvm::ffi::TensorView masked_tw) {
+  using namespace sglang::host;
+
+  SymbolicSize E = {"num_experts"}, K = {"num_slots"}, T = {"topk_n"};
+  SymbolicDevice device_;
+  device_.set_options<kDLCUDA>();
+  TensorMatcher({E}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(expert_slot).verify(freq).verify(idx);
+  TensorMatcher({K})
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(device_)
+      .verify(slot_expert)
+      .verify(slot_lastuse)
+      .verify(src)
+      .verify(dst);
+  TensorMatcher({T}).with_dtype<int32_t>().with_device<kDLCUDA>(device_).verify(topk).verify(safe_ids);
+  TensorMatcher({T}).with_dtype<float>().with_device<kDLCUDA>(device_).verify(tw).verify(masked_tw);
+
+  const int e = static_cast<int>(E.unwrap());
+  const int k = static_cast<int>(K.unwrap());
+  const int t = static_cast<int>(T.unwrap());
+  const DLDevice device = device_.unwrap();
+
+  LaunchKernel(1, 32, device)(
+      decide_kernel,
+      static_cast<const int32_t*>(topk.data_ptr()),
+      t,
+      e,
+      k,
+      static_cast<int>(lfu),
+      static_cast<int>(pin),
+      static_cast<int32_t*>(step_ctr.data_ptr()),
+      static_cast<int32_t*>(slot_expert.data_ptr()),
+      static_cast<int32_t*>(expert_slot.data_ptr()),
+      static_cast<int32_t*>(slot_lastuse.data_ptr()),
+      static_cast<int32_t*>(freq.data_ptr()),
+      static_cast<int32_t*>(src.data_ptr()),
+      static_cast<int32_t*>(dst.data_ptr()),
+      static_cast<int32_t*>(n_out.data_ptr()),
+      static_cast<int32_t*>(idx.data_ptr()),
+      static_cast<const float*>(tw.data_ptr()),
+      static_cast<int32_t*>(safe_ids.data_ptr()),
+      static_cast<float*>(masked_tw.data_ptr()));
 }
 
 void decide_bounded(

@@ -18,6 +18,7 @@ def _jit_paged_experts_decide_module() -> Module:
         cuda_files=["moe/paged_experts_decide.cuh"],
         cuda_wrappers=[
             ("decide", "decide"),
+            ("decide_remap", "decide_remap"),
             ("decide_bounded", "decide_bounded"),
             ("decide_wave", "decide_wave"),
             ("gather", "gather"),
@@ -90,6 +91,51 @@ def paged_experts_decide(
         dst,
         n_out,
         idx,
+    )
+
+
+def paged_experts_decide_remap(
+    topk: torch.Tensor,
+    step_ctr: torch.Tensor,
+    slot_expert: torch.Tensor,
+    expert_slot: torch.Tensor,
+    slot_lastuse: torch.Tensor,
+    freq: torch.Tensor,
+    lfu: bool,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    n_out: torch.Tensor,
+    idx: torch.Tensor,
+    tw: torch.Tensor,
+    safe_ids: torch.Tensor,
+    masked_tw: torch.Tensor,
+    pin: int = 0,
+) -> None:
+    """``paged_experts_decide`` + the fused forward remap in ONE launch (paged-experts #4).
+
+    Identical residency decision to ``paged_experts_decide``; the same kernel then emits the forward
+    remap from the just-finalized live map — ``safe_ids = where(idx[topk] >= 0, idx[topk], 0)`` and
+    ``masked_tw = where(idx[topk] >= 0, tw, 0)`` — so the plain captured keep-warm path skips the separate
+    ``remap_mask`` launch. Only valid where ``idx`` aliases ``expert_slot`` (the captured keep-warm caller
+    passes ``logical_to_gpu_index_cuda`` for both). ``tw``/``masked_tw`` are ``[topk_n]`` float32;
+    ``safe_ids`` is ``[topk_n]`` int32."""
+    module = _jit_paged_experts_decide_module()
+    module.decide_remap(
+        topk,
+        step_ctr,
+        slot_expert,
+        expert_slot,
+        slot_lastuse,
+        freq,
+        int(lfu),
+        int(pin),
+        src,
+        dst,
+        n_out,
+        idx,
+        tw,
+        safe_ids,
+        masked_tw,
     )
 
 

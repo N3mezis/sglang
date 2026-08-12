@@ -155,7 +155,11 @@ class CapturedPlacement(Placement):
         topk_ids = dispatch_output.topk_output.topk_ids
         keep_warm = topk_ids.shape[0] * topk_ids.shape[-1] <= pager.K
         if keep_warm:
-            pager.decide_and_page_ondevice(topk_ids)
+            # #4: pass topk_weights so the decide launch also emits the forward remap (fused), and
+            # _keep_warm_gemm's remap_mask_ondevice returns it without a second launch.
+            pager.decide_and_page_ondevice(
+                topk_ids, dispatch_output.topk_output.topk_weights
+            )
             hidden = _keep_warm_gemm(method, layer, dispatch_output, pager)
         else:  # distinct can exceed K (prefill / big batch): static waves, summed
             _warn_wave_capture_once(pager, topk_ids)
