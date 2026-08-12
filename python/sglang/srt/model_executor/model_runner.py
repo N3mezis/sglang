@@ -44,7 +44,7 @@ def _pe_sample_stage():
             _PE_SAMPLE_STAGE = None
     return _PE_SAMPLE_STAGE
 
-from sglang.kernels.jit.ngram_embedding import update_token_table_decode
+from sglang.kernels.ops.speculative.ngram_embedding import update_token_table_decode
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,

@@ -2014,8 +2014,13 @@ class DeepseekV2AttentionMLA(
 
         self.has_q_b_proj = hasattr(self, "q_b_proj")
         q_b_proj_verified_shapes = {(2048, 2048), (4096, 2048)}
-        self._q_b_proj_verified_shape = self.has_q_b_proj and (
-            tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
+        self._q_b_proj_verified_shape = (
+            self.has_q_b_proj
+            # packed quant (hybrid_int4_nvfp4 / awq / moe_wna16) has no dense ``.weight`` — short-circuit
+            # like the fused_a path above so the min-latency q_b GEMM fast-path is skipped and q_b_proj
+            # goes through the quant-aware linear apply.
+            and hasattr(self.q_b_proj, "weight")
+            and tuple(self.q_b_proj.weight.shape) in q_b_proj_verified_shapes
         )
         self._use_min_latency_q_b_gemm: bool | None = None
 
