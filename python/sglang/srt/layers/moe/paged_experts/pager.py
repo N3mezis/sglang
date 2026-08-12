@@ -568,30 +568,39 @@ class ExpertPager:
         self.policy.begin_step()
         if distinct is None:
             distinct = self.distinct_active(topk_ids)
-        l2g = self.logical_to_gpu_index
+        l2g_t = self.logical_to_gpu_index  # [E] int32 CPU host mirror
+        l2g = l2g_t.tolist()  # one bulk read -> python list; avoids ~2*len(distinct) 0-d tensor builds
+        se = self.slot_expert  # already a python list; mutations below persist (same object)
         needed = set(distinct)
         if _PRED_STATS_ON:  # SGLANG_PE_PRED_STATS: routing + miss temporal hit-rate (l2g is pre-step here)
-            _record_pred_stats(self, needed, {e for e in distinct if int(l2g[e]) < 0})
+            _record_pred_stats(self, needed, {e for e in distinct if l2g[e] < 0})
         for e in distinct:  # touch recency/frequency of resident hits
-            s = int(l2g[e])
+            s = l2g[e]
             if s >= 0:
                 self.policy.record_use(e, s)
         src, dst = [], []
         for e in distinct:
-            if int(l2g[e]) >= 0:
+            if l2g[e] >= 0:
                 continue  # already resident (or just assigned)
-            victim = self.policy.pick_victim(self.slot_expert, needed)
+            victim = self.policy.pick_victim(se, needed)
             if victim < 0:
                 continue  # pool too small (shouldn't happen: distinct <= K)
-            old = self.slot_expert[victim]
+            old = se[victim]
             if old >= 0:
                 l2g[old] = -1
-            self.slot_expert[victim] = e
+            se[victim] = e
             l2g[e] = victim
             self.policy.record_use(e, victim)  # the fresh assignment counts as a use
             src.append(e)
             dst.append(victim)
-        self.logical_to_gpu_index_cuda.copy_(l2g)
+        if not src:
+            # pure-hit step: residency (and thus logical_to_gpu_index_cuda) is unchanged from last step,
+            # so skip the [E] H2D map copy AND both torch.tensor(list, device=) builds entirely.
+            if not hasattr(self, "_kw_empty"):
+                self._kw_empty = torch.empty(0, dtype=torch.int64, device=self.device)
+            return self._kw_empty, self._kw_empty
+        l2g_t.copy_(torch.tensor(l2g, dtype=l2g_t.dtype))  # one bulk write-back (miss steps only)
+        self.logical_to_gpu_index_cuda.copy_(l2g_t, non_blocking=True)
         return (
             torch.tensor(src, dtype=torch.int64, device=self.device),
             torch.tensor(dst, dtype=torch.int64, device=self.device),

@@ -107,9 +107,27 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
         # positioned the weights (captured keep-warm / on-device waves), i.e. no explicit wave map was
         # passed. Empty slots (-1) clamp to 0; their GEMM output is masked out downstream, so the
         # borrowed scalar is inert.
-        idx = s2l.clamp(min=0).long()
-        for nm, full in fe.items():
-            getattr(layer, nm).data.copy_(full[idx])
+        # Fused refresh: ONE index_select gathers all nvfp4 scalars into a persistent buffer, then copy
+        # each row into its K-slot param — replaces the per-scalar clamp/long/gather/copy chain
+        # (~10 launches + ~6 allocs -> ~7 launches, 0 per-step allocs). Buffers built once (shapes are
+        # graph-stable: K slots, fixed scalar set). Bit-identical to the old ``full[s2l.clamp(0)]`` gather.
+        idx = getattr(method, "_nvfp4_idx", None)
+        if idx is None:
+            method._nvfp4_names = list(fe.keys())
+            method._nvfp4_stacked = torch.stack(
+                [fe[n] for n in method._nvfp4_names]
+            )  # [ntens, E]
+            method._nvfp4_idx = idx = torch.empty_like(s2l, dtype=torch.long)
+            method._nvfp4_gathered = torch.empty(
+                (len(method._nvfp4_names), s2l.numel()),
+                dtype=method._nvfp4_stacked.dtype,
+                device=s2l.device,
+            )
+        idx.copy_(s2l)  # int32 slot->logical -> int64 index buffer (no alloc)
+        idx.clamp_(min=0)  # empty slots (-1) -> 0; their GEMM output is masked out downstream
+        torch.index_select(method._nvfp4_stacked, 1, idx, out=method._nvfp4_gathered)
+        for i, nm in enumerate(method._nvfp4_names):
+            getattr(layer, nm).data.copy_(method._nvfp4_gathered[i])
     else:
         # Eager scatter by the logical->slot map. The HOST wave path (_wave_apply) positions weights by
         # its LOCAL l2g (host page_in, not the on-device decide) and passes it as logical_to_slot — that
@@ -148,8 +166,9 @@ def _gemm_hidden(
     """
     topk_output = dispatch_output.topk_output
     tw = topk_output.topk_weights
-    masked_tw = torch.where(remap >= 0, tw, torch.zeros_like(tw))
-    safe_ids = torch.where(remap >= 0, remap, torch.zeros_like(remap))
+    mask = remap >= 0  # compute once; scalar `0` in where avoids two throwaway zeros_like allocs
+    masked_tw = torch.where(mask, tw, 0.0)
+    safe_ids = torch.where(mask, remap, 0)
     hidden = dispatch_output.hidden_states
     md = dispatch_output._replace(
         hidden_states=hidden.clone() if clone_hidden else hidden,

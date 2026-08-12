@@ -22,6 +22,17 @@ from abc import ABC, abstractmethod
 
 import torch
 
+# Hoisted from EagerPlacement.apply (was re-imported per layer per step — pure _handle_fromlist overhead
+# on the host-bound eager path). forward.py imports no paged_experts sibling, so this is circular-safe.
+from sglang.srt.layers.moe.paged_experts.forward import (
+    _SHARED_OVERLAP_ON,
+    _current_overlap,
+    _gemm_hidden,
+    _overlap_stream,
+    _wave_apply,
+    mask_and_remap_expert_ids,
+)
+
 from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
@@ -46,14 +57,6 @@ class EagerPlacement(Placement):
     needs_ondevice_store = False
 
     def apply(self, method, layer, dispatch_output):
-        from sglang.srt.layers.moe.paged_experts.forward import (
-            _SHARED_OVERLAP_ON,
-            _current_overlap,
-            _gemm_hidden,
-            _overlap_stream,
-            _wave_apply,
-            mask_and_remap_expert_ids,
-        )
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         pager = method._pager
