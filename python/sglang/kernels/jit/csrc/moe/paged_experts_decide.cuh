@@ -14,6 +14,8 @@
 
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 
+#include <cstdlib>  // std::getenv / std::atoi (env-tunable gather grid for C2C)
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
@@ -68,6 +70,62 @@ SGL_DEVICE int pick_victim(
   return victim;
 }
 
+// WARP-COOPERATIVE ``pick_victim``: all 32 lanes scan the dynamic slots [pin_base, K) in stride, then a
+// warp reduction picks the SAME victim the serial scan would — argmin of (cold, f, lu) lexicographically,
+// ties broken by the LOWEST slot index (matching the serial "first strictly-smaller wins"). Returns the
+// broadcast victim on every lane (-1 if none). Must be called by a full, converged warp. Fixes the
+// single-lane serial scan that made ``decide_kernel`` a 1-warp, latency-bound ~16% of decode on GH200.
+SGL_DEVICE int pick_victim_warp(
+    int lane,
+    const int32_t* topk,
+    int topk_n,
+    int K,
+    int lfu,
+    const int32_t* slot_expert,
+    const int32_t* slot_lastuse,
+    const int32_t* freq,
+    const int32_t* log2hot,
+    int pin_base) {
+  int b_cold = INT_MAX, b_f = INT_MAX, b_lu = INT_MAX, b_s = INT_MAX;  // this lane's best (INT_MAX = none)
+  for (int s = pin_base + lane; s < K; s += 32) {
+    const int se = slot_expert[s];
+    bool needed = false;
+    for (int j = 0; j < topk_n; ++j) {
+      if (topk[j] == se) {
+        needed = true;
+        break;
+      }
+    }
+    if (needed) continue;  // never evict a slot this step still needs
+    const int cold = (log2hot != nullptr && se >= 0 && log2hot[se] < 0) ? 1 : 0;
+    const int f = (lfu && se >= 0) ? freq[se] : 0;
+    const int lu = slot_lastuse[s];
+    // (cold, f, lu) smaller wins; tie -> lower slot index (serial keeps the first, i.e. lowest, s).
+    if (cold < b_cold ||
+        (cold == b_cold && (f < b_f || (f == b_f && (lu < b_lu || (lu == b_lu && s < b_s)))))) {
+      b_cold = cold;
+      b_f = f;
+      b_lu = lu;
+      b_s = s;
+    }
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    const int oc = __shfl_down_sync(0xffffffffu, b_cold, off);
+    const int of = __shfl_down_sync(0xffffffffu, b_f, off);
+    const int ol = __shfl_down_sync(0xffffffffu, b_lu, off);
+    const int os = __shfl_down_sync(0xffffffffu, b_s, off);
+    if (oc < b_cold ||
+        (oc == b_cold && (of < b_f || (of == b_f && (ol < b_lu || (ol == b_lu && os < b_s)))))) {
+      b_cold = oc;
+      b_f = of;
+      b_lu = ol;
+      b_s = os;
+    }
+  }
+  const int v = __shfl_sync(0xffffffffu, b_s, 0);  // lane 0 holds the winner
+  return v == INT_MAX ? -1 : v;
+}
+
 // Keep-warm + LRU/LFU decision (distinct active experts <= K). Mutates the residency state in place and
 // emits the page-in plan: for each distinct active expert not resident, evict a non-needed slot and assign
 // it. src[0..n)/dst[0..n) are the (expert -> slot) page-ins; n_out is their count; idx[e] is the updated
@@ -108,16 +166,20 @@ __global__ void decide_kernel(
     if (s >= 0) slot_lastuse[s] = step;
   }
   __syncwarp();
-  // pass 2 (lane 0, serial): each miss evicts a non-needed slot per the policy and pages its expert in.
-  // Sequential by nature — every eviction changes the state the next pick depends on.
-  if (lane == 0) {
-    int n = 0;
-    for (int i = 0; i < topk_n; ++i) {
-      const int e = topk[i];
-      if (e < 0 || e >= E) continue;
-      if (expert_slot[e] >= 0) continue;  // resident (or just assigned this step)
-      const int victim = pick_victim(topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, nullptr, pin);
-      if (victim < 0) continue;  // pool too small (should not happen: distinct <= K - pin)
+  // pass 2 (WARP-COOPERATIVE): the miss loop stays sequential (each eviction changes the state the next
+  // pick reads), but every pick's K-slot victim scan now runs across all 32 lanes + a warp reduction,
+  // instead of a single-lane serial scan — the pattern that made this a 1-warp, latency-bound ~16% of GH200
+  // decode. lane 0 commits each eviction; a threadfence+syncwarp publishes the new residency to the warp
+  // before the next pick's scan reads it (so a freshly-filled victim is never re-picked this step).
+  int n = 0;
+  for (int i = 0; i < topk_n; ++i) {
+    const int e = topk[i];
+    if (e < 0 || e >= E) continue;        // warp-uniform
+    if (expert_slot[e] >= 0) continue;    // warp-uniform: resident (or just assigned this step)
+    const int victim =
+        pick_victim_warp(lane, topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, nullptr, pin);
+    if (victim < 0) continue;             // warp-uniform (broadcast): pool too small (shouldn't happen)
+    if (lane == 0) {
       const int old = slot_expert[victim];
       if (old >= 0) expert_slot[old] = -1;
       slot_expert[victim] = e;
@@ -126,9 +188,11 @@ __global__ void decide_kernel(
       src[n] = e;
       dst[n] = victim;
       ++n;
+      __threadfence_block();  // publish the residency writes to the rest of the warp
     }
-    *n_out = n;
+    __syncwarp();  // + execution barrier: the next pick's scan sees the committed slot
   }
+  if (lane == 0) *n_out = n;
   __syncwarp();
   // map snapshot (warp-parallel) — SKIP when idx aliases expert_slot. The captured decode path passes the
   // same logical_to_gpu_index_cuda buffer for both expert_slot and idx, and pass 2 already mutated it in
@@ -680,7 +744,19 @@ void gather_multi(
   // still retire cheaply (cnt==0 early-exit before any addressing). Per-tensor 16-byte alignment is
   // validated at setup (python side). Layering an MLP-unrolled kernel on top buys ~another ~9% up to the
   // DMA ceiling but adds register pressure — do that as a separately A/B'd step on the target GPU.
-  LaunchKernel(2048, 512, device)(
+  // Grid/block env-tunable for the C2C regime. The 2048x512 above is tuned to the PCIe DMA ceiling
+  // (~57.6 GB/s); NVLink-C2C is ~450 GB/s (~8x), so saturating it needs far more float4 loads in flight —
+  // a larger grid. Sweep SGLANG_PE_GATHER_GRID / SGLANG_PE_GATHER_BLOCK on the target GPU to find the knee
+  // (defaults preserve the PCIe-tuned launch). Read once (static init).
+  static const int gm_grid = [] {
+    const char* e = std::getenv("SGLANG_PE_GATHER_GRID");
+    return e && std::atoi(e) > 0 ? std::atoi(e) : 2048;
+  }();
+  static const int gm_block = [] {
+    const char* e = std::getenv("SGLANG_PE_GATHER_BLOCK");
+    return e && std::atoi(e) > 0 ? std::atoi(e) : 512;
+  }();
+  LaunchKernel(gm_grid, gm_block, device)(
       gather_multi_kernel,
       static_cast<const int64_t*>(stores.data_ptr()),
       static_cast<const int64_t*>(slots.data_ptr()),
