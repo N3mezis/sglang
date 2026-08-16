@@ -25,6 +25,21 @@
 
 namespace {
 
+// SGLANG_PE_PDL=1: launch decide+gather with Programmatic Dependent Launch (SM90+). Two effects:
+// (1) both kernels' blocks dispatch while the predecessor's tail still runs (launch-latency overlap),
+// (2) decide releases the dependent gather EARLY — right after the page-in plan (src/dst/n_out) is
+// committed — so the C2C copy starts while decide finishes its tail (map snapshot + fused remap, which
+// gather never reads). Correctness: gather griddepcontrol-waits before reading the plan; the marlin GEMM
+// after gather is launched without the PDL attribute, so it keeps full-completion ordering. Off by
+// default for a clean A/B (read once, static).
+inline bool pe_use_pdl() {
+  static const bool v = [] {
+    const char* e = std::getenv("SGLANG_PE_PDL");
+    return e && std::atoi(e) != 0;
+  }();
+  return v;
+}
+
 // Victim = a non-needed resident slot, chosen by eviction policy: LFU (lfu != 0) -> minimum use count of
 // the resident expert, LRU recency as tiebreak; LRU (lfu == 0) -> minimum last-use step. Empty slots
 // (slot_expert < 0) get freq key 0 so they are filled first. Mirrors the host path's ResidencyPolicy.
@@ -130,6 +145,7 @@ SGL_DEVICE int pick_victim_warp(
 // emits the page-in plan: for each distinct active expert not resident, evict a non-needed slot and assign
 // it. src[0..n)/dst[0..n) are the (expert -> slot) page-ins; n_out is their count; idx[e] is the updated
 // logical->slot map (-1 == not resident) that the forward remap reads.
+template <bool kUsePDL>
 __global__ void decide_kernel(
     const int32_t* topk,
     int topk_n,
@@ -150,6 +166,9 @@ __global__ void decide_kernel(
     int32_t* safe_ids,      // [T]  out: fused remap slot ids (masked -> 0); nullptr = off
     float* masked_tw) {     // [T]  out: fused masked routing weights; nullptr = off
   if (blockIdx.x || threadIdx.x >= 32) return;
+  // PDL: blocks may have dispatched early — wait before touching topk / the residency state, which the
+  // preceding kernels in the stream may still be writing. No-op when kUsePDL is false.
+  sglang::device::PDLWaitPrimary<kUsePDL>();
   const int lane = threadIdx.x;
   // The step counter lives on-device and is bumped here so a captured graph advances LRU recency on every
   // replay (a host-scalar step would be frozen at capture time).
@@ -192,8 +211,14 @@ __global__ void decide_kernel(
     }
     __syncwarp();  // + execution barrier: the next pick's scan sees the committed slot
   }
-  if (lane == 0) *n_out = n;
+  if (lane == 0) {
+    *n_out = n;
+    __threadfence();  // publish the plan (src/dst/n_out) device-wide for the dependent gather grid
+  }
   __syncwarp();
+  // PDL: the page-in plan is FINAL here — release the dependent gather_multi launch now, so the C2C copy
+  // runs concurrently with this kernel's tail (map snapshot + fused remap, which gather never reads).
+  sglang::device::PDLTriggerSecondary<kUsePDL>();
   // map snapshot (warp-parallel) — SKIP when idx aliases expert_slot. The captured decode path passes the
   // same logical_to_gpu_index_cuda buffer for both expert_slot and idx, and pass 2 already mutated it in
   // place, so this loop would be a 256-wide uncoalesced self-copy on one warp every MoE layer every step
@@ -404,6 +429,7 @@ gather_kernel(const float4* store, float4* slot, const int32_t* src, const int32
 // resolved once at setup — UVA devptr for the pinned store, data_ptr for the GPU pool) and ``e16s`` the
 // per-tensor expert-block sizes / 16. Blocks iterate the tensors serially and grid-stride within each;
 // the copy is PCIe-bound, so a modest grid saturates it and empty plans retire cheaply.
+template <bool kUsePDL>
 __global__ void gather_multi_kernel(
     const int64_t* stores,  // [ntens] per-tensor pinned-store base (UVA device pointer)
     const int64_t* slots,   // [ntens] per-tensor GPU slot-pool base
@@ -412,6 +438,9 @@ __global__ void gather_multi_kernel(
     const int32_t* src,
     const int32_t* dst,
     const int32_t* n) {
+  // PDL: launched as a dependent of decide — blocks dispatch early, but must wait for decide's early
+  // trigger (plan committed) before reading n/src/dst. No-op when kUsePDL is false.
+  sglang::device::PDLWaitPrimary<kUsePDL>();
   const int cnt = *n;
   if (cnt == 0) return;
   const long stride = static_cast<long>(gridDim.x) * blockDim.x;
@@ -490,8 +519,9 @@ void decide(
   const int t = static_cast<int>(T.unwrap());
   const DLDevice device = device_.unwrap();
 
-  LaunchKernel(1, 32, device)(
-      decide_kernel,
+  auto* decide_kern = pe_use_pdl() ? decide_kernel<true> : decide_kernel<false>;
+  LaunchKernel(1, 32, device).config({.use_pdl = pe_use_pdl()})(
+      decide_kern,
       static_cast<const int32_t*>(topk.data_ptr()),
       t,
       e,
@@ -553,8 +583,9 @@ void decide_remap(
   const int t = static_cast<int>(T.unwrap());
   const DLDevice device = device_.unwrap();
 
-  LaunchKernel(1, 32, device)(
-      decide_kernel,
+  auto* decide_kern = pe_use_pdl() ? decide_kernel<true> : decide_kernel<false>;
+  LaunchKernel(1, 32, device).config({.use_pdl = pe_use_pdl()})(
+      decide_kern,
       static_cast<const int32_t*>(topk.data_ptr()),
       t,
       e,
@@ -756,8 +787,9 @@ void gather_multi(
     const char* e = std::getenv("SGLANG_PE_GATHER_BLOCK");
     return e && std::atoi(e) > 0 ? std::atoi(e) : 512;
   }();
-  LaunchKernel(gm_grid, gm_block, device)(
-      gather_multi_kernel,
+  auto* gm_kern = pe_use_pdl() ? gather_multi_kernel<true> : gather_multi_kernel<false>;
+  LaunchKernel(gm_grid, gm_block, device).config({.use_pdl = pe_use_pdl()})(
+      gm_kern,
       static_cast<const int64_t*>(stores.data_ptr()),
       static_cast<const int64_t*>(slots.data_ptr()),
       static_cast<const int64_t*>(e16s.data_ptr()),
