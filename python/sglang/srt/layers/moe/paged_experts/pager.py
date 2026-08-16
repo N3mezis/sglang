@@ -393,11 +393,12 @@ class ExpertPager:
         self.store_devptr: Dict[str, int] = {}
         self._slot_expert_d = self._slot_lastuse_d = self._freq_d = None
         self._step_ctr_d = self._src_d = self._dst_d = self._n_out_d = None
-        self._topk_i32 = None
+        self._topk_i32 = self._topk_store = None
         # Fused-launch state: gather_multi descriptors (per-tensor base pointers, built once at setup)
         # and the remap_mask output buffers (allocated at the captured shape).
         self._gm_stores = self._gm_slots = self._gm_e16s = None
         self._safe_ids_d = self._masked_tw_d = None
+        self._safe_ids_store = self._masked_tw_store = None
         # True after decide_and_page_ondevice fused the forward remap into the decide launch (#4), so
         # remap_mask_ondevice returns the already-computed buffers instead of a second launch. Set per step
         # by the plain captured keep-warm path only; the windowed/BCG paths leave it False (they remap after
@@ -659,6 +660,15 @@ class ExpertPager:
         self._src_d = torch.zeros(self.K, dtype=i32, device=dev)
         self._dst_d = torch.zeros(self.K, dtype=i32, device=dev)
         self._n_out_d = torch.zeros(1, dtype=i32, device=dev)
+        # STABLE per-step buffers (multi-tier capture fix): _topk/_safe_ids/_masked_tw used to be lazily
+        # RE-allocated whenever the flattened topk size t changed. With MULTIPLE captured tiers (multi-bs
+        # decode graphs, adaptive-spec states) each tier's capture re-allocated them, leaving other tiers'
+        # graphs holding freed pointers (aliasing / illegal-access class — crashed multi-bs concurrency,
+        # suspected in the adaptive-spec intermittent corruption). Allocate ONCE here, oversized; every
+        # tier and the eager wave path take a [:t] view of the same never-moving storage.
+        self._topk_store = torch.empty(262144, dtype=i32, device=dev)  # 1 MB; covers prefill chunks (tokens*topk)
+        self._safe_ids_store = torch.empty(self.K, dtype=i32, device=dev)  # keep-warm t <= K (caller guard)
+        self._masked_tw_store = torch.empty(self.K, dtype=torch.float32, device=dev)
         # gather_multi descriptors: one fused launch pages ALL paged tensors (6 launches -> 1 for marlin
         # int4). Base pointers are capture-stable: the UVA store pointer and the GPU pool allocations are
         # resolved after weight processing and never move.
@@ -746,10 +756,12 @@ class ExpertPager:
         int32; capture-safe). Allocated once at the captured shape, reused across replays.
         """
         flat = topk_ids.reshape(-1)
-        if self._topk_i32 is None or self._topk_i32.numel() != flat.numel():
-            self._topk_i32 = torch.empty(
-                flat.numel(), dtype=torch.int32, device=self.device
-            )
+        t = flat.numel()
+        if self._topk_store is None or self._topk_store.numel() < t:
+            # Eager-only growth (a giant prefill beyond the setup-time store); captured tiers all fit
+            # the setup allocation, so no captured graph ever holds a re-allocated pointer.
+            self._topk_store = torch.empty(t, dtype=torch.int32, device=self.device)
+        self._topk_i32 = self._topk_store[:t]
         self._topk_i32.copy_(flat)
 
     def _gather_planned_ondevice(self) -> None:
@@ -791,9 +803,11 @@ class ExpertPager:
                 self._masked_tw_d.view(topk_weights.shape),
             )
         t = topk_ids.numel()
-        if self._safe_ids_d is None or self._safe_ids_d.numel() != t:
-            self._safe_ids_d = torch.empty(t, dtype=torch.int32, device=self.device)
-            self._masked_tw_d = torch.empty(t, dtype=torch.float32, device=self.device)
+        if self._safe_ids_store is None or self._safe_ids_store.numel() < t:
+            self._safe_ids_store = torch.empty(t, dtype=torch.int32, device=self.device)
+            self._masked_tw_store = torch.empty(t, dtype=torch.float32, device=self.device)
+        self._safe_ids_d = self._safe_ids_store[:t]
+        self._masked_tw_d = self._masked_tw_store[:t]
         paged_experts_remap_mask(
             self._topk_i32,  # already holds this step's flattened ids (_prep_topk_ondevice in decide)
             self.logical_to_gpu_index_cuda,
@@ -834,11 +848,15 @@ class ExpertPager:
             )
 
             t = topk_ids.numel()
-            if self._safe_ids_d is None or self._safe_ids_d.numel() != t:
-                self._safe_ids_d = torch.empty(t, dtype=torch.int32, device=self.device)
-                self._masked_tw_d = torch.empty(
+            if self._safe_ids_store is None or self._safe_ids_store.numel() < t:
+                self._safe_ids_store = torch.empty(
+                    t, dtype=torch.int32, device=self.device
+                )
+                self._masked_tw_store = torch.empty(
                     t, dtype=torch.float32, device=self.device
                 )
+            self._safe_ids_d = self._safe_ids_store[:t]
+            self._masked_tw_d = self._masked_tw_store[:t]
             paged_experts_decide_remap(
                 self._topk_i32,
                 self._step_ctr_d,
