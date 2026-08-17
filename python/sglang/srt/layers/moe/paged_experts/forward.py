@@ -30,6 +30,9 @@ import torch
 # ships dark and gives a clean A/B.
 _SHARED_OVERLAP_ON = os.environ.get("SGLANG_PE_SHARED_OVERLAP") not in (None, "", "0")
 
+# SGLANG_PE_NO_SCRATCH=1: disable the double-buffered scratch prefill pipeline (fall back to waves).
+_SCRATCH_DISABLED = os.environ.get("SGLANG_PE_NO_SCRATCH") not in (None, "", "0")
+
 # Router-independent-work overlap (paged-experts #4): a model with a SHARED expert wraps its paged-experts
 # call in ``shared_expert_overlap(fn)``; the EAGER keep-warm placement then runs ``fn`` (the shared-expert
 # GEMM) on the compute stream while the routed page-in transfers on a dedicated stream, hiding
@@ -226,6 +229,12 @@ def _scratch_prefill_apply(method, layer, dispatch_output, topk_ids, distinct=No
     """
     pager = method._pager
     if torch.cuda.is_current_stream_capturing():
+        return None
+    if _SCRATCH_DISABLED:
+        # SGLANG_PE_NO_SCRATCH=1: kill-switch — route prefill through the wave path instead. Isolation
+        # lever for a concurrency crash observed INSIDE the scratch pipeline (illegal access surfacing at
+        # the GEMM1->swiglu boundary with interleaved multi-request chunked prefills); the banked
+        # double-buffer + cross-layer prefetch was designed for single-request prefill passes.
         return None
     if getattr(method, "_nvfp4_full_e", None) is not None:
         # nvfp4 scalar params (g*_alphas, w*_input_scale_quant) are K-sized and refreshed by the
