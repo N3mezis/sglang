@@ -412,23 +412,31 @@ def resolve_num_resident_experts(
         # is exactly our capture reserve.
         sa.mem_fraction_static = mem_frac
 
-    # KV reserve (the K/KV split): mrr x context x per-token, MLA cell or MHA/GQA per-token.
+    # KV reserve (the K/KV split): kv-token count x per-token, MLA cell or MHA/GQA per-token.
+    # The token count is mrr x context capped at --max-total-tokens: sglang's real KV pool honors that
+    # cap, so reserving the uncapped product starves K for KV that will never be allocated (mrr=128 x
+    # 2k ctx reserved ~13GB on a 16GB card and floored K to top_k while the actual pool was 16k tokens).
+    kv_tokens = mrr * ctx
+    mtt = getattr(sa, "max_total_tokens", None)
+    if mtt:
+        kv_tokens = min(kv_tokens, int(mtt))
     kv_gb = getattr(sa, "paged_experts_kv_reserve_gb", -1.0)
     if kv_gb is not None and kv_gb >= 0:
         kv_reserve = kv_gb * 1e9
     elif getattr(mc, "kv_lora_rank", None):  # MLA
         cell = (mc.kv_lora_rank + mc.qk_rope_head_dim) * layers * kv_elt
-        kv_reserve = mrr * ctx * cell
+        kv_reserve = kv_tokens * cell
     else:  # MHA / GQA — reuse the pure helper (get_num_kv_heads handles GQA + TP)
         tp = getattr(sa, "tp_size", 1) or 1
-        kv_reserve = kv_reserve_bytes_mha(
+        per_token = kv_reserve_bytes_mha(
             num_layers=layers,
             num_kv_heads=mc.get_num_kv_heads(tp),
             head_dim=(mc.head_dim + mc.v_head_dim) // 2,  # combined K+V per-head width
             kv_dtype_bytes=kv_elt,
-            max_running_requests=mrr,  # size KV for the declared concurrency; single-stream -> small
-            context_length=ctx,
+            max_running_requests=1,
+            context_length=1,
         )
+        kv_reserve = kv_tokens * per_token
 
     # Hybrid (mamba / linear-attention) models keep a per-request STATE cache outside the token-KV
     # pool; sglang sizes it from what is left after weights — which auto-K would otherwise consume
