@@ -32,6 +32,8 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
+    graph_pool_capture_scope,
+    graph_pool_replay_scope,
 )
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -142,7 +144,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = self._device_module.graph
 
-        with graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream):
+        with (
+            graph_pool_capture_scope(),
+            graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
+        ):
             out = forward_fn()
 
         if profiler is not None:
@@ -164,11 +169,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         static_forward_batch: ForwardBatch,
         **kwargs,
     ) -> Any:
-        self._graphs[shape_key].replay()
+        with graph_pool_replay_scope():
+            self._graphs[shape_key].replay()
+        # The post-replay hook (paged-experts refill / hotset rotation) is not a replay and does its own
+        # allocations, so it runs OUTSIDE the pool scope; each re-replay it asks for re-enters the scope.
         if _post_replay_hook is not None:
             tries = 0
             while _post_replay_hook() and tries < _POST_REPLAY_MAX_TRIES:
-                self._graphs[shape_key].replay()
+                with graph_pool_replay_scope():
+                    self._graphs[shape_key].replay()
                 tries += 1
         return self._outputs[shape_key]
 

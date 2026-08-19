@@ -4,7 +4,7 @@ import logging
 import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -12,7 +12,13 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.runtime_context import get_exec, get_flags, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_flags,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 from sglang.srt.utils import is_cuda, is_npu
 
 _is_npu = is_npu()
@@ -20,7 +26,6 @@ _is_npu = is_npu()
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-from sglang.srt.runtime_context import get_server_args
 from sglang.srt.utils.common import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -37,6 +42,7 @@ class MoeA2ABackend(Enum):
     ASCEND_TP = "ascend_tp"
     FLASHINFER = "flashinfer"
     MEGAMOE = "megamoe"
+    DEEPEP_V2 = "deepep_v2"
     PPLX = "pplx"
     CUSTOMIZED = "customized"
 
@@ -75,6 +81,9 @@ class MoeA2ABackend(Enum):
 
     def is_megamoe(self):
         return self == MoeA2ABackend.MEGAMOE
+
+    def is_deepep_v2(self):
+        return self == MoeA2ABackend.DEEPEP_V2
 
     def is_pplx(self):
         return self == MoeA2ABackend.PPLX
@@ -173,6 +182,20 @@ class MoeRunnerBackend(Enum):
 
     def is_aiter(self):
         return self == MoeRunnerBackend.AITER
+
+
+class DeepEPv2Fp8ScaleFormat(NamedTuple):
+    """
+    Layout of the FP8 activation scales DeepEP v2 dispatches to DeepGEMM.
+
+    Both fields come from the DeepGEMM JIT configuration and therefore vary by
+    HARDWARE, not by runner: Hopper wants row-major fp32, Blackwell wants
+    column-major packed UE8M0. Resolving them here keeps the dispatcher from
+    importing deep_gemm_wrapper and reading JIT flags itself.
+    """
+
+    tma_aligned: bool
+    ue8m0: bool
 
 
 class DeepEPMode(Enum):
@@ -306,6 +329,23 @@ def get_ascend_dispatcher_output_dtype(dispatcher):
 
     # 2. Ascend dispatch defaults to BF16
     return DispatcherOutputDtype.BF16
+
+
+def get_deepep_v2_fp8_scale_format() -> DeepEPv2Fp8ScaleFormat:
+    """Resolve the FP8 scale layout DeepEP v2 must pre-quantize into.
+
+    deepep_v2 dispatches FP8 activations plus scales, which only the deep_gemm
+    runner consumes; MoeRunner rejects any other runner for this backend.
+    """
+    from sglang.srt.layers import deep_gemm_wrapper
+
+    return DeepEPv2Fp8ScaleFormat(
+        tma_aligned=(
+            deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES
+            or deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        ),
+        ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+    )
 
 
 def initialize_moe_config(server_args: ServerArgs):
@@ -684,6 +724,41 @@ class RoutingMethodType(IntEnum):
 
 AITER_PADDING_SIZE = 128
 TRITON_PADDING_SIZE = 128
+
+# Row-stride padding, in bytes, applied to XPU MoE expert weights whose K dim
+# lands on an L3 aliasing stride (see xpu_moe_ld_padding_elems). 64B matches
+# the 32 bf16 elements used by the sgl-kernel-xpu MoE benchmark. Expressed in
+# bytes because the aliasing is a property of the row's byte size, so this
+# stays correct if the path ever carries a non-bf16 weight dtype.
+#
+# Measured on BMG: halving this to 32B still clears the aliasing but runs ~6%
+# slower than not padding at all on hidden=7168 shapes (0.94x), presumably by
+# misaligning the grouped GEMM's row loads. Doubling it to 128B gains nothing
+# over 64B. Re-measure before changing.
+XPU_MOE_LD_PADDING_BYTES = 64
+
+
+def xpu_moe_ld_padding_elems(k_dim: int, itemsize: int) -> int:
+    """Extra elements to add to an XPU MoE weight's row stride (leading dim).
+
+    The Xe20 grouped GEMM walks B row-by-row over the K dim, so the row stride
+    in bytes decides which L3 set each row lands in. The L3 set index is
+    derived by XOR-folding address bits; when the row byte size is a multiple
+    of 2048 with an odd cofactor >= 3 (K = 3072, 7168, ... in bf16) successive
+    rows collapse onto a small number of sets and thrash. Padding the stride
+    (without changing the logical shape) breaks the aliasing.
+
+    Returns 0 when the shape is already well distributed, so callers can use
+    this to decide whether to allocate a padded buffer at all.
+    """
+    row_bytes = k_dim * itemsize
+    if row_bytes <= 0 or XPU_MOE_LD_PADDING_BYTES % itemsize != 0:
+        return 0
+    trailing_zeros = (row_bytes & -row_bytes).bit_length() - 1
+    odd_cofactor = row_bytes >> trailing_zeros
+    if trailing_zeros >= 11 and odd_cofactor >= 3:
+        return XPU_MOE_LD_PADDING_BYTES // itemsize
+    return 0
 
 
 # Unit of padding - context dependent
