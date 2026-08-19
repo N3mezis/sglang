@@ -350,6 +350,23 @@ __global__ void decide_bounded_kernel(
 // served in exactly its wave, so summing the per-wave GEMM partials reconstructs the full MoE output
 // (lossless). slot_base banks the slot pool for double-buffered waves: bank B pages on an alternate
 // stream while bank A's GEMM computes. No eviction, no state mutation, no host sync.
+// Max wave-group width served by the shared-memory presence map (4 KB of smem); every real MoE is far
+// under this (E=128 Qwen, 256 DeepSeek) and K <= E, so the serial fallback below is unreachable in
+// practice — it exists only so a pathological pool can never be silently wrong.
+constexpr int kWaveFlagMax = 1024;
+
+// BLOCK-PARALLEL dedup (2026-08-19). This ran on lane 0 alone as an O(topk_n * n) rescan of ``src`` in
+// GLOBAL memory: measured 234 us/call at ~300 running requests and growing LINEARLY with the batch
+// (~800 us at bs=1024), which made it 15.3% of decode GPU time in the trace — and it sits on the
+// critical path directly ahead of the wave's gather, so it delays every page-in. Its sibling
+// ``decide_kernel`` was warp-parallelized earlier for exactly this reason; this variant is strictly
+// easier because a wave slot is a pure function of the expert id (``e - lo + slot_base``), with none of
+// the eviction-order dependency that forces decide_kernel's miss loop to stay sequential. A shared
+// per-expert presence flag makes it O(topk_n / threads + K).
+//
+// src/dst ordering changes from first-appearance to ascending expert id. That is unobservable: the
+// gather applies ``src[i] -> dst[i]`` independently per entry, ``dst`` depends only on ``e``, and
+// ``n_out`` is a count — so the plan is the same SET of (src, dst) pairs.
 __global__ void decide_wave_kernel(
     const int32_t* topk,
     int topk_n,
@@ -361,26 +378,48 @@ __global__ void decide_wave_kernel(
     int32_t* dst,
     int32_t* n_out,
     int32_t* idx) {
-  if (blockIdx.x || threadIdx.x >= 32) return;
-  const int lane = threadIdx.x;
+  if (blockIdx.x) return;
+  __shared__ int32_t sflag[kWaveFlagMax];
+  const int tid = threadIdx.x, nthr = blockDim.x;
   const int lo = w * K, hi = lo + K;
-  for (int e = lane; e < E; e += 32)
+  for (int e = tid; e < E; e += nthr)
     idx[e] = (e >= lo && e < hi) ? (e - lo + slot_base) : -1;
-  if (lane == 0) {
-    int n = 0;
-    for (int i = 0; i < topk_n; ++i) {
-      const int e = topk[i];
-      if (e < lo || e >= hi) continue;  // not this wave's group
-      bool seen = false;
-      for (int k = 0; k < n; ++k) {
-        if (src[k] == e) {
-          seen = true;
-          break;
+  if (K > kWaveFlagMax) {  // block-uniform: no thread reaches the barriers below
+    if (tid == 0) {
+      int n = 0;
+      for (int i = 0; i < topk_n; ++i) {
+        const int e = topk[i];
+        if (e < lo || e >= hi) continue;  // not this wave's group
+        bool seen = false;
+        for (int k = 0; k < n; ++k) {
+          if (src[k] == e) {
+            seen = true;
+            break;
+          }
+        }
+        if (!seen) {  // distinct in-wave hit -> its home slot (bank-offset)
+          src[n] = e;
+          dst[n] = e - lo + slot_base;
+          ++n;
         }
       }
-      if (!seen) {  // distinct in-wave hit -> its home slot (bank-offset)
-        src[n] = e;
-        dst[n] = e - lo + slot_base;
+      *n_out = n;
+    }
+    return;
+  }
+  for (int i = tid; i < K; i += nthr) sflag[i] = 0;
+  __syncthreads();
+  for (int i = tid; i < topk_n; i += nthr) {
+    const int e = topk[i];
+    if (e >= lo && e < hi) sflag[e - lo] = 1;  // duplicate writes store the same value (benign race)
+  }
+  __syncthreads();
+  if (tid == 0) {  // compaction over K shared flags: ~E reads, vs the old ~topk_n * n global reads
+    int n = 0;
+    for (int e = 0; e < K; ++e) {
+      if (sflag[e]) {
+        src[n] = lo + e;
+        dst[n] = e + slot_base;
         ++n;
       }
     }
@@ -698,7 +737,8 @@ void decide_wave(
   const int t = static_cast<int>(T.unwrap());
   const DLDevice device = device_.unwrap();
 
-  LaunchKernel(1, 32, device)(
+  // 256 threads: the dedup is block-parallel over topk_n (see decide_wave_kernel).
+  LaunchKernel(1, 256, device)(
       decide_wave_kernel,
       static_cast<const int32_t*>(topk.data_ptr()),
       t,

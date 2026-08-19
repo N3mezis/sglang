@@ -148,8 +148,12 @@ def test_decide_wave_matches_reference():
         r_src, r_dst, r_idx = _ref_wave(experts, E, K, w)
         n = int(n_out.item())
         assert idx.tolist() == r_idx, f"wave {w}: idx"
-        assert src[:n].tolist() == r_src, f"wave {w}: src"
-        assert dst[:n].tolist() == r_dst, f"wave {w}: dst"
+        # The dedup is block-parallel, so the plan comes out in ascending expert order rather than the
+        # reference's first-appearance order. A page-in plan is a SET of (src -> dst) pairs: gather applies
+        # each entry independently and dst is a pure function of the expert, so compare as pairs.
+        assert sorted(zip(src[:n].tolist(), dst[:n].tolist())) == sorted(
+            zip(r_src, r_dst)
+        ), f"wave {w}: plan"
         served += src[:n].tolist()
     assert sorted(served) == sorted(
         experts
@@ -168,12 +172,40 @@ def test_decide_wave_matches_reference():
         r_src, r_dst, r_idx = _ref_wave(experts, E, half, w, slot_base=base)
         n = int(n_out.item())
         assert idx.tolist() == r_idx, f"banked wave {w}: idx"
-        assert src[:n].tolist() == r_src, f"banked wave {w}: src"
-        assert dst[:n].tolist() == r_dst, f"banked wave {w}: dst"
+        assert sorted(zip(src[:n].tolist(), dst[:n].tolist())) == sorted(
+            zip(r_src, r_dst)
+        ), f"banked wave {w}: plan"
         assert all(base <= s < base + half for s in dst[:n].tolist())
         served += src[:n].tolist()
     assert sorted(served) == sorted(experts)
 
+
+
+@requires_cuda
+def test_decide_wave_parallel_dedup_batched():
+    """Decode-batch shaped: topk_n far exceeds the block's thread count and every expert repeats many
+    times, so the plan is only correct if the block-parallel presence map dedups across threads (the old
+    single-lane rescan could not be wrong here, the parallel one can). Also covers the wave that ends up
+    empty and the ``n_out`` count itself."""
+    E, K = 128, 39  # jixi's measured auto-K at bs=1024
+    sc, se, es, lu, fq, src, dst, n_out, idx = _new_state(E, K)
+    # 1024 tokens x top-8, deterministic spread: every expert appears ~64 times
+    experts = [(i * 7 + i // 128) % E for i in range(1024 * 8)]
+    topk = _i32(experts)
+    nwaves = (E + K - 1) // K
+    served = []
+    for w in range(nwaves):
+        paged_experts_decide_wave(topk, E, K, w, src, dst, n_out, idx)
+        r_src, r_dst, r_idx = _ref_wave(experts, E, K, w)
+        n = int(n_out.item())
+        assert n == len(r_src), f"wave {w}: count {n} != {len(r_src)}"
+        assert idx.tolist() == r_idx, f"wave {w}: idx"
+        assert sorted(zip(src[:n].tolist(), dst[:n].tolist())) == sorted(
+            zip(r_src, r_dst)
+        ), f"wave {w}: plan"
+        assert len(set(src[:n].tolist())) == n, f"wave {w}: duplicate page-in"
+        served += src[:n].tolist()
+    assert sorted(served) == sorted(set(experts))  # each distinct expert paged exactly once
 
 @requires_cuda
 def test_decide_is_cuda_graph_capturable():
