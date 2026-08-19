@@ -381,7 +381,12 @@ class ExpertPager:
         # holding experts 0..K-1 (what the native loader put there). logical_to_gpu_index[e] is the slot
         # of expert e (-1 if not resident); its device mirror drives the remap each step. The policy owns
         # the eviction choice + its recency/frequency bookkeeping (see policy.py).
-        self.policy: ResidencyPolicy = make_residency_policy(eviction, self.K, self.E)
+        # "auto": LRU single-stream / LFU batched, chosen per step by _lfu_flag. The policy object
+        # itself stays LRU so the host path keeps concrete behaviour.
+        self._evict_auto = str(eviction).lower() == "auto"
+        self.policy: ResidencyPolicy = make_residency_policy(
+            "lru" if self._evict_auto else eviction, self.K, self.E
+        )
         self.slot_expert = list(range(self.K))  # slot -> expert id (-1 == empty)
         self.logical_to_gpu_index = torch.full((self.E,), -1, dtype=torch.int32)
         self.logical_to_gpu_index[: self.K] = torch.arange(self.K, dtype=torch.int32)
@@ -820,6 +825,15 @@ class ExpertPager:
             self._masked_tw_d.view(topk_weights.shape),
         )
 
+    def _lfu_flag(self, topk_ids: torch.Tensor) -> bool:
+        """Per-step eviction policy for the on-device decide kernels: the static server arg, or --
+        under "auto" -- LRU for single-token (bs=1) steps and LFU for batched ones (the measured winner
+        per regime). num_tokens is static per captured graph, so each bs bucket bakes its policy at
+        capture."""
+        if self._evict_auto:
+            return topk_ids.shape[0] > 1
+        return self.policy.name == "lfu"
+
     def decide_and_page_ondevice(
         self, topk_ids: torch.Tensor, topk_weights: torch.Tensor = None
     ) -> None:
@@ -836,7 +850,7 @@ class ExpertPager:
         their out-of-graph cold-staging break)."""
         self._prep_topk_ondevice(topk_ids)
         l2g = self.logical_to_gpu_index_cuda  # serves as both expert_slot and idx
-        lfu = self.policy.name == "lfu"  # --paged-experts-eviction, same as the host path
+        lfu = self._lfu_flag(topk_ids)  # --paged-experts-eviction (incl. "auto"), as the host path
         fusable = (
             topk_weights is not None
             and topk_weights.dtype == torch.float32
@@ -910,8 +924,9 @@ class ExpertPager:
             l2g,
             self._slot_lastuse_d,
             self._freq_d,
-            self.policy.name
-            == "lfu",  # --paged-experts-eviction, same as the host path
+            self._lfu_flag(
+                topk_ids
+            ),  # --paged-experts-eviction (incl. "auto"), as the host path
             self._log2hot_d,
             self._src_d,
             self._dst_d,
