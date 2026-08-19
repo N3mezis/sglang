@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -16,6 +17,18 @@ if _is_cuda:
 
     from sglang.kernels.ops.activation.activation import silu_and_mul
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+
+# Paged Experts wave-skip (SGLANG_PE_WAVE_SKIP=1). The paged wave path serves >K distinct experts in
+# ceil(distinct/K) waves and masks each wave to its own experts. Masking by clamping the other waves' ids
+# onto slot 0 with weight 0 means every wave GEMMs the WHOLE batch and keeps ~1/nwaves of it (measured:
+# marlin us/CALL constant while total GEMM ms/step tracks nwaves). Letting those ids stay NEGATIVE and
+# telling the aligner to drop them (``ignore_invalid_expert``: "if (ignore && topk_ids[i] < 0) continue" in
+# both the histogram and the sort pass) removes that work: the skipped pairs never enter sorted_token_ids,
+# so no block covers them, their pre-zeroed intermediate_cache rows stay zero, and their zero routing
+# weight makes the final sum identical. Negative ids never index a weight tensor here -- topk_ids is used
+# only for shapes, a dtype check, and the aligner. Env-scoped because the id convention is set by the
+# paged forward, which reads the same variable.
+_PE_WAVE_SKIP = os.environ.get("SGLANG_PE_WAVE_SKIP", "0") != "0"
 
 
 @triton.jit
@@ -250,6 +263,9 @@ def fused_marlin_moe(
         # The JIT kernel is int32-only; torch-native topk emits int64 -- let
         # that (test-only) shape take the generic path instead of casting.
         and topk_ids.dtype == torch.int32
+        # moe_align_single_token has no invalid-id handling: a negative id would index out of bounds
+        # (this is what crashed bs=1 capture before the gate existed).
+        and not _PE_WAVE_SKIP
     ):
         # Single-token decode: top-k ids are distinct, so alignment is a
         # single-warp sort instead of the align + count_and_sort kernel pair.
@@ -260,7 +276,10 @@ def fused_marlin_moe(
         )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, global_num_experts
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            ignore_invalid_expert=_PE_WAVE_SKIP,
         )
 
     if workspace is None:
@@ -362,7 +381,12 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    if expert_map is not None:
+    # Rows the second GEMM skips must not carry stale GEMM1 output: cache1 and cache3 ALIAS the same
+    # ``intermediate_cache13`` allocation, so its initial zeroing is already gone by here. expert_map
+    # filtering skips rows, and so does wave-skip's ignore_invalid_expert -- without this the summed
+    # partials pick up GEMM1 leftovers (measured as fluent-but-unrelated output, 0/5 greedy completions
+    # matching the baseline). Safe here: the activation above has moved GEMM1's result into cache2.
+    if expert_map is not None or _PE_WAVE_SKIP:
         intermediate_cache3.zero_()
 
     intermediate_cache3 = moe_wna16_marlin_gemm(

@@ -33,6 +33,15 @@ _SHARED_OVERLAP_ON = os.environ.get("SGLANG_PE_SHARED_OVERLAP") not in (None, ""
 # SGLANG_PE_NO_SCRATCH=1: disable the double-buffered scratch prefill pipeline (fall back to waves).
 _SCRATCH_DISABLED = os.environ.get("SGLANG_PE_NO_SCRATCH") not in (None, "", "0")
 
+# SGLANG_PE_WAVE_SKIP=1: in the wave path, leave out-of-wave pairs at id -1 instead of clamping them to
+# slot 0, so the aligner drops them and marlin never GEMMs them (see the flag's note in fused_marlin_moe).
+# Each wave otherwise GEMMs the WHOLE batch and keeps ~1/nwaves of it: measured at bs=1024, marlin's
+# us/CALL is constant (500 at 6 waves, 513 at 4) while total GEMM ms/step tracks nwaves exactly (288 ->
+# 197 ms for 6 -> 4 waves), so the GEMM -- 60% of the step -- does ~nwaves x the necessary work.
+# Marlin-only: the flag makes fused_marlin_moe pass ignore_invalid_expert; other runners still need the
+# slot-0 clamp, so keep-warm callers never set wave_skip and the flag stays opt-in.
+_WAVE_SKIP = os.environ.get("SGLANG_PE_WAVE_SKIP", "0") != "0"
+
 # Router-independent-work overlap (paged-experts #4): a model with a SHARED expert wraps its paged-experts
 # call in ``shared_expert_overlap(fn)``; the EAGER keep-warm placement then runs ``fn`` (the shared-expert
 # GEMM) on the compute stream while the routed page-in transfers on a dedicated stream, hiding
@@ -158,6 +167,7 @@ def _gemm_hidden(
     *,
     clone_hidden: bool,
     logical_to_slot: torch.Tensor = None,
+    wave_skip: bool = False,
 ):
     """Run the base fused-MoE over the K-slot pool for one (wave's) remap, returning the hidden output.
 
@@ -171,7 +181,12 @@ def _gemm_hidden(
     tw = topk_output.topk_weights
     mask = remap >= 0  # compute once; scalar `0` in where avoids two throwaway zeros_like allocs
     masked_tw = torch.where(mask, tw, 0.0)
-    safe_ids = torch.where(mask, remap, 0)
+    if wave_skip and _WAVE_SKIP:
+        # Leave masked ids NEGATIVE: the aligner drops them (ignore_invalid_expert), so no GEMM block
+        # covers them, their pre-zeroed cache rows stay zero, and masked_tw already zeroes the sum.
+        safe_ids = remap
+    else:
+        safe_ids = torch.where(mask, remap, 0)
     hidden = dispatch_output.hidden_states
     md = dispatch_output._replace(
         hidden_states=hidden.clone() if clone_hidden else hidden,
@@ -459,7 +474,12 @@ def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
                     topk_ids, pager.logical_to_gpu_index_cuda
                 )
                 partial = _gemm_hidden(
-                    method, layer, dispatch_output, remap, clone_hidden=True
+                    method,
+                    layer,
+                    dispatch_output,
+                    remap,
+                    clone_hidden=True,
+                    wave_skip=True,
                 )
             out = partial if out is None else out + partial
         lo = (nwaves - 1) * K
@@ -483,7 +503,9 @@ def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
             ev_h2d[b].record(ts)
         cs.wait_event(ev_h2d[b])
         remap = mask_and_remap_expert_ids(topk_ids, idx_banks[b])
-        partial = _gemm_hidden(method, layer, dispatch_output, remap, clone_hidden=True)
+        partial = _gemm_hidden(
+            method, layer, dispatch_output, remap, clone_hidden=True, wave_skip=True
+        )
         ev_gemm[b].record(cs)
         out = partial if out is None else out + partial
     lo = (nwaves - 1) * half
