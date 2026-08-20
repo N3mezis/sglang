@@ -51,13 +51,16 @@ def _fill_bf16_from_checkpoint(
                 if proj == down:
                     store.row("w2_weight", e).copy_(t)
                     continue
-                # w13 packs gate (first half of dim 0) then up (second half)
+                # w13 packs UP (first half of dim 0) then GATE (second half). The paged MoE GEMM applies
+                # silu to the FIRST half, so gate must land in the SECOND half to yield the correct
+                # silu(gate)*up (gate-first gives silu(up)*gate garbage — see the _fill_bf16 fix / the
+                # in-place NVFP4 store's (up, gate, down) swap).
                 row = store.row("w13_weight", e)
                 half = row.shape[0] // 2
                 if proj == gate:
-                    row[:half].copy_(t)
-                else:  # up
                     row[half:].copy_(t)
+                else:  # up
+                    row[:half].copy_(t)
         _drop_file_cache(_shard_path)  # release this shard's page cache before the next
 
 
