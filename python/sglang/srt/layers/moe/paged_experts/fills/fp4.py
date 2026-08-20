@@ -135,6 +135,13 @@ def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)
     gate, up, down = _proj_names(wmap, pre)
+    # SWAP gate<->up for the fused w13. The MoE GEMM silus w13's FIRST half, and this checkpoint family
+    # needs gate in the SECOND half to yield silu(gate)*up -- the in-place nvfp4 store (the nvfp4 path
+    # known to serve correctly) does exactly this, and _fill_bf16 carries the same fix. Swapping the NAMES
+    # here rather than the individual destinations flips ALL of it together: packed weights, swizzled
+    # block scales, AND the per-half global-scale bookkeeping (w1_* must describe whichever projection
+    # occupies the first half). Flipping only the weights leaves the alphas describing the wrong half.
+    gate, up = up, gate
 
     # raw (pre-swizzle) block-scale + global-scale collectors, filled per expert then transformed en masse
     w13_sc_raw = w2_sc_raw = None
