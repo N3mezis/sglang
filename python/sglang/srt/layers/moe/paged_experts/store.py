@@ -34,6 +34,25 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def _moe_layer_count_hint() -> int:
+    """Best-effort count of MoE layers in the model being served, for per-layer host budgets that must sum
+    to a whole-host number. Reads the live ServerArgs/ModelConfig; falls back to a pessimistic 64 so a
+    miss under-sizes the cache (slower) rather than over-committing RAM (fatal)."""
+    try:
+        from sglang.srt.server_args import get_global_server_args
+
+        mp = get_global_server_args().model_path
+        from sglang.srt.configs.model_config import ModelConfig
+
+        mc = ModelConfig.from_server_args(get_global_server_args())
+        htc = getattr(mc, "hf_text_config", None) or mc.hf_config
+        n = int(getattr(mc, "num_hidden_layers", 0) or 0)
+        dense = int(getattr(htc, "first_k_dense_replace", 0) or 0)
+        return max(1, n - dense) if n else 64
+    except Exception:
+        return 64
+
+
 def _pinned_empty(shape, dtype: torch.dtype) -> torch.Tensor:
     """Pinned host tensor allocated via raw ``cudaHostAlloc`` instead of torch's pinned allocator.
 
@@ -1006,8 +1025,12 @@ class SwapExpertStore(ExpertStore):
             budget = float(gb) * 1e9
         else:
             avail = _host_available_bytes()
-            # /proc split across all layers is unknowable here; take a small conservative slice per layer.
-            budget = (0.15 * avail) if avail else 2e9
+            # MemAvailable is a WHOLE-HOST number but this budget is charged PER MoE LAYER, so it must be
+            # divided by the layer count: 0.15 * avail per layer on a 48-layer model asks for 7.2x
+            # MemAvailable and thrashes the host to death (sshd starves before the loader finishes).
+            # Take a quarter of MemAvailable for the WHOLE model and split it evenly across layers.
+            nlayers = max(1, _moe_layer_count_hint())
+            budget = (0.25 * avail / nlayers) if avail else (2e9 / nlayers)
         return max(1, int(budget // row_bytes))
 
     def fill_tensor(self, name: str, full: torch.Tensor) -> None:

@@ -698,7 +698,14 @@ def make_for_layer(
     pin_host = store_kind != "paged"
     # Use the on-device (capturable) decode path unless CUDA graphs are disabled. With graphs off it's the
     # eager kernel-free path (host decide + transfer_kv); with graphs on the decode step is captured.
-    use_ondevice = not bool(getattr(server_args, "disable_cuda_graph", False))
+    # --disable-cuda-graph is deprecated upstream; the live switch is --cuda-graph-backend-decode.
+    # Honour BOTH, or a deployment that turns decode graphs off the modern way still gets the captured
+    # on-device placement (wrong, and fatal for stores whose cold tier is not UVA-gatherable).
+    _cg_decode = str(getattr(server_args, "cuda_graph_backend_decode", "") or "").lower()
+    use_ondevice = (
+        not bool(getattr(server_args, "disable_cuda_graph", False))
+        and _cg_decode != "disabled"
+    )
     if use_ondevice and not pin_host:
         # The pageable store has no capture-safe gather: it would select the eager placement, whose
         # host-side decision syncs inside graph capture and fails cryptically at startup. Reject up front.
