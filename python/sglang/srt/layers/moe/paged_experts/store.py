@@ -628,8 +628,11 @@ class WindowedExpertStore(ExpertStore):
     def cold_direct_all(self) -> bool:
         """True when every paged tensor's cold rows can be read O_DIRECT (fd available, block-aligned
         rows) — the page-in paths then bypass the page cache, and WILLNEED read-ahead would only pull
-        pages nobody will fault."""
+        pages nobody will fault. Must honor SGLANG_PAGED_EXPERTS_ODIRECT: with the env off, reads go
+        through the mmap even when fds exist, and suppressing WILLNEED then starves the fault path."""
         if not self._cold_fd:
+            return False
+        if os.environ.get("SGLANG_PAGED_EXPERTS_ODIRECT", "1") == "0":
             return False
         return all(
             self._cold_fd.get(name) is not None and self.item_bytes[name] % 4096 == 0
@@ -1198,6 +1201,58 @@ class SwapExpertStore(ExpertStore):
         if self._d2h_stream is None:
             self._d2h_stream = torch.cuda.Stream(self.device)
         return self._d2h_stream
+
+    def cold_direct_all(self) -> bool:
+        """Same semantics as the windowed store: True when page-ins bypass the page cache (O_DIRECT
+        usable for every tensor AND not disabled via env) — WILLNEED hints are useless then."""
+        if not self._disk or not self._cold_fd:
+            return False
+        if os.environ.get("SGLANG_PAGED_EXPERTS_ODIRECT", "1") == "0":
+            return False
+        return all(
+            self._cold_fd.get(name) is not None and self.item_bytes[name] % 4096 == 0
+            for name in self.gpu
+        )
+
+    def prefetch_cold(self, experts, force: bool = False) -> None:
+        """MADV_WILLNEED read-ahead for the disk rows of ``experts`` (row index == expert id in this
+        store's full-E backing). Skips experts already in the RAM cache or resident in a GPU slot —
+        their bytes won't be read from disk. No-op when page-ins bypass the page cache (O_DIRECT),
+        unless the caller reads via the mmap anyway (force=True). Best-effort, never fatal."""
+        if not self._cold_mm or (self.cold_direct_all() and not force):
+            return
+        page = mmap.PAGESIZE
+        rows = sorted(
+            {
+                int(e)
+                for e in experts
+                if int(e) not in self.expert_row and int(e) not in self.expert_slot
+            }
+        )
+        if not rows:
+            return
+        for name, mm in self._cold_mm.items():
+            stride = self.item_bytes[name]
+            size = len(mm)
+            m_start = m_end = None
+            for r in rows:
+                off = r * stride
+                start = (off // page) * page
+                end = min(off + stride, size)
+                if m_end is not None and start <= m_end:
+                    m_end = max(m_end, end)
+                    continue
+                if m_end is not None:
+                    try:
+                        mm.madvise(mmap.MADV_WILLNEED, m_start, m_end - m_start)
+                    except (OSError, ValueError):
+                        pass
+                m_start, m_end = start, end
+            if m_end is not None:
+                try:
+                    mm.madvise(mmap.MADV_WILLNEED, m_start, m_end - m_start)
+                except (OSError, ValueError):
+                    pass
 
     def page_in(
         self,

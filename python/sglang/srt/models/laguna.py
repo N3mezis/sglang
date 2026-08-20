@@ -41,6 +41,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.paged_experts import prefetch as _pe_prefetch
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -142,6 +143,9 @@ class LagunaMoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        self.layer_id = layer_id
+        if _pe_prefetch.ON:
+            _pe_prefetch.register(layer_id, self, config.num_experts_per_tok)
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.moe_routed_scaling_factor
         self.router_logit_softcapping = getattr(
@@ -204,6 +208,9 @@ class LagunaMoE(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states
+
+        if _pe_prefetch.ON and hidden_states.shape[0] == 1:  # kick next layers' cold read-ahead early
+            _pe_prefetch.prefetch_ahead(self, hidden_states)
 
         shared_out = self.shared_expert(hidden_states)
 

@@ -48,6 +48,8 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.paged_experts import prefetch as _pe_prefetch
+from sglang.srt.layers.moe.paged_experts import route_probe as _route_probe
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -237,6 +239,8 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
         self.layer_id = layer_id
+        if _pe_prefetch.ON:
+            _pe_prefetch.register(layer_id, self, config.num_experts_per_tok)
         if self.tp_size > config.num_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -324,9 +328,14 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
+        if _pe_prefetch.ON and num_tokens == 1:  # kick next layers' cold read-ahead before this layer's work
+            _pe_prefetch.prefetch_ahead(self, hidden_states)
+
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
+        if _route_probe.ON:
+            _route_probe.probe(self, hidden_states, router_logits, topk_output)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
