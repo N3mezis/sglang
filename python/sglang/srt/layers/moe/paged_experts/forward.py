@@ -123,6 +123,14 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
         # each row into its K-slot param — replaces the per-scalar clamp/long/gather/copy chain
         # (~10 launches + ~6 allocs -> ~7 launches, 0 per-step allocs). Buffers built once (shapes are
         # graph-stable: K slots, fixed scalar set). Bit-identical to the old ``full[s2l.clamp(0)]`` gather.
+        if not all(full.dim() > 0 for full in fe.values()):
+            # Some resident scalars are 0-dim per-tensor (input_scale_quant): they cannot be stacked or
+            # gathered per-expert, and torch.stack below would raise. Per-tensor loop handles both.
+            idx0 = s2l.clamp(min=0).long()
+            for nm, full in fe.items():
+                tgt = getattr(layer, nm).data
+                tgt.copy_(full) if full.dim() == 0 else tgt.copy_(full[idx0])
+            return
         idx = getattr(method, "_nvfp4_idx", None)
         if idx is None:
             method._nvfp4_names = list(fe.keys())
@@ -156,7 +164,11 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
         resident = l2g >= 0
         slots = l2g[resident].long()
         for nm, full in fe.items():
-            getattr(layer, nm).data[slots] = full[resident]
+            tgt = getattr(layer, nm).data
+            if full.dim() == 0:
+                tgt.copy_(full)  # per-tensor scalar (input_scale_quant is 0-dim) — no per-slot scatter
+            else:
+                tgt[slots] = full[resident]
 
 
 def _gemm_hidden(
