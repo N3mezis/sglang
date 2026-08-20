@@ -41,6 +41,7 @@ from sglang.srt.layers.moe.paged_experts.store import ExpertStore, make_expert_s
 logger = logging.getLogger(__name__)
 
 # ALL pagers in model-layer order (appended by setup_pager) — the wave path's next-layer prefetch.
+_INPLACE_NVFP4_LOGGED = False  # log the zero-copy nvfp4 store once
 _MMAP_FALLBACK_LOGGED = False  # log the mmap->pinned fallback once, not per layer
 _MMAP_STORE_LOGGED = False  # log the zero-copy store once, not per layer
 _ALL_PAGERS: list = []
@@ -454,14 +455,32 @@ class ExpertPager:
         ``stage_bank``/``async_h2d``/``src_host``/``dst_host`` are the double-buffered wave path's knobs:
         separate staging buffers per bank, no trailing stream sync (the caller sequences buffer reuse with
         events), and host-side copies of the src/dst plan (no D2H read-back)."""
+        kw = {}
+        if dst_host is not None:
+            # only stores whose page_in accepts dst_host (WindowedNvfp4Store's does not); keep the base
+            # contract unchanged for the rest.
+            import inspect
+
+            if "dst_host" in inspect.signature(self.store.page_in).parameters:
+                kw["dst_host"] = dst_host
         self.store.page_in(
             src_experts,
             dst_slots,
             stage_bank=stage_bank,
             async_h2d=async_h2d,
             src_host=src_host,
-            dst_host=dst_host,
+            **kw,
         )
+        if getattr(self.store, "single_copy", False):
+            # Single-copy (swap) store: its page_in may RELOCATE experts the plan never mentioned (the
+            # promote of an already-resident expert is a D2D move that vacates its old slot; the demote
+            # keeps the victim alive in a different tier). The pager's maps only reflect the plan it
+            # asked for, so after every page_in the store's slot_expert is the sole truth — copy it back,
+            # or the next remap sends tokens to slots holding a different expert (its own docstring:
+            # "single-copy cannot tolerate a stale map"). The stream-nvfp4 branch wires this at the wave
+            # tail; the keep-warm path needs it just as much, which a per-step slot-vs-map audit proved
+            # (clean for ~40 steps, then permanently divergent once the first relocation happened).
+            self.store.reconcile_pager(self)
 
     def scratch_ctx(self):
         """Streaming-prefill scratch pools: TWO full-``[E, *slot]`` buffer sets (one per paged tensor),
@@ -1265,13 +1284,35 @@ def setup_pager(method, layer) -> ExpertPager:
         _mp = get_global_server_args().model_path
         v2dir = _store_v2_layer_dir(_store_cache_dir(_mp), layer_idx_early)
         names = list(discover_paged_params(layer, method.num_resident))
-        global _MMAP_FALLBACK_LOGGED, _MMAP_STORE_LOGGED
-        if "w13_weight_scale" in names:
-            if not _MMAP_FALLBACK_LOGGED:
-                _MMAP_FALLBACK_LOGGED = True
-                logger.warning(
-                    "[paged-experts] --paged-experts-store mmap: nvfp4 unsupported (resident scalars) "
-                    "— using the pinned fill store"
+        global _MMAP_FALLBACK_LOGGED, _MMAP_STORE_LOGGED, _INPLACE_NVFP4_LOGGED
+        if "w13_blockscale_swizzled" in names or "w13_weight_scale" in names:
+            # nvfp4 zero-copy IN-PLACE: mmap the checkpoint expert regions directly and page/swizzle per
+            # resident slot on demand — no materialized host store, no cold-tier copy, no per-boot fill
+            # (the swap store rewrote an 84 GB cold file EVERY boot for a 93 GB model). This is the nvfp4
+            # configuration the stream-nvfp4 branch actually validated. Eager placement only.
+            from sglang.srt.layers.moe.paged_experts.inplace_nvfp4_store import (
+                _WINDOWED,
+                InPlaceNvfp4Store,
+                WindowedNvfp4Store,
+            )
+
+            cls = WindowedNvfp4Store if _WINDOWED else InPlaceNvfp4Store
+            store = cls(
+                layer,
+                method.E,
+                method.num_resident,
+                dev,
+                model_path=_mp,
+                layer_idx=layer_idx_early,
+            )
+            method._nvfp4_full_e = store.nvfp4_full_e
+            zero_copied = True
+            if not _INPLACE_NVFP4_LOGGED:
+                _INPLACE_NVFP4_LOGGED = True
+                logger.info(
+                    "[paged-experts] zero-copy %s NVFP4 store: checkpoint experts + swizzle "
+                    "(no materialized store, no cold copy)",
+                    "WINDOWED (captured)" if _WINDOWED else "IN-PLACE (eager)",
                 )
         elif os.environ.get("SGLANG_PAGED_EXPERTS_MMAP_REGISTER", "1") != "1":
             if not _MMAP_FALLBACK_LOGGED:
@@ -1352,6 +1393,8 @@ def setup_pager(method, layer) -> ExpertPager:
         logger.debug("[paged-experts] L%d zero-copy store: fill skipped", layer_idx)
     else:
         _fill_and_cache_store(store, method, model_path, layer_idx, dev)
+        if hasattr(store, "finalize_fill"):
+            store.finalize_fill()  # swap+disk: seed GPU slots from the cold mmap the fill wrote through to
     logger.debug(
         "[paged-experts] L%d host store filled: E=%d, %d tensors %s",
         layer_idx,

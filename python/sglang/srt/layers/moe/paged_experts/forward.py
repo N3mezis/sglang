@@ -171,6 +171,62 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
                 tgt[slots] = full[resident]
 
 
+# SGLANG_PE_PARANOIA=1: per-step residency audit for the nvfp4 debug hunt. After the scalar refresh,
+# verify for every resident logical expert that (a) the GPU slot's weight bytes equal the authoritative
+# cold-store row and (b) the slot's g1_alpha equals the full-E table entry. Whichever fires first, and at
+# which step, localises the corruption (fill vs page_in vs refresh-map skew). Eager path only; heavy.
+_PARANOIA = os.environ.get("SGLANG_PE_PARANOIA", "0") != "0"
+_PARANOIA_STEP = [0]
+
+
+def _paranoia_audit(method, layer):
+    pager = getattr(method, "_pager", None)
+    fe = getattr(method, "_nvfp4_full_e", None)
+    if pager is None or fe is None or torch.cuda.is_current_stream_capturing():
+        return
+    _PARANOIA_STEP[0] += 1
+    step = _PARANOIA_STEP[0]
+    store = pager.store
+    cold = getattr(store, "_cold", None)
+    l2g = pager.logical_to_gpu_index  # host [E] logical -> slot
+    import logging
+
+    log = logging.getLogger(__name__)
+    checked = 0
+    for e in range(store.E):
+        s_ = int(l2g[e])
+        if s_ < 0:
+            continue
+        checked += 1
+        # (a) weight bytes: GPU slot vs authoritative cold row
+        if cold is not None and "w13_weight" in cold:
+            gslot = store.gpu["w13_weight"].data[s_].detach().cpu().view(torch.uint8)
+            cref = cold["w13_weight"][e].view(torch.uint8)
+            if not torch.equal(gslot, cref):
+                nz = (gslot != cref).nonzero().flatten()
+                log.error(
+                    "[paranoia] step %d L%s: WEIGHT bytes diverge: logical %d in slot %d, "
+                    "%d/%d bytes differ, first at offset %d",
+                    step, getattr(layer, "layer_id", "?"), e, s_,
+                    nz.numel(), gslot.numel(), int(nz[0]),
+                )
+                return
+        # (b) scalar: slot alpha vs full-E table
+        ga = fe.get("g1_alphas")
+        if ga is not None and ga.dim() > 0:
+            got = float(layer.g1_alphas.data[s_])
+            want = float(ga[e])
+            if got != want:
+                log.error(
+                    "[paranoia] step %d L%s: SCALAR diverges: logical %d in slot %d, "
+                    "g1_alpha got %.6g want %.6g",
+                    step, getattr(layer, "layer_id", "?"), e, s_, got, want,
+                )
+                return
+    if step % 200 == 0:
+        log.warning("[paranoia] step %d: %d resident slots verified clean", step, checked)
+
+
 def _gemm_hidden(
     method,
     layer,
@@ -205,6 +261,8 @@ def _gemm_hidden(
         topk_output=topk_output._replace(topk_ids=safe_ids, topk_weights=masked_tw),
     )
     _refresh_nvfp4_scalars(method, layer, logical_to_slot=logical_to_slot)
+    if _PARANOIA:
+        _paranoia_audit(method, layer)
     out = method.base_method.apply(layer, md)
     return out.hidden_states if hasattr(out, "hidden_states") else out
 

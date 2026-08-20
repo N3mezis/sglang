@@ -1046,16 +1046,19 @@ class SwapExpertStore(ExpertStore):
             self.host[name][:R].copy_(full[self.K : self.K + R])
 
     def row(self, name: str, e: int) -> torch.Tensor:
-        # dynamic: a pool-resident expert lives in its GPU slot; else a RAM cache row, else the disk file.
+        if self._disk:
+            # Disk mode: the cold mmap is the AUTHORITATIVE, immutable copy of every expert, so it is
+            # always a correct read -- and, critically, the only correct WRITE target for per-row fills.
+            # Returning the GPU slot here for resident experts silently dropped the fill's bytes for the
+            # K seeded experts (slot written, cold left zero-initialised): the first eviction+re-promote
+            # of a seeded expert then loaded ZEROS, which is exactly a first-token-right-then-garbage
+            # failure once residency churns. finalize_fill() seeds the GPU slots from cold post-fill.
+            return self._cold[name][e]
+        # non-disk: a pool-resident expert lives in its GPU slot; else its RAM row (demotes keep it fresh).
         s = self.expert_slot.get(e)
         if s is not None:
             return self.gpu[name].data[s]
-        r = self.expert_row.get(e)
-        if r is not None:
-            return self.host[name][r]
-        if self._disk:
-            return self._cold[name][e]  # disk-only (cold tail): read straight from the mmap
-        return self.host[name][self.expert_row[e]]  # non-disk: KeyError is a real bug (invariant broken)
+        return self.host[name][self.expert_row[e]]  # KeyError here is a real bug (invariant broken)
 
     def _read_cold_into(self, name: str, expert_ids, buf: torch.Tensor) -> None:
         """Read disk experts ``expert_ids`` (by logical id == disk row) into ``buf[0..n)`` — O_DIRECT
@@ -1304,6 +1307,21 @@ class SwapExpertStore(ExpertStore):
         # serial swaps reused the buffer rows transiently; their release events are stale -> clear.
         self._row_release.clear()
         torch.cuda.current_stream(dev).synchronize()
+
+    def finalize_fill(self) -> None:
+        """Disk mode, after the checkpoint fill: per-row writes went to the cold mmap (row() is cold-first
+        there), so copy the seeded experts' rows cold -> GPU slots now, and start with an EMPTY RAM cache
+        (its fill_tensor-time mirror never received the per-row tensors and would serve stale rows)."""
+        if not self._disk:
+            return
+        for name, p in self.gpu.items():
+            cold = self._cold[name]
+            for s_, e in enumerate(self.slot_expert):
+                if e >= 0:
+                    p.data[s_].copy_(cold[e], non_blocking=True)
+        torch.cuda.synchronize(self.device)
+        self.free_rows.extend(sorted(self.expert_row.values()))
+        self.expert_row.clear()
 
     def reconcile_pager(self, pager) -> None:
         """After a wave sequence (which routes experts through slots without touching the pager's maps),
