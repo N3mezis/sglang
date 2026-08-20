@@ -24,7 +24,10 @@ import torch
 # lives under fills too; re-exported here because method.py imports _store_cache_dir from pager.
 from sglang.srt.layers.moe.paged_experts.fills import select_fill  # noqa: E402
 from sglang.srt.layers.moe.paged_experts.fills.cache import (  # noqa: E402,F401
+    _save_store_v2,
     _store_cache_dir,
+    _store_v2_layer_dir,
+    _v2_cache_complete,
 )
 from sglang.srt.layers.moe.paged_experts.fills.checkpoint import (  # noqa: E402
     checkpoint_quant_method,
@@ -38,6 +41,8 @@ from sglang.srt.layers.moe.paged_experts.store import ExpertStore, make_expert_s
 logger = logging.getLogger(__name__)
 
 # ALL pagers in model-layer order (appended by setup_pager) — the wave path's next-layer prefetch.
+_MMAP_FALLBACK_LOGGED = False  # log the mmap->pinned fallback once, not per layer
+_MMAP_STORE_LOGGED = False  # log the zero-copy store once, not per layer
 _ALL_PAGERS: list = []
 
 
@@ -102,6 +107,7 @@ _BCG_HOOK_INSTALLED = False
 from sglang.srt.layers.moe.paged_experts.store import (  # noqa: E402
     _STAGE_PIN,
     _stage_pin_buf,
+    discover_paged_params,
 )
 
 # Shared DEVICE staging rows for the fused refill scatter, reused across ALL layers (refills are
@@ -1211,6 +1217,32 @@ class ExpertPager:
             self._slot_lastuse_d.zero_()
 
 
+def _fill_and_cache_store(store, method, model_path, layer_idx, dev) -> None:
+    """Fill the host store from the checkpoint, then persist the v2 repack cache so a later boot with
+    ``--paged-experts-store mmap`` can map these bytes in place instead of repacking again."""
+    try:
+        # One ExpertFill per quant format, selected by predicate (fills/). The registry keys on the
+        # store's paged params + the checkpoint quant_method (gptq vs awq register identical keys).
+        # A fill may return a resident full-E scalar table (nvfp4) to stash on the method.
+        quant_method = checkpoint_quant_method(model_path)
+        resident = select_fill(store, quant_method).fill(
+            store, model_path, layer_idx, dev
+        )
+        if resident is not None:
+            method._nvfp4_full_e = resident
+    except KeyError as e:
+        raise RuntimeError(
+            f"[paged-experts] checkpoint tensor {e} not found for layer {layer_idx}: the fill expects "
+            "per-expert {gate,up,down}_proj tensors; fused-expert checkpoint layouts (e.g. a packed "
+            "experts.gate_up_proj) are unsupported."
+        ) from e
+    # Only when the operator asked for the zero-copy store: the v2 cache is a full second copy of the
+    # store on disk (~store size) and costs real boot time to write, so a pinned-only deployment should
+    # not pay for it. Best-effort — a failed write only costs the next boot its zero-copy path.
+    if getattr(method, "store_kind", "pinned") == "mmap":
+        _save_store_v2(store, _store_cache_dir(model_path), layer_idx)
+
+
 def setup_pager(method, layer) -> ExpertPager:
     """Build the host store and fill it from the checkpoint (all E experts), then return the pager wrapping
     it. ``method`` carries E, K, and the resident map. gptq-int4 is repacked to marlin at load time; bf16 is
@@ -1219,7 +1251,66 @@ def setup_pager(method, layer) -> ExpertPager:
 
     dev = next(layer.parameters()).device
     store_kind = getattr(method, "store_kind", "pinned")
-    if store_kind == "swap":
+    layer_idx_early = getattr(layer, "layer_id", getattr(layer, "layer_idx", 0))
+    store = None
+    zero_copied = False
+    if store_kind == "mmap":
+        # Zero-copy store: mmap the v2 repack cache and cudaHostRegister it IN PLACE — no cudaHostAlloc
+        # and no fill copy, so boot is mmap+register (~0.3 s/GB) and host RAM holds ONE file-backed copy
+        # that the OS can reclaim under pressure. Needs a COMPLETE v2 cache (per-tensor .bin + manifest),
+        # which the pinned path writes on its first boot -- so run once with the default store, then
+        # switch to mmap. nvfp4 is excluded: its resident per-expert scalars are not in the cache layout.
+        from sglang.srt.layers.moe.paged_experts.store import RegisteredExpertStore
+
+        _mp = get_global_server_args().model_path
+        v2dir = _store_v2_layer_dir(_store_cache_dir(_mp), layer_idx_early)
+        names = list(discover_paged_params(layer, method.num_resident))
+        global _MMAP_FALLBACK_LOGGED, _MMAP_STORE_LOGGED
+        if "w13_weight_scale" in names:
+            if not _MMAP_FALLBACK_LOGGED:
+                _MMAP_FALLBACK_LOGGED = True
+                logger.warning(
+                    "[paged-experts] --paged-experts-store mmap: nvfp4 unsupported (resident scalars) "
+                    "— using the pinned fill store"
+                )
+        elif os.environ.get("SGLANG_PAGED_EXPERTS_MMAP_REGISTER", "1") != "1":
+            if not _MMAP_FALLBACK_LOGGED:
+                _MMAP_FALLBACK_LOGGED = True
+                logger.warning(
+                    "[paged-experts] store=mmap: in-place registration disabled by "
+                    "SGLANG_PAGED_EXPERTS_MMAP_REGISTER=0 — using the pinned fill store"
+                )
+        elif not _v2_cache_complete(v2dir, names):
+            if not _MMAP_FALLBACK_LOGGED:
+                _MMAP_FALLBACK_LOGGED = True
+                logger.warning(
+                    "[paged-experts] store=mmap: no complete v2 cache yet — using the pinned fill store "
+                    "(it writes the cache; the next boot can mmap it)"
+                )
+        else:
+            try:
+                store = RegisteredExpertStore(
+                    layer, method.E, method.num_resident, dev, cache_layer_dir=v2dir
+                )
+                zero_copied = True
+                if not _MMAP_STORE_LOGGED:
+                    _MMAP_STORE_LOGGED = True
+                    logger.info(
+                        "[paged-experts] zero-copy store: mmap + cudaHostRegister(ReadOnly) from %s "
+                        "(no fill; read-only by contract)",
+                        os.path.dirname(v2dir),
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[paged-experts] zero-copy store failed for layer %d (%s) — falling back to the "
+                    "pinned fill store",
+                    layer_idx_early,
+                    e,
+                )
+                store = None
+    if store is not None:
+        pass
+    elif store_kind == "swap":
         # Single-copy store: ONE pinned staging buffer per paged tensor instead of a full [E, *] pinned
         # host copy, so the page-lock ceiling stops bounding the model. cold_backing="disk" spills the
         # full E-expert set to an mmap'd file and keeps RAM as a bounded LRU cache, which is what lets a
@@ -1255,22 +1346,12 @@ def setup_pager(method, layer) -> ExpertPager:
 
     layer_idx = getattr(layer, "layer_id", getattr(layer, "layer_idx", 0))
     model_path = get_global_server_args().model_path
-    try:
-        # One ExpertFill per quant format, selected by predicate (fills/). The registry keys on the
-        # store's paged params + the checkpoint quant_method (gptq vs awq register identical keys).
-        # A fill may return a resident full-E scalar table (nvfp4) to stash on the method.
-        quant_method = checkpoint_quant_method(model_path)
-        resident = select_fill(store, quant_method).fill(
-            store, model_path, layer_idx, dev
-        )
-        if resident is not None:
-            method._nvfp4_full_e = resident
-    except KeyError as e:
-        raise RuntimeError(
-            f"[paged-experts] checkpoint tensor {e} not found for layer {layer_idx}: the fill expects "
-            "per-expert {gate,up,down}_proj tensors; fused-expert checkpoint layouts (e.g. a packed "
-            "experts.gate_up_proj) are unsupported."
-        ) from e
+    if zero_copied:
+        # The mmap store IS the cache: its rows are the repacked bytes, already registered. Filling would
+        # write through a read-only-by-contract mapping and duplicate the RAM the mmap just avoided.
+        logger.debug("[paged-experts] L%d zero-copy store: fill skipped", layer_idx)
+    else:
+        _fill_and_cache_store(store, method, model_path, layer_idx, dev)
     logger.debug(
         "[paged-experts] L%d host store filled: E=%d, %d tensors %s",
         layer_idx,

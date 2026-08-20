@@ -4,9 +4,12 @@ store is cached (bf16/fp8 fills are already direct byte copies). Extracted verba
 """
 
 import functools
+import json
 import logging
 import os
 from typing import Optional
+
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +59,55 @@ def _store_cache_dir(model_path: str) -> Optional[str]:
         return None
     root = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
     return os.path.join(root, "paged_experts_cache", f"store-{h.hexdigest()[:16]}")
+
+
+def _store_v2_layer_dir(cache_dir: Optional[str], layer_idx: int) -> Optional[str]:
+    """Per-layer directory of the v2 RAW store cache (one page-aligned .bin per paged tensor +
+    manifest.json) — the mmap+register (zero-copy) store's format. v1 (safetensors) stays readable for
+    the copy path; v2 exists because safetensors tensor offsets are only 8-byte aligned, while the UVA
+    gather needs a 16-byte-aligned base — a per-tensor file's mmap base is page-aligned by construction."""
+    return os.path.join(cache_dir, "v2", f"layer_{layer_idx}") if cache_dir else None
+
+def _v2_cache_complete(layer_dir: Optional[str], names) -> bool:
+    if not layer_dir or not os.path.exists(os.path.join(layer_dir, "manifest.json")):
+        return False
+    return all(os.path.exists(os.path.join(layer_dir, f"{n}.bin")) for n in names)
+
+def _save_store_v2(store, cache_dir: Optional[str], layer_idx: int) -> None:
+    """Persist the filled host store as v2 raw per-tensor files (atomic per file), so the NEXT boot can
+    mmap+register it in place (--paged-experts-store mmap) instead of re-filling."""
+    layer_dir = _store_v2_layer_dir(cache_dir, layer_idx)
+    if not layer_dir:
+        return
+    try:
+        os.makedirs(layer_dir, exist_ok=True)
+        manifest = {}
+        for name, p in store.gpu.items():
+            host = store.host.get(name) if getattr(store, "host", None) is not None else None
+            if host is None:  # windowed store: reconstruct expert order via the fill accessors
+                host = torch.empty((store.E, *p.shape[1:]), dtype=p.dtype)
+                for e in range(store.E):
+                    host[e].copy_(store.row(name, e))
+            raw = host.contiguous().view(torch.uint8).numpy()  # byte reinterpretation (bf16/fp8-safe)
+            path = os.path.join(layer_dir, f"{name}.bin")
+            with open(path + ".tmp", "wb") as f:
+                f.write(raw.tobytes())
+            os.replace(path + ".tmp", path)
+            manifest[name] = {
+                "shape": list(host.shape),
+                "dtype": str(host.dtype),
+                "nbytes": host.numel() * host.element_size(),
+            }
+        mpath = os.path.join(layer_dir, "manifest.json")
+        with open(mpath + ".tmp", "w") as f:
+            json.dump(manifest, f)
+        os.replace(mpath + ".tmp", mpath)
+    except Exception as e:
+        logger.warning(
+            "[paged-experts] v2 store cache write failed for layer %d (%s) — boot unaffected",
+            layer_idx,
+            e,
+        )
 
 
 def _fill_store_from_cache(store, cache_dir: Optional[str], layer_idx: int) -> bool:

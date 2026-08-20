@@ -2566,7 +2566,7 @@ class ServerArgs:
             "store and pages with the fast transfer kernel. 'paged' uses a non-pinned store paged with a "
             "plain indexed copy — correct but slower; use it only when the pinned store would exceed the "
             "host's page-locked memory limit (e.g. an unquantized model on a small-RAM box).",
-            choices=["pinned", "paged", "swap"],
+            choices=["pinned", "paged", "swap", "mmap"],
         ),
     ] = "pinned"
     paged_experts_kv_reserve_gb: A[
