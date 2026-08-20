@@ -1218,16 +1218,40 @@ def setup_pager(method, layer) -> ExpertPager:
     from sglang.srt.server_args import get_global_server_args
 
     dev = next(layer.parameters()).device
-    store = make_expert_store(
-        layer,
-        method.E,
-        method.num_resident,
-        dev,
-        pin_host=getattr(method, "pin_host", True),
-        window_W=getattr(method, "window", 0),
-        cold_backing=getattr(method, "cold_backing", "ram"),
-        cold_dir=getattr(method, "cold_dir", None),
-    )
+    store_kind = getattr(method, "store_kind", "pinned")
+    if store_kind == "swap":
+        # Single-copy store: ONE pinned staging buffer per paged tensor instead of a full [E, *] pinned
+        # host copy, so the page-lock ceiling stops bounding the model. cold_backing="disk" spills the
+        # full E-expert set to an mmap'd file and keeps RAM as a bounded LRU cache, which is what lets a
+        # store larger than host RAM serve at all. Its RAM budget comes from SGLANG_PE_SWAP_RAM_GB /
+        # MemAvailable, NOT from --paged-experts-window (a full-pin-ceiling probe, meaningless here).
+        if getattr(method, "use_ondevice", False):
+            raise RuntimeError(
+                "--paged-experts-store swap needs the eager placement: the cold tier is not UVA-"
+                "gatherable inside a captured graph. Pass --cuda-graph-backend-decode disabled."
+            )
+        from sglang.srt.layers.moe.paged_experts.store import SwapExpertStore
+
+        store = SwapExpertStore(
+            layer,
+            method.E,
+            method.num_resident,
+            dev,
+            cold_backing=getattr(method, "cold_backing", "ram"),
+            cold_dir=getattr(method, "cold_dir", None),
+            ram_rows=0,
+        )
+    else:
+        store = make_expert_store(
+            layer,
+            method.E,
+            method.num_resident,
+            dev,
+            pin_host=getattr(method, "pin_host", True),
+            window_W=getattr(method, "window", 0),
+            cold_backing=getattr(method, "cold_backing", "ram"),
+            cold_dir=getattr(method, "cold_dir", None),
+        )
 
     layer_idx = getattr(layer, "layer_id", getattr(layer, "layer_idx", 0))
     model_path = get_global_server_args().model_path

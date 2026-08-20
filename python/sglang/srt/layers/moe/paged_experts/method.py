@@ -528,6 +528,7 @@ def _make_method_class():
             num_experts_E: int,
             num_resident_K: int,
             pin_host: bool = True,
+            store_kind: str = "pinned",
             use_ondevice: bool = False,
             eviction: str = "lru",
             window: Optional[int] = 0,
@@ -539,6 +540,7 @@ def _make_method_class():
             self.E = num_experts_E
             self.num_resident = num_resident_K
             self.pin_host = pin_host
+            self.store_kind = store_kind
             self.eviction = eviction
             # Pinned-window fallback: 0 = full pin (every expert page-locked); 0 < window < E pins only the
             # W hot experts and keeps the E-W cold tail pageable, for stores past the page-lock ceiling.
@@ -692,7 +694,8 @@ def make_for_layer(
         )
     else:
         K = int(num_resident)
-    pin_host = getattr(server_args, "paged_experts_store", "pinned") != "paged"
+    store_kind = getattr(server_args, "paged_experts_store", "pinned")
+    pin_host = store_kind != "paged"
     # Use the on-device (capturable) decode path unless CUDA graphs are disabled. With graphs off it's the
     # eager kernel-free path (host decide + transfer_kv); with graphs on the decode step is captured.
     use_ondevice = not bool(getattr(server_args, "disable_cuda_graph", False))
@@ -719,6 +722,7 @@ def make_for_layer(
         E,
         K,
         pin_host=bool(pin_host),
+        store_kind=store_kind,
         use_ondevice=use_ondevice,
         eviction=eviction,
         window=window,
