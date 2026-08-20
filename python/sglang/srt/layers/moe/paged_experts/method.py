@@ -588,14 +588,40 @@ def _make_method_class():
             if getattr(layer, "_num_local_routed", None) is not None:
                 layer._num_local_routed = self.num_resident
                 layer._num_global_routed = self.num_resident
-            self.base_method.create_weights(
-                layer=layer,
-                num_experts=self.num_resident,
-                hidden_size=hidden_size,
-                intermediate_size_per_partition=intermediate_size_per_partition,
-                params_dtype=params_dtype,
-                **extra,
-            )
+            # Base create_weights (and anything it constructs) may read layer.num_experts as well as
+            # the kwarg -- both must say K while the K-slot params are made.
+            saved_ne = getattr(layer, "num_experts", None)
+            if saved_ne is not None:
+                layer.num_experts = self.num_resident
+            try:
+                self.base_method.create_weights(
+                    layer=layer,
+                    num_experts=self.num_resident,
+                    hidden_size=hidden_size,
+                    intermediate_size_per_partition=intermediate_size_per_partition,
+                    params_dtype=params_dtype,
+                    **extra,
+                )
+            finally:
+                if saved_ne is not None:
+                    layer.num_experts = saved_ne
+            # Scale params of quantized MoE methods (nvfp4: weight_scale / weight_scale_2 / input_scale)
+            # carry loader attrs sized for the GLOBAL expert count; on a K-slot paged layer that makes the
+            # loading/PWAL machinery treat K-sized scales at E -- silently mis-laid-out scales, i.e.
+            # fluent-but-wrong output. Mark their granularity and drop the global-experts demand. Marlin
+            # param names ("*scales") do not match these suffixes, which is why marlin was immune.
+            # (Mirrors stream-nvfp4, where paged nvfp4 is validated.)
+            for _n, _p in list(layer.named_parameters(recurse=False)):
+                if "scale" not in _n or getattr(_p, "quant_method", None) is not None:
+                    continue
+                if _n.endswith("weight_scale"):  # block scale (not *_scale_2)
+                    _p.quant_method = "block"
+                elif _n.endswith(("weight_scale_2", "input_scale")):
+                    _p.quant_method = "tensor"
+                else:
+                    continue
+                if hasattr(_p, "_sglang_require_global_experts"):
+                    _p._sglang_require_global_experts = False
 
         def create_moe_runner(self, layer, moe_runner_config):
             from dataclasses import replace
