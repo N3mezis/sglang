@@ -210,21 +210,18 @@ def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
     w1_igs, w3_igs, w2_igs = w1_igs.to(device), w3_igs.to(device), w2_igs.to(device)
     w13_ws2 = 1.0 / w1_wgs  # per-expert weight_scale_2 [E]
     w2_ws2 = 1.0 / w2_wgs
-    w13_iq = torch.minimum(w1_igs, w3_igs)  # per-expert input_scale_quant (1/input_scale) [E]
-    # Upstream's NVFP4 fused-MoE (ModelOptNvFp4FusedMoEMethod, flashinfer_cutlass/trtllm) collapses the
-    # per-expert input scale to a PER-TENSOR max: input_scale = 1/iq, max_input_scale = 1/min(iq). The
-    # kernel quantizes activations with 1/max, so the alphas MUST use max_input_scale too — with a
-    # per-expert input scale the activation-quant and dequant scales disagree and every expert's output is
-    # mis-scaled by its own factor. That is fluent-but-wrong text whose flavour tracks which experts happen
-    # to be resident (it looks non-deterministic at temperature 0). g*_alphas stay per-expert
-    # (max_input_scale * per-expert weight_scale_2); *_input_scale_quant become 0-dim per-tensor scalars.
-    w13_is_max = (1.0 / w13_iq).max()
-    w2_is_max = (1.0 / w2_igs).max()
+    w13_iq = torch.minimum(w1_igs, w3_igs)  # per-expert input_scale_quant [E]
+    # Contract = CompressedTensorsW4A4Nvfp4MoE.process_weights_after_loading, CUTLASS branch: it keeps the
+    # input scale PER-EXPERT (`w13_input_global_scale.min(dim=1).values`) and derives per-expert alphas
+    # `(1/input_scale) * weight_scale_2`. The per-TENSOR max collapse (`.min()` over all experts, expanded)
+    # is the TRT-LLM branch ONLY — importing it here mis-scales every expert under the cutlass runner
+    # (tried; fluent-but-wrong output). The paged wrapper runs the base PWAL on the K-slot params before
+    # the fill overwrites them, so matching the cutlass branch of that PWAL exactly is the whole job.
     return {
-        "g1_alphas": (w13_is_max * w13_ws2).float(),
-        "g2_alphas": (w2_is_max * w2_ws2).float(),
-        "w13_input_scale_quant": (1.0 / w13_is_max).float().reshape(()),
-        "w2_input_scale_quant": (1.0 / w2_is_max).float().reshape(()),
+        "g1_alphas": ((1.0 / w13_iq) * w13_ws2).float(),
+        "g2_alphas": ((1.0 / w2_igs) * w2_ws2).float(),
+        "w13_input_scale_quant": w13_iq.float(),
+        "w2_input_scale_quant": w2_igs.float(),
     }
 
 
