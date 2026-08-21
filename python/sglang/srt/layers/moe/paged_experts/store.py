@@ -24,9 +24,8 @@ import math
 import mmap
 import os
 import tempfile
-from collections import OrderedDict
-
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from typing import Dict, Optional
 
 import torch
@@ -347,12 +346,12 @@ class ExpertStore(ABC):
         """Fill the whole host backing for ``name`` from a contiguous ``[E, *slot_shape]`` CPU tensor."""
         self.host[name].copy_(full)
 
-
     def gather_rows_into(self, name: str, ids, buf: torch.Tensor) -> None:
         """Copy rows ``ids`` of paged tensor ``name`` into ``buf[:len(ids)]``. Default: per-row copies via
         :meth:`row`. Stores with a faster bulk path (disk pread, mmap) override it."""
         for i, e in enumerate(ids):
             buf[i].copy_(self.row(name, int(e)))
+
 
 class PinnedExpertStore(ExpertStore):
     """Pinned (page-locked) host store, paged with sglang's existing ``transfer_kv_per_layer_mla`` block
@@ -443,7 +442,15 @@ class RegisteredExpertStore(PinnedExpertStore):
 
     pinned = True
 
-    def __init__(self, layer, num_experts_E: int, num_resident_K: int, device, *, cache_layer_dir: str):
+    def __init__(
+        self,
+        layer,
+        num_experts_E: int,
+        num_resident_K: int,
+        device,
+        *,
+        cache_layer_dir: str,
+    ):
         import ctypes
         import json
 
@@ -456,10 +463,14 @@ class RegisteredExpertStore(PinnedExpertStore):
         assert self.gpu, "no per-expert params found on layer"
         self.host: Dict[str, torch.Tensor] = {}
         self.item_bytes: Dict[str, int] = {}
-        self._regions: list = []  # (mmap, addr, reg_size) — keep-alive + unregister handles
+        self._regions: list = (
+            []
+        )  # (mmap, addr, reg_size) — keep-alive + unregister handles
         rt = _cudart_handle()
         if rt is None:
-            raise RuntimeError("[paged-experts] mmap store: CUDA runtime unavailable for cudaHostRegister")
+            raise RuntimeError(
+                "[paged-experts] mmap store: CUDA runtime unavailable for cudaHostRegister"
+            )
         manifest = json.load(open(os.path.join(cache_layer_dir, "manifest.json")))
         HOST_REGISTER_MAPPED, HOST_REGISTER_READONLY = 0x2, 0x8
         page = mmap.PAGESIZE
@@ -479,7 +490,9 @@ class RegisteredExpertStore(PinnedExpertStore):
                 path = os.path.join(cache_layer_dir, f"{name}.bin")
                 nbytes = int(ent["nbytes"])
                 if os.path.getsize(path) != nbytes:
-                    raise RuntimeError(f"[paged-experts] mmap store: torn cache file {path}")
+                    raise RuntimeError(
+                        f"[paged-experts] mmap store: torn cache file {path}"
+                    )
                 # MAP_SHARED writable (O_RDWR + ACCESS_WRITE): MAP_PRIVATE hangs cudaHostRegister on WSL2
                 # (register_mode_repro.py). Read-only by contract (below) — we never write these pages.
                 fd = os.open(path, os.O_RDWR)
@@ -488,7 +501,9 @@ class RegisteredExpertStore(PinnedExpertStore):
                 finally:
                     os.close(fd)
                 addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-                reg_size = ((nbytes + page - 1) // page) * page  # mmap maps whole pages; register them all
+                reg_size = (
+                    (nbytes + page - 1) // page
+                ) * page  # mmap maps whole pages; register them all
                 rc = rt.cudaHostRegister(
                     ctypes.c_void_p(addr),
                     ctypes.c_size_t(reg_size),
@@ -501,7 +516,9 @@ class RegisteredExpertStore(PinnedExpertStore):
                         f"{name!r} — register ceiling reached; fall back to --paged-experts-store pinned"
                     )
                 self._regions.append((mm, addr, reg_size))
-                t = torch.frombuffer(mm, dtype=p.dtype, count=self.E * p[0].numel()).view(shape)
+                t = torch.frombuffer(
+                    mm, dtype=p.dtype, count=self.E * p[0].numel()
+                ).view(shape)
                 self.host[name] = t
                 self.item_bytes[name] = p[0].numel() * p.element_size()
                 if self.item_bytes[name] % 8 != 0:
@@ -539,10 +556,15 @@ class RegisteredExpertStore(PinnedExpertStore):
 
     # The store is READ-ONLY by contract (see class docstring): the fill accessors must never run.
     def row(self, name: str, e: int) -> torch.Tensor:
-        raise RuntimeError("[paged-experts] mmap store is read-only (loaded from the repack cache)")
+        raise RuntimeError(
+            "[paged-experts] mmap store is read-only (loaded from the repack cache)"
+        )
 
     def fill_tensor(self, name: str, full: torch.Tensor) -> None:
-        raise RuntimeError("[paged-experts] mmap store is read-only (loaded from the repack cache)")
+        raise RuntimeError(
+            "[paged-experts] mmap store is read-only (loaded from the repack cache)"
+        )
+
 
 class WindowedExpertStore(ExpertStore):
     """Pinned hot window + pageable cold tail — the fallback for stores that can't be fully page-locked.
@@ -629,7 +651,8 @@ class WindowedExpertStore(ExpertStore):
         """True when every paged tensor's cold rows can be read O_DIRECT (fd available, block-aligned
         rows) — the page-in paths then bypass the page cache, and WILLNEED read-ahead would only pull
         pages nobody will fault. Must honor SGLANG_PAGED_EXPERTS_ODIRECT: with the env off, reads go
-        through the mmap even when fds exist, and suppressing WILLNEED then starves the fault path."""
+        through the mmap even when fds exist, and suppressing WILLNEED then starves the fault path.
+        """
         if not self._cold_fd:
             return False
         if os.environ.get("SGLANG_PAGED_EXPERTS_ODIRECT", "1") == "0":
@@ -918,7 +941,10 @@ class WindowedExpertStore(ExpertStore):
                 torch.cuda.current_stream().synchronize()
 
 
-_SWAP_DISK_LOGGED = False  # one-line boot log for the swap+disk cold tier (once across all layers)
+_SWAP_DISK_LOGGED = (
+    False  # one-line boot log for the swap+disk cold tier (once across all layers)
+)
+
 
 class SwapExpertStore(ExpertStore):
     """Single-copy SWAP store (``--paged-experts-store swap``; eager keep-warm path, ``--disable-cuda-graph``).
@@ -978,11 +1004,17 @@ class SwapExpertStore(ExpertStore):
         # serves models whose E-K non-resident set exceeds RAM. cold_backing="ram" keeps the pure
         # single-copy swap (host = E-K+B rows, no disk).
         self._disk = cold_backing == "disk"
-        self._cold: Dict[str, torch.Tensor] = {}  # [E, *slot] mmap'd disk backing (disk mode only)
+        self._cold: Dict[str, torch.Tensor] = (
+            {}
+        )  # [E, *slot] mmap'd disk backing (disk mode only)
         self._cold_mm: Dict[str, mmap.mmap] = {}
-        self._cold_fd: Dict[str, Optional[int]] = {}  # O_DIRECT fds (None = mmap copy only)
+        self._cold_fd: Dict[str, Optional[int]] = (
+            {}
+        )  # O_DIRECT fds (None = mmap copy only)
         if not self._disk:
-            self._rows = self.E - self.K + self._spare  # (E-K) host experts + B buffer rows
+            self._rows = (
+                self.E - self.K + self._spare
+            )  # (E-K) host experts + B buffer rows
             for name, p in self.gpu.items():
                 self.host[name] = _pinned_empty((self._rows, *p.shape[1:]), p.dtype)
             # initial layout: expert e in slot e for e<K; expert K+i in host row i.
@@ -1010,20 +1042,35 @@ class SwapExpertStore(ExpertStore):
                 logger.info(
                     "[paged-experts] SWAP + disk cold tier: RAM cache R=%d rows x %.1f MB (single-copy) "
                     "+ full %d-expert store mmap'd to disk (O_DIRECT=%s) — RAM footprint independent of E",
-                    R, row_mb, self.E, all(v is not None for v in self._cold_fd.values()),
+                    R,
+                    row_mb,
+                    self.E,
+                    all(v is not None for v in self._cold_fd.values()),
                 )
         # residency bookkeeping shared by both modes.
         self.slot_expert = list(range(self.K))  # slot -> expert
         self.expert_slot = {e: e for e in range(self.K)}  # pool-resident expert -> slot
-        self._row_release: Dict[int, "torch.cuda.Event"] = {}  # freed row -> event of its last promote-read
-        self._d2h_stream = None  # lazy copy-out stream (demotes overlap promotes on full-duplex PCIe)
+        self._row_release: Dict[int, "torch.cuda.Event"] = (
+            {}
+        )  # freed row -> event of its last promote-read
+        self._d2h_stream = (
+            None  # lazy copy-out stream (demotes overlap promotes on full-duplex PCIe)
+        )
 
     def _auto_ram_rows(self) -> int:
         """RAM cache capacity (rows) for the disk tier when not given explicitly. PER-LAYER budget:
         ``SGLANG_PE_SWAP_RAM_GB`` (per MoE layer) if set, else a conservative slice of MemAvailable. Sized
-        small forces disk spillover; sized >= E-K degenerates to the pure single-copy swap (no disk)."""
+        small forces disk spillover; sized >= E-K degenerates to the pure single-copy swap (no disk).
+        """
         row_bytes = max(1, sum(self.item_bytes.values()))
-        gb = os.environ.get("SGLANG_PE_SWAP_RAM_GB")
+        from sglang.srt.layers.moe.paged_experts import flags as _pe_flags
+
+        gb = _pe_flags.resolve(
+            arg_name="paged_experts_swap_ram_gb",
+            env_name="SGLANG_PE_SWAP_RAM_GB",
+            cast=float,
+            default=None,
+        )
         if gb:
             budget = float(gb) * 1e9
         else:
@@ -1061,12 +1108,15 @@ class SwapExpertStore(ExpertStore):
         s = self.expert_slot.get(e)
         if s is not None:
             return self.gpu[name].data[s]
-        return self.host[name][self.expert_row[e]]  # KeyError here is a real bug (invariant broken)
+        return self.host[name][
+            self.expert_row[e]
+        ]  # KeyError here is a real bug (invariant broken)
 
     def _read_cold_into(self, name: str, expert_ids, buf: torch.Tensor) -> None:
         """Read disk experts ``expert_ids`` (by logical id == disk row) into ``buf[0..n)`` — O_DIRECT
         (page-cache bypass, thread-pool queue depth) when the row is 4 KB-aligned and the fd is available,
-        else a plain mmap copy loop. ``buf`` rows must be exactly ``item_bytes[name]`` (a staging buffer)."""
+        else a plain mmap copy loop. ``buf`` rows must be exactly ``item_bytes[name]`` (a staging buffer).
+        """
         fd = self._cold_fd.get(name)
         nbytes = self.item_bytes[name]
         direct = (
@@ -1093,7 +1143,9 @@ class SwapExpertStore(ExpertStore):
                 raise OSError("short read")
             except OSError as ex:
                 logger.warning(
-                    "[paged-experts] swap O_DIRECT cold read failed for %s (%s) — mmap fallback", name, ex
+                    "[paged-experts] swap O_DIRECT cold read failed for %s (%s) — mmap fallback",
+                    name,
+                    ex,
                 )
                 self._cold_fd[name] = None
         cold = self._cold[name]
@@ -1104,7 +1156,8 @@ class SwapExpertStore(ExpertStore):
         """Guarantee at least one free RAM row: if none, evict the least-recently-used cache expert (oldest
         in the ``expert_row`` OrderedDict) to disk-only, reclaiming its row. Never evicts an expert in
         ``protect`` (the ones being promoted this batch — their RAM/disk source is already classified). The
-        evicted expert's data lives on disk (immutable), so eviction is a pure drop — no writeback."""
+        evicted expert's data lives on disk (immutable), so eviction is a pure drop — no writeback.
+        """
         if self.free_rows:
             return
         for e in list(self.expert_row):
@@ -1119,7 +1172,8 @@ class SwapExpertStore(ExpertStore):
     def _restore_buffer(self) -> None:
         """After a disk batch (whose disk-miss demotes grow the cache into the buffer rows), evict the LRU
         tail until >= ``_spare`` rows are free again — restoring the invariant the all-RAM-hit pipeline
-        path relies on (it pops a buffer row per swap) and capping the cache at R = _rows - _spare."""
+        path relies on (it pops a buffer row per swap) and capping the cache at R = _rows - _spare.
+        """
         while len(self.free_rows) < self._spare and self.expert_row:
             _e, _r = self.expert_row.popitem(last=False)  # LRU oldest -> disk-only
             self.free_rows.append(_r)
@@ -1128,21 +1182,31 @@ class SwapExpertStore(ExpertStore):
         """Disk-tier page-in (serial, current stream). Each swap: demote the victim A into a RAM cache row
         (D2H, pure caching — A is on disk), promote B from its RAM row (hit) or from a staged O_DIRECT disk
         read (miss); a member already resident in another slot is a slot<->slot D2D swap through a spare
-        row. The whole step's disk-miss set is read up front (thread-pool queue depth)."""
+        row. The whole step's disk-miss set is read up front (thread-pool queue depth).
+        """
         se = self.slot_expert
         dev = self.device
-        pairs = [(int(B), int(s)) for B, s in zip(promote, slots) if se[int(s)] != int(B)]
+        pairs = [
+            (int(B), int(s)) for B, s in zip(promote, slots) if se[int(s)] != int(B)
+        ]
         if not pairs:
             return
         promote_set = {B for B, _ in pairs}
         # PHASE 1 (disk, high QD): stage every disk-miss expert (not in RAM, not resident) into pinned bufs.
-        disk_ids = [B for B, _ in pairs if B not in self.expert_row and B not in self.expert_slot]
+        disk_ids = [
+            B
+            for B, _ in pairs
+            if B not in self.expert_row and B not in self.expert_slot
+        ]
         staged = {}
         if disk_ids:
             pos = {e: i for i, e in enumerate(disk_ids)}
             for name in names:
                 buf = _stage_pin_buf(
-                    f"swapdisk#{name}", len(disk_ids), self.gpu[name].shape[1:], self.gpu[name].dtype
+                    f"swapdisk#{name}",
+                    len(disk_ids),
+                    self.gpu[name].shape[1:],
+                    self.gpu[name].dtype,
                 )
                 self._read_cold_into(name, disk_ids, buf)
                 staged[name] = buf
@@ -1154,7 +1218,9 @@ class SwapExpertStore(ExpertStore):
                 # slot<->slot: B already resident in slot sB -> D2D swap A<->B through a spare RAM row.
                 sB = self.expert_slot[B]
                 self._ensure_free(promote_set)
-                r = self.free_rows[0]  # borrowed scratch (not consumed; invariant keeps >=1 free)
+                r = self.free_rows[
+                    0
+                ]  # borrowed scratch (not consumed; invariant keeps >=1 free)
                 for name in names:
                     g, h = self.gpu[name].data, self.host[name]
                     h[r].copy_(g[s], non_blocking=True)  # A: slot s -> spare (D2H)
@@ -1169,16 +1235,22 @@ class SwapExpertStore(ExpertStore):
             self._ensure_free(promote_set)
             r = self.free_rows.pop(0)
             for name in names:
-                self.host[name][r].copy_(self.gpu[name].data[s], non_blocking=True)  # demote A (D2H)
+                self.host[name][r].copy_(
+                    self.gpu[name].data[s], non_blocking=True
+                )  # demote A (D2H)
             if B in self.expert_row:
                 rB = self.expert_row.pop(B)
                 for name in names:
-                    self.gpu[name].data[s].copy_(self.host[name][rB], non_blocking=True)  # promote B (H2D)
+                    self.gpu[name].data[s].copy_(
+                        self.host[name][rB], non_blocking=True
+                    )  # promote B (H2D)
                 self.free_rows.append(rB)  # B's freed row replenishes the buffer
             else:
                 i = pos[B]
                 for name in names:
-                    self.gpu[name].data[s].copy_(staged[name][i], non_blocking=True)  # promote B (disk->H2D)
+                    self.gpu[name].data[s].copy_(
+                        staged[name][i], non_blocking=True
+                    )  # promote B (disk->H2D)
             del self.expert_slot[A]
             self.expert_row[A] = r  # A cached in RAM (most-recent in the LRU)
             se[s] = B
@@ -1204,7 +1276,8 @@ class SwapExpertStore(ExpertStore):
 
     def cold_direct_all(self) -> bool:
         """Same semantics as the windowed store: True when page-ins bypass the page cache (O_DIRECT
-        usable for every tensor AND not disabled via env) — WILLNEED hints are useless then."""
+        usable for every tensor AND not disabled via env) — WILLNEED hints are useless then.
+        """
         if not self._disk or not self._cold_fd:
             return False
         if os.environ.get("SGLANG_PAGED_EXPERTS_ODIRECT", "1") == "0":
@@ -1218,7 +1291,8 @@ class SwapExpertStore(ExpertStore):
         """MADV_WILLNEED read-ahead for the disk rows of ``experts`` (row index == expert id in this
         store's full-E backing). Skips experts already in the RAM cache or resident in a GPU slot —
         their bytes won't be read from disk. No-op when page-ins bypass the page cache (O_DIRECT),
-        unless the caller reads via the mmap anyway (force=True). Best-effort, never fatal."""
+        unless the caller reads via the mmap anyway (force=True). Best-effort, never fatal.
+        """
         if not self._cold_mm or (self.cold_direct_all() and not force):
             return
         page = mmap.PAGESIZE
@@ -1264,11 +1338,7 @@ class SwapExpertStore(ExpertStore):
         src_host: Optional[list] = None,
         dst_host: Optional[list] = None,
     ) -> None:
-        n = (
-            src_experts.numel()
-            if hasattr(src_experts, "numel")
-            else len(src_experts)
-        )
+        n = src_experts.numel() if hasattr(src_experts, "numel") else len(src_experts)
         if n == 0:
             return
         promote = (
@@ -1277,7 +1347,9 @@ class SwapExpertStore(ExpertStore):
             else src_experts.detach().cpu().tolist()
         )
         slots = (
-            list(dst_host) if dst_host is not None else dst_slots.detach().cpu().tolist()
+            list(dst_host)
+            if dst_host is not None
+            else dst_slots.detach().cpu().tolist()
         )
         names = list(self.gpu)
         se = self.slot_expert
@@ -1304,27 +1376,41 @@ class SwapExpertStore(ExpertStore):
                 if A == B:
                     continue
                 rB = self.expert_row.pop(B)
-                r = self.free_rows.pop(0)  # FIFO: the oldest freed row (its promote-reader is furthest done)
+                r = self.free_rows.pop(
+                    0
+                )  # FIFO: the oldest freed row (its promote-reader is furthest done)
                 rel = self._row_release.pop(r, None)
                 with torch.cuda.stream(d2h):
                     if rel is not None:
-                        d2h.wait_event(rel)  # don't overwrite r until its last promote finished reading it
+                        d2h.wait_event(
+                            rel
+                        )  # don't overwrite r until its last promote finished reading it
                     for name in names:
-                        self.host[name][r].copy_(self.gpu[name].data[s], non_blocking=True)  # demote A (D2H)
+                        self.host[name][r].copy_(
+                            self.gpu[name].data[s], non_blocking=True
+                        )  # demote A (D2H)
                     dev_ev = torch.cuda.Event()
                     dev_ev.record(d2h)
-                cur.wait_event(dev_ev)  # WAR on slot s: promote overwrites only after A's demote read it
+                cur.wait_event(
+                    dev_ev
+                )  # WAR on slot s: promote overwrites only after A's demote read it
                 for name in names:
-                    self.gpu[name].data[s].copy_(self.host[name][rB], non_blocking=True)  # promote B (H2D)
+                    self.gpu[name].data[s].copy_(
+                        self.host[name][rB], non_blocking=True
+                    )  # promote B (H2D)
                 rel_ev = torch.cuda.Event()
-                rel_ev.record(cur)  # promote read h[rB]; rB is safe to overwrite only after this
+                rel_ev.record(
+                    cur
+                )  # promote read h[rB]; rB is safe to overwrite only after this
                 self.expert_row[A] = r
                 del self.expert_slot[A]
                 se[s] = B
                 self.expert_slot[B] = s
                 self.free_rows.append(rB)
                 self._row_release[rB] = rel_ev
-            cur.wait_stream(d2h)  # fold the copy-out stream back before the GEMM reads the slots
+            cur.wait_stream(
+                d2h
+            )  # fold the copy-out stream back before the GEMM reads the slots
             cur.synchronize()
             return
         # serial fallback (wave path): handles slot<->slot swaps; everything on the current stream.
@@ -1348,7 +1434,9 @@ class SwapExpertStore(ExpertStore):
                 self.free_rows.append(rB)
             else:
                 sB = self.expert_slot[B]
-                r = self.free_rows[0]  # borrowed, not consumed (invariant keeps >=1 free)
+                r = self.free_rows[
+                    0
+                ]  # borrowed, not consumed (invariant keeps >=1 free)
                 for name in names:
                     g = self.gpu[name].data
                     h = self.host[name]
@@ -1366,7 +1454,8 @@ class SwapExpertStore(ExpertStore):
     def finalize_fill(self) -> None:
         """Disk mode, after the checkpoint fill: per-row writes went to the cold mmap (row() is cold-first
         there), so copy the seeded experts' rows cold -> GPU slots now, and start with an EMPTY RAM cache
-        (its fill_tensor-time mirror never received the per-row tensors and would serve stale rows)."""
+        (its fill_tensor-time mirror never received the per-row tensors and would serve stale rows).
+        """
         if not self._disk:
             return
         for name, p in self.gpu.items():

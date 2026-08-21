@@ -75,10 +75,18 @@ _NONEXPERT_RUNTIME_RESERVE = 0.5e9
 # (heavier graphs -> bigger pool; DSA/indexer models capture a lot, hence the conservative base). It never
 # pushes past _MAX_MEM_FRACTION_CEIL (always >=1-ceil left for capture) and never drops below the served
 # fraction (max is >= auto). This is a K/capture split, not the old free-minus-tiny-reserve edge-gamble.
-_MAX_CAPTURE_BASE = 2.5e9  # capture/activation slack floor (covers a single captured decode graph)
-_MAX_CAPTURE_PER_GRAPH = 0.5e9  # extra slack per captured decode-graph batch (cuda_graph_max_bs_decode)
-_MAX_MEM_FRACTION_CEIL = 0.96  # hardest 'max' pushes weights; the remaining >=4% stays as capture slack
-_AGGRESSIVE_WORKSPACE_SLACK = 0.2e9  # real loader/quant workspace kept on top of the EXACT non-expert bytes
+_MAX_CAPTURE_BASE = (
+    2.5e9  # capture/activation slack floor (covers a single captured decode graph)
+)
+_MAX_CAPTURE_PER_GRAPH = (
+    0.5e9  # extra slack per captured decode-graph batch (cuda_graph_max_bs_decode)
+)
+_MAX_MEM_FRACTION_CEIL = (
+    0.96  # hardest 'max' pushes weights; the remaining >=4% stays as capture slack
+)
+_AGGRESSIVE_WORKSPACE_SLACK = (
+    0.2e9  # real loader/quant workspace kept on top of the EXACT non-expert bytes
+)
 # Small slop on the MEASURED per-expert checkpoint size (below). The supported repacks are size-
 # preserving — marlin re-lays-out 4-bit weights (same bytes) and keeps e8m0 scales; bf16/fp8 fills are
 # direct copies — so the measured on-disk size IS the resident size (verified: DSV4 marlin resident
@@ -145,7 +153,8 @@ def _routed_expert_bytes_from_checkpoint(model_path: str) -> Optional[int]:
     resident) and MTP/nextn draft layers are skipped. Divided by ``num_experts * moe_layers`` this yields
     the per-expert-per-layer size WITHOUT trusting the ``quant_method`` label — the fix for checkpoints
     whose declared quant differs from the routed-expert dtype (e.g. DSV4: quant_method=fp8, experts
-    mxfp4). Returns ``None`` when the checkpoint isn't a locally readable safetensors layout."""
+    mxfp4). Returns ``None`` when the checkpoint isn't a locally readable safetensors layout.
+    """
     import glob
     import json
     import struct
@@ -183,7 +192,9 @@ def _routed_expert_bytes_from_checkpoint(model_path: str) -> Optional[int]:
             for name, entry in header.items():
                 if name == "__metadata__" or ".experts." not in name:
                     continue
-                if "mtp" in name or "nextn" in name:  # skip MTP / nextn draft expert layers
+                if (
+                    "mtp" in name or "nextn" in name
+                ):  # skip MTP / nextn draft expert layers
                     continue
                 begin, end = entry["data_offsets"]
                 total += end - begin
@@ -282,10 +293,15 @@ def _moe_geometry():
             # paging). Use the real fp4 width, unless SGLANG_DSV4_FP4_DEQUANT upconverts them to fp8.
             from sglang.srt.environ import envs
 
-            if getattr(mc, "is_fp4_experts", False) and not envs.SGLANG_DSV4_FP4_DEQUANT.get():
+            if (
+                getattr(mc, "is_fp4_experts", False)
+                and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
+            ):
                 bits = 4.25
             else:
-                bits = 8  # true fp8 block-quant (or fp4 dequantized to fp8); no "bits" key
+                bits = (
+                    8  # true fp8 block-quant (or fp4 dequantized to fp8); no "bits" key
+                )
 
         elif qm == "compressed-tensors" and "nvfp4" in fmt:
             # 4-bit packed weights + one fp8 block scale per 16 weights (8/16 = 0.5 bit-equiv);
@@ -299,7 +315,9 @@ def _moe_geometry():
             # int pack-quantized (the Hub's "AWQ-4bit"/"w4a16"): num_bits packed weights + one
             # fp16 group scale per group_size weights (16/group bit-equiv). group_size -1 (channel)
             # => scale overhead negligible.
-            w = next(iter((qc.get("config_groups") or {}).values()), {}).get("weights", {})
+            w = next(iter((qc.get("config_groups") or {}).values()), {}).get(
+                "weights", {}
+            )
             nb = w.get("num_bits", 4)
             gs = w.get("group_size") or -1
             bits = nb + (16.0 / gs if gs and gs > 0 else 0.0)
@@ -324,7 +342,9 @@ def _moe_geometry():
         or getattr(htc, "num_experts", None)
         or getattr(htc, "num_local_experts", None)
     )
-    routed_bytes = _routed_expert_bytes_from_checkpoint(getattr(mc, "model_path", "") or "")
+    routed_bytes = _routed_expert_bytes_from_checkpoint(
+        getattr(mc, "model_path", "") or ""
+    )
     if routed_bytes and num_experts and moe_layers:
         per_el = (routed_bytes / (num_experts * moe_layers)) * _MEASURED_EXPERT_MARGIN
     else:
@@ -406,7 +426,9 @@ def resolve_num_resident_experts(
         )
         max_slack = _MAX_CAPTURE_BASE + _MAX_CAPTURE_PER_GRAPH * graph_bs
         raised = min(_MAX_MEM_FRACTION_CEIL, 1.0 - max_slack / max(free, 1.0))
-        mem_frac = max(mem_frac, raised)  # >= served fraction: max is never less aggressive than auto
+        mem_frac = max(
+            mem_frac, raised
+        )  # >= served fraction: max is never less aggressive than auto
         # The KV configurator reads mem_fraction_static LIVE (weight ceiling = fraction*pre_free, capture
         # slack = pre_free*(1-fraction)); raise it so the larger weight budget is permitted and the slack
         # is exactly our capture reserve.
@@ -727,7 +749,9 @@ def make_for_layer(
     # --disable-cuda-graph is deprecated upstream; the live switch is --cuda-graph-backend-decode.
     # Honour BOTH, or a deployment that turns decode graphs off the modern way still gets the captured
     # on-device placement (wrong, and fatal for stores whose cold tier is not UVA-gatherable).
-    _cg_decode = str(getattr(server_args, "cuda_graph_backend_decode", "") or "").lower()
+    _cg_decode = str(
+        getattr(server_args, "cuda_graph_backend_decode", "") or ""
+    ).lower()
     use_ondevice = (
         not bool(getattr(server_args, "disable_cuda_graph", False))
         and _cg_decode != "disabled"

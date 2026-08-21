@@ -156,7 +156,9 @@ def check_paged_experts_quant(hf_text_config: Any) -> None:
             w = g.get("weights", {}) or {}
             act = g.get("input_activations") or {}
             strat = (w.get("strategy") or "").lower()
-            if (w.get("num_bits") or 8) != 8 or (w.get("type") or "float").lower() != "float":
+            if (w.get("num_bits") or 8) != 8 or (
+                w.get("type") or "float"
+            ).lower() != "float":
                 raise RuntimeError(
                     f"Paged Experts supports compressed-tensors float-quantized only as 8-bit fp8; "
                     f"this checkpoint uses num_bits={w.get('num_bits')!r} type={w.get('type')!r}."

@@ -101,7 +101,9 @@ def _fill_gptq_marlin_from_checkpoint(
             w13_gi.append(g_gate)
             w2_gi.append(get(f"{p}{down}.g_idx"))
     _shard_stack.close()  # release shard handles before the (GPU) repack
-    for _sh in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
+    for (
+        _sh
+    ) in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
         _drop_file_cache(os.path.join(snap, _sh))
     w13_qw, w2_qw = torch.stack(w13_qw).to(dev), torch.stack(w2_qw).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
@@ -225,7 +227,9 @@ def _fill_ct_wna16_from_checkpoint(
         )
         w2_s.append(_t(get(f"{p}{down}.weight_scale")))
     _shard_stack.close()  # release shard handles before the (GPU) repack
-    for _sh in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
+    for (
+        _sh
+    ) in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
         _drop_file_cache(os.path.join(snap, _sh))
     w13_pk, w2_pk = torch.stack(w13_pk).to(dev), torch.stack(w2_pk).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
@@ -314,7 +318,9 @@ def _fill_awq_marlin_from_checkpoint(
         )
         w2_qz.append(get(f"{p}{down}.qzeros"))
     _shard_stack.close()  # release shard handles before the (GPU) repack
-    for _sh in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
+    for (
+        _sh
+    ) in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
         _drop_file_cache(os.path.join(snap, _sh))
     w13_qw, w2_qw = torch.stack(w13_qw).to(dev), torch.stack(w2_qw).to(dev)
     w13_s, w2_s = torch.stack(w13_s).to(dev), torch.stack(w2_s).to(dev)
@@ -414,7 +420,9 @@ def _fill_moe_wna16_from_checkpoint(
             get(f"{p}{down}.scales").t().contiguous().to(sdt)
         )
     _shard_stack.close()
-    for _sh in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
+    for (
+        _sh
+    ) in open_shards:  # drop each consumed shard's page cache (bound peak load RAM)
         _drop_file_cache(os.path.join(snap, _sh))
 
 

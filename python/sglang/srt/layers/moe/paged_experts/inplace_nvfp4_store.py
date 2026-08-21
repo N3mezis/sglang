@@ -42,7 +42,22 @@ _READ_POOL = ThreadPoolExecutor(
     max_workers=int(os.environ.get("SGLANG_INPLACE_READ_WORKERS", "32")),
     thread_name_prefix="inplace-nvfp4-read",
 )
-_PIN_BUDGET = int(float(os.environ.get("SGLANG_INPLACE_PIN_GB", "20")) * 1e9)
+
+
+def _pin_budget() -> int:
+    from sglang.srt.layers.moe.paged_experts import flags as _pe_flags
+
+    return int(
+        _pe_flags.resolve(
+            arg_name="paged_experts_pin_gb",
+            env_name="SGLANG_INPLACE_PIN_GB",
+            cast=float,
+            default=20.0,
+        )
+        * 1e9
+    )
+
+
 # O_DIRECT: DMA weight reads straight past the page cache. The buffered path caps ~2.7 GB/s under RAM
 # pressure (page-cache reclaim + a per-read memcpy) while O_DIRECT hit 6.2 GB/s in testing AND stops the
 # 427 GB expert stream from thrashing the page cache. Off -> plain buffered pread. Needs 4 KB alignment.
@@ -95,10 +110,13 @@ def _stage_flush(tag):
     bb = _STAGE_NS.get("model_backbone", 0)
     tot = bb + _STAGE_NS.get("sampling", 0) or sum(_STAGE_NS.values()) or 1
     msg = "  ".join(
-        f"{k}={v/1e6:.0f}ms/{100*v/tot:.0f}%" for k, v in sorted(_STAGE_NS.items(), key=lambda x: -x[1])
+        f"{k}={v/1e6:.0f}ms/{100*v/tot:.0f}%"
+        for k, v in sorted(_STAGE_NS.items(), key=lambda x: -x[1])
     )
     logging.getLogger(__name__).info("[PE-TIMING] %s | %s", tag, msg)
     _STAGE_NS.clear()
+
+
 # Windowed variant (CUDA-graph-capturable decode): keep a fixed pinned [W,*slot] hot window per layer
 # (stable UVA base -> in-graph gather) + in-place checkpoint cold reads. W experts/layer resident hot.
 _WINDOWED = os.environ.get("SGLANG_INPLACE_WINDOWED", "0") != "0"
@@ -138,7 +156,9 @@ def _cpu_swizzle_blockscale(scale: torch.Tensor) -> torch.Tensor:
     B, M, K = scale.shape
     ru = lambda x, m: (x + m - 1) // m * m
     Mp, Kp = ru(M, 128), ru(K, 4)
-    su = scale.contiguous().view(torch.uint8)  # fp8 -> uint8 (same bytes); uint8 CPU ops are fast
+    su = scale.contiguous().view(
+        torch.uint8
+    )  # fp8 -> uint8 (same bytes); uint8 CPU ops are fast
     padded = torch.zeros((B, Mp, Kp), dtype=torch.uint8)
     padded[:B, :M, :K] = su
     padded = padded.reshape(B, Mp // 128, 4, 32, Kp // 4, 4)
@@ -185,7 +205,8 @@ def _pread_into(fd: int, offset: int, mv: memoryview):
 def _pread_into_direct(path: str, offset: int, mv: memoryview):
     """O_DIRECT read of ``len(mv)`` bytes at ``offset`` into ``mv``. safetensors offsets/sizes are not
     4 KB aligned, so read the aligned superset into a page-aligned bounce buffer, then copy out the exact
-    window (an aligned memcpy ~10 GB/s — the win is the DMA disk read, not touching the page cache)."""
+    window (an aligned memcpy ~10 GB/s — the win is the DMA disk read, not touching the page cache).
+    """
     n = len(mv)
     astart = offset & ~(_ALIGN - 1)
     aend = (offset + n + _ALIGN - 1) & ~(_ALIGN - 1)
@@ -219,14 +240,18 @@ class _SlabPool:
         # ~33GB across ~4.5k mappings), and page-locks ~12GB below raw cudaHostAlloc (see _pinned_empty).
         # One raw block fixes all three: exact size, a single mapping, private anon, the higher ceiling.
         self._block = _pinned_empty((self.n, slab_bytes), torch.uint8)
-        self.slabs = [self._block[i] for i in range(self.n)]  # row views; each is contiguous + pinned
+        self.slabs = [
+            self._block[i] for i in range(self.n)
+        ]  # row views; each is contiguous + pinned
         self.mv = [memoryview(s.numpy()) for s in self.slabs]
         self.free = list(range(self.n))
         self.lru: "OrderedDict" = OrderedDict()  # key -> slab_idx (most-recent last)
         self.lock = threading.Lock()
         self.hits = 0
         self.misses = 0
-        self.inflight = {}  # slot_idx -> list[Future]: a slot with a pending fill is not evictable (its
+        self.inflight = (
+            {}
+        )  # slot_idx -> list[Future]: a slot with a pending fill is not evictable (its
         # async write would corrupt whoever reused it) and page_in must wait on it. Keyed by SLOT, not
         # (layer,expert), so a prefetched slot that gets evicted/reused can never be mistaken for still-valid.
 
@@ -258,16 +283,24 @@ class _SlabPool:
                         victim = kk
                         break
                 if victim is None:
-                    victim = next(iter(self.lru))  # every slot mid-fill (shouldn't happen): take the oldest
+                    victim = next(
+                        iter(self.lru)
+                    )  # every slot mid-fill (shouldn't happen): take the oldest
                 idx = self.lru.pop(victim)
-            self.inflight.pop(idx, None)  # slot reused -> drop any (completed) stale fill record
+            self.inflight.pop(
+                idx, None
+            )  # slot reused -> drop any (completed) stale fill record
             self.lru[key] = idx
             if _PE_TIMING and (self.hits + self.misses) % 4800 == 0:
                 import logging
 
                 tot = self.hits + self.misses
                 logging.getLogger(__name__).info(
-                    "[PE-SLAB] n=%d hit=%.1f%% (%d/%d)", self.n, 100 * self.hits / tot, self.hits, tot
+                    "[PE-SLAB] n=%d hit=%.1f%% (%d/%d)",
+                    self.n,
+                    100 * self.hits / tot,
+                    self.hits,
+                    tot,
                 )
             return idx, True
 
@@ -295,7 +328,8 @@ _MEMCENSUS_DONE = False
 def _mem_census(tag: str) -> None:
     """One-shot diagnostic (SGLANG_PE_MEMCENSUS=1): census the process's live CPU-side torch tensors to
     identify what is holding host RAM (the ~27GB load-resident anon). Dedups by storage data_ptr so views
-    don't double-count. Writes to the HF-cache mount so the host can read it. Runs once, best-effort."""
+    don't double-count. Writes to the HF-cache mount so the host can read it. Runs once, best-effort.
+    """
     global _MEMCENSUS_DONE
     if _MEMCENSUS_DONE or os.environ.get("SGLANG_PE_MEMCENSUS", "0") == "0":
         return
@@ -307,13 +341,22 @@ def _mem_census(tag: str) -> None:
         rss = {}
         try:
             for ln in open("/proc/self/status"):
-                if ln.split(":")[0] in ("VmRSS", "RssAnon", "RssShmem", "RssFile", "VmSwap", "VmData"):
+                if ln.split(":")[0] in (
+                    "VmRSS",
+                    "RssAnon",
+                    "RssShmem",
+                    "RssFile",
+                    "VmSwap",
+                    "VmData",
+                ):
                     rss[ln.split(":")[0]] = int(ln.split()[1]) / 1048576.0  # GB
         except Exception:
             pass
 
         seen = set()
-        by_kind = collections.defaultdict(lambda: [0, 0])  # (dtype,ndim,pinned) -> [count, bytes]
+        by_kind = collections.defaultdict(
+            lambda: [0, 0]
+        )  # (dtype,ndim,pinned) -> [count, bytes]
         tops = []
         total = 0
         n_tensors = 0
@@ -330,7 +373,11 @@ def _mem_census(tag: str) -> None:
                 if ptr in seen:
                     continue
                 seen.add(ptr)
-                nb = st.nbytes() if hasattr(st, "nbytes") else st.size() * obj.element_size()
+                nb = (
+                    st.nbytes()
+                    if hasattr(st, "nbytes")
+                    else st.size() * obj.element_size()
+                )
                 total += nb
                 try:
                     pinned = obj.is_pinned()
@@ -347,8 +394,16 @@ def _mem_census(tag: str) -> None:
             try:
                 if not isinstance(obj, torch.Tensor) or obj.device.type != "cpu":
                     continue
-                st = obj.untyped_storage() if hasattr(obj, "untyped_storage") else obj.storage()
-                nb = st.nbytes() if hasattr(st, "nbytes") else st.size() * obj.element_size()
+                st = (
+                    obj.untyped_storage()
+                    if hasattr(obj, "untyped_storage")
+                    else obj.storage()
+                )
+                nb = (
+                    st.nbytes()
+                    if hasattr(st, "nbytes")
+                    else st.size() * obj.element_size()
+                )
                 if nb > 400_000_000:  # >0.4 GB
                     big.append((nb, obj))
             except Exception:
@@ -379,15 +434,19 @@ def _mem_census(tag: str) -> None:
                         break
             except Exception as ee:
                 desc = ["<err %r>" % ee]
-            owner_lines.append("  %6.2f GB %-18s held-by: %s"
-                               % (nb / 1e9, tuple(t.shape), " | ".join(desc[:3]) or "<none>"))
+            owner_lines.append(
+                "  %6.2f GB %-18s held-by: %s"
+                % (nb / 1e9, tuple(t.shape), " | ".join(desc[:3]) or "<none>")
+            )
         del big
 
         tops.sort(reverse=True)
         lines = ["=== PE MEM CENSUS (%s) ===" % tag]
         lines.append("RSS: " + "  ".join("%s=%.2fG" % (k, v) for k, v in rss.items()))
-        lines.append("live CPU torch tensors: n=%d unique-storages=%d total=%.2f GB"
-                     % (n_tensors, len(seen), total / 1e9))
+        lines.append(
+            "live CPU torch tensors: n=%d unique-storages=%d total=%.2f GB"
+            % (n_tensors, len(seen), total / 1e9)
+        )
         lines.append("--- by (dtype, ndim, pinned): count, GB ---")
         for k, (c, b) in sorted(by_kind.items(), key=lambda x: -x[1][1])[:15]:
             lines.append("  %-40s n=%-5d %.2f GB" % (str(k), c, b / 1e9))
@@ -401,8 +460,11 @@ def _mem_census(tag: str) -> None:
             f.write("\n".join(lines) + "\n")
         import logging
 
-        logging.getLogger(__name__).info("[paged-experts] mem census written to %s (CPU tensors=%.1f GB)",
-                                         out, total / 1e9)
+        logging.getLogger(__name__).info(
+            "[paged-experts] mem census written to %s (CPU tensors=%.1f GB)",
+            out,
+            total / 1e9,
+        )
     except Exception as e:
         import logging
 
@@ -413,24 +475,33 @@ def _get_pool(slab_bytes: int) -> "_SlabPool":
     """Lazily create the global pinned slab pool on FIRST page-in (inference), not at store __init__
     (which runs in process_weights_after_loading, during the load window). Deferring keeps the multi-GB
     pin off the load-time RAM peak — the load completes on the loader footprint, then the pin allocates
-    when host RAM is free — so the cache can be sized near the RAM ceiling without load-time thrash."""
+    when host RAM is free — so the cache can be sized near the RAM ceiling without load-time thrash.
+    """
     global _POOL, _LOGGED
     if _POOL is None:
         with _POOL_LOCK:
             if _POOL is None:
                 _mem_census("pre-slab-alloc (first page-in)")
-                pool = _SlabPool(slab_bytes, _PIN_BUDGET)
+                pool = _SlabPool(slab_bytes, _pin_budget())
                 if not _LOGGED:
                     _LOGGED = True
                     import logging
 
-                    layers = max(1, _N_STORES)  # actual MoE-layer count, not the old hardcoded 75
+                    layers = max(
+                        1, _N_STORES
+                    )  # actual MoE-layer count, not the old hardcoded 75
                     logging.getLogger(__name__).info(
                         "[paged-experts] in-place NVFP4 slab cache (lazy, post-load): %d slabs x %.1f MB "
                         "= %.1f GB pinned (~%d experts/layer over %d MoE layers)",
-                        pool.n, slab_bytes / 1e6, pool.n * slab_bytes / 1e9, pool.n // layers, layers,
+                        pool.n,
+                        slab_bytes / 1e6,
+                        pool.n * slab_bytes / 1e9,
+                        pool.n // layers,
+                        layers,
                     )
-                _POOL = pool  # publish only after fully built (readers see a complete pool)
+                _POOL = (
+                    pool  # publish only after fully built (readers see a complete pool)
+                )
     return _POOL
 
 
@@ -441,14 +512,19 @@ class _ColdStagePool:
     distinct cold set (≤ top_k ≈ 4 at bs=1). Reads fan out on ``_READ_POOL`` (deep QD), so the layer's cold
     experts read in PARALLEL instead of serially at each wave break. Keyed on ``(layer_idx, expert)`` — a
     hit is always valid (expert weights are immutable), so cross-step reuse is a free bonus. Per-store the
-    pool would be W×layers pinned bufsets (~17 GB); global it is ``cap`` bufsets (~cap×19 MB)."""
+    pool would be W×layers pinned bufsets (~17 GB); global it is ``cap`` bufsets (~cap×19 MB).
+    """
 
     __slots__ = ("cap", "free", "staged")
 
     def __init__(self, cap: int = 16):
         self.cap = cap
-        self.free = []  # list of {name: pinned tensor} bufsets, reusable across layers (uniform MoE dims)
-        self.staged = OrderedDict()  # (layer_idx, e) -> (bufs, futs); LRU by insertion/touch order
+        self.free = (
+            []
+        )  # list of {name: pinned tensor} bufsets, reusable across layers (uniform MoE dims)
+        self.staged = (
+            OrderedDict()
+        )  # (layer_idx, e) -> (bufs, futs); LRU by insertion/touch order
 
     def _acquire(self, store) -> dict:
         # Bufsets are interchangeable across uniform MoE layers; drop a mismatched one (defensive) + alloc.
@@ -458,12 +534,14 @@ class _ColdStagePool:
             if b["w13_weight"].shape == want:
                 return b
         return {
-            n: torch.empty_like(store.host_hot[n][0], pin_memory=True) for n in store._names
+            n: torch.empty_like(store.host_hot[n][0], pin_memory=True)
+            for n in store._names
         }
 
     def prefetch(self, store, e: int) -> None:
         """Kick async reads of expert ``e``'s tensors into a staged bufset (idempotent; LRU-evicts to stay
-        within ``cap``). Single-threaded caller (the eager BCG break) — no lock needed."""
+        within ``cap``). Single-threaded caller (the eager BCG break) — no lock needed.
+        """
         key = (store.layer_idx, int(e))
         ent = self.staged.get(key)
         if ent is not None:
@@ -499,9 +577,13 @@ _COLD_STAGE = _ColdStagePool()
 class InPlaceNvfp4Store(ExpertStore):
     pinned = False
 
-    def __init__(self, layer, num_experts_E, num_resident_K, device, *, model_path, layer_idx):
+    def __init__(
+        self, layer, num_experts_E, num_resident_K, device, *, model_path, layer_idx
+    ):
         global _N_STORES
-        _N_STORES += 1  # one instance per MoE layer -> real layer count for the cache log
+        _N_STORES += (
+            1  # one instance per MoE layer -> real layer count for the cache log
+        )
         self.E = num_experts_E
         self.K = num_resident_K
         self.device = device
@@ -509,10 +591,22 @@ class InPlaceNvfp4Store(ExpertStore):
         self.host = None
         self.gpu = discover_paged_params(layer, num_resident_K)
         assert self.gpu, "no per-expert params found on layer"
-        self.item_bytes = {n: p[0].numel() * p.element_size() for n, p in self.gpu.items()}
-        assert self.gpu["w13_weight"].dtype == torch.uint8, "in-place nvfp4 expects uint8 packed weights"
-        self._sc_w13 = "w13_blockscale_swizzled" if "w13_blockscale_swizzled" in self.gpu else "w13_weight_scale"
-        self._sc_w2 = "w2_blockscale_swizzled" if "w2_blockscale_swizzled" in self.gpu else "w2_weight_scale"
+        self.item_bytes = {
+            n: p[0].numel() * p.element_size() for n, p in self.gpu.items()
+        }
+        assert (
+            self.gpu["w13_weight"].dtype == torch.uint8
+        ), "in-place nvfp4 expects uint8 packed weights"
+        self._sc_w13 = (
+            "w13_blockscale_swizzled"
+            if "w13_blockscale_swizzled" in self.gpu
+            else "w13_weight_scale"
+        )
+        self._sc_w2 = (
+            "w2_blockscale_swizzled"
+            if "w2_blockscale_swizzled" in self.gpu
+            else "w2_weight_scale"
+        )
 
         # slot shapes -> slab layout (uniform across MoE layers)
         w13, w2 = self.gpu["w13_weight"], self.gpu["w2_weight"]
@@ -588,8 +682,14 @@ class InPlaceNvfp4Store(ExpertStore):
                     v = h[key]
                     b0, b1 = v["data_offsets"]
                     p = os.path.join(snap, shard)
-                    d[suf] = (_shard_fd(p), ds + b0, tuple(v["shape"]),
-                              _DTYPE[v["dtype"]], b1 - b0, os.path.realpath(p))
+                    d[suf] = (
+                        _shard_fd(p),
+                        ds + b0,
+                        tuple(v["shape"]),
+                        _DTYPE[v["dtype"]],
+                        b1 - b0,
+                        os.path.realpath(p),
+                    )
                 pe[proj] = d
             src[e] = pe
         self._src = src
@@ -627,7 +727,9 @@ class InPlaceNvfp4Store(ExpertStore):
         w1_wgs, w2_wgs = w1_wgs.to(dev), w2_wgs.to(dev)
         w1_igs, w3_igs, w2_igs = w1_igs.to(dev), w3_igs.to(dev), w2_igs.to(dev)
         w13_ws2, w2_ws2 = 1.0 / w1_wgs, 1.0 / w2_wgs  # per-expert weight_scale_2 [E]
-        w13_iq = torch.minimum(w1_igs, w3_igs)  # per-expert input_scale_quant (1/input_scale) [E]
+        w13_iq = torch.minimum(
+            w1_igs, w3_igs
+        )  # per-expert input_scale_quant (1/input_scale) [E]
         # Upstream's NVFP4 fused-MoE (flashinfer_cutlass/trtllm, ModelOptNvFp4FusedMoEMethod) collapses the
         # per-expert input scale to a PER-TENSOR max: input_scale = 1/iq, max_input_scale = 1/min(iq). The
         # kernel quantizes activations with 1/max, so the alphas must use max_input_scale too (else the
@@ -646,7 +748,8 @@ class InPlaceNvfp4Store(ExpertStore):
     def _submit_weight_reads(self, idx: int, e: int):
         """Submit the 3 packed-weight preads (gate|up -> w13 region, down -> w2 region) straight into the
         slab; return their futures. Fanning ALL misses' reads out at once gives the NVMe deep queue depth
-        (QD ~ 3 x misses) — a serial expert-at-a-time loop only reaches QD~3 and leaves the disk ~80% idle."""
+        (QD ~ 3 x misses) — a serial expert-at-a-time loop only reaches QD~3 and leaves the disk ~80% idle.
+        """
         mv = _POOL.mv[idx]
         gate, up, down = self._projs
         s = self._src[e]
@@ -660,7 +763,10 @@ class InPlaceNvfp4Store(ExpertStore):
             (s[down][self._W], mv[w2_off : w2_off + w2_b]),
         ]
         if _ODIRECT:
-            return [_READ_POOL.submit(_pread_into_direct, j[0][5], j[0][1], j[1]) for j in jobs]
+            return [
+                _READ_POOL.submit(_pread_into_direct, j[0][5], j[0][1], j[1])
+                for j in jobs
+            ]
         return [_READ_POOL.submit(_pread_into, j[0][0], j[0][1], j[1]) for j in jobs]
 
     def _fill_scales(self, idx: int, e: int):
@@ -671,18 +777,26 @@ class InPlaceNvfp4Store(ExpertStore):
         g = self._read_small(s[gate]["weight_scale"])
         u = self._read_small(s[up]["weight_scale"])
         dn = self._read_small(s[down]["weight_scale"])
-        sw13 = _cpu_swizzle_blockscale(torch.cat([g, u], dim=0).unsqueeze(0))[0].contiguous()
+        sw13 = _cpu_swizzle_blockscale(torch.cat([g, u], dim=0).unsqueeze(0))[
+            0
+        ].contiguous()
         sw2 = _cpu_swizzle_blockscale(dn.unsqueeze(0))[0].contiguous()
         sc13_off, sc13_b = self._lay["sc13"]
         sc2_off, sc2_b = self._lay["sc2"]
-        torch.frombuffer(mv[sc13_off : sc13_off + sc13_b], dtype=self._sc13_dt).copy_(sw13.view(-1))
-        torch.frombuffer(mv[sc2_off : sc2_off + sc2_b], dtype=self._sc2_dt).copy_(sw2.view(-1))
+        torch.frombuffer(mv[sc13_off : sc13_off + sc13_b], dtype=self._sc13_dt).copy_(
+            sw13.view(-1)
+        )
+        torch.frombuffer(mv[sc2_off : sc2_off + sc2_b], dtype=self._sc2_dt).copy_(
+            sw2.view(-1)
+        )
 
     def _submit_fill(self, idx: int, e: int):
         """Fan out one expert's slab fill (3 weight preads + 1 scale swizzle) to the pool; return futures."""
         futs = self._submit_weight_reads(idx, e)
         futs.append(_READ_POOL.submit(self._fill_scales, idx, e))
-        _POOL.note_fill(idx, futs)  # pool won't evict this slot until the fill completes; page_in waits on it
+        _POOL.note_fill(
+            idx, futs
+        )  # pool won't evict this slot until the fill completes; page_in waits on it
         return futs
 
     # ---- read-ahead: fan out the WHOLE layer's cold reads at once (deep queue depth) ----------------
@@ -694,19 +808,34 @@ class InPlaceNvfp4Store(ExpertStore):
         waits on the in-flight fill and just does the H2D."""
         if experts is None:
             return
-        _get_pool(self._pool_slab_bytes)  # lazy: allocate the pinned pool on first use (post-load)
+        _get_pool(
+            self._pool_slab_bytes
+        )  # lazy: allocate the pinned pool on first use (post-load)
         ids = experts.tolist() if torch.is_tensor(experts) else list(experts)
         for e in ids:
             e = int(e)
             idx, need_fill = _POOL.acquire((self.layer_idx, e))
             if need_fill:
-                self._submit_fill(idx, e)  # records the fill on the pool (slot-keyed, eviction-safe)
+                self._submit_fill(
+                    idx, e
+                )  # records the fill on the pool (slot-keyed, eviction-safe)
 
     # ---- hot path ----------------------------------------------------------------------------------
-    def page_in(self, src_experts, dst_slots, *, stage_bank=0, async_h2d=False, src_host=None, dst_host=None):
+    def page_in(
+        self,
+        src_experts,
+        dst_slots,
+        *,
+        stage_bank=0,
+        async_h2d=False,
+        src_host=None,
+        dst_host=None,
+    ):
         if src_experts.numel() == 0:
             return
-        _get_pool(self._pool_slab_bytes)  # lazy: allocate the pinned pool on first use (post-load)
+        _get_pool(
+            self._pool_slab_bytes
+        )  # lazy: allocate the pinned pool on first use (post-load)
         # Use caller-supplied host lists to AVOID device->host syncs (.to("cpu").tolist() stalls the pipeline
         # ~2x/wave; the eager wave path already has these on the host).
         srcs = src_host if src_host is not None else src_experts.to("cpu").tolist()
@@ -728,7 +857,9 @@ class InPlaceNvfp4Store(ExpertStore):
             if need_fill:
                 pending.extend(self._submit_fill(idx, e))  # inline miss: fill now
             else:
-                fs = _POOL.take_inflight(idx)  # hit: a prefetch fill for this slot may still be running
+                fs = _POOL.take_inflight(
+                    idx
+                )  # hit: a prefetch fill for this slot may still be running
                 if fs:
                     pending.extend(fs)
             plan.append((e, slot, idx))
@@ -744,16 +875,26 @@ class InPlaceNvfp4Store(ExpertStore):
         for e, slot, idx in plan:
             slab = _POOL.slabs[idx]
             w13[slot].copy_(
-                slab[w13_off : w13_off + w13_b].view(torch.uint8).reshape(self._w13_shape), non_blocking=True
+                slab[w13_off : w13_off + w13_b]
+                .view(torch.uint8)
+                .reshape(self._w13_shape),
+                non_blocking=True,
             )
             w2[slot].copy_(
-                slab[w2_off : w2_off + w2_b].view(torch.uint8).reshape(self._w2_shape), non_blocking=True
+                slab[w2_off : w2_off + w2_b].view(torch.uint8).reshape(self._w2_shape),
+                non_blocking=True,
             )
             sc13[slot].copy_(
-                slab[sc13_off : sc13_off + sc13_b].view(self._sc13_dt).reshape(self._sc13_shape), non_blocking=True
+                slab[sc13_off : sc13_off + sc13_b]
+                .view(self._sc13_dt)
+                .reshape(self._sc13_shape),
+                non_blocking=True,
             )
             sc2[slot].copy_(
-                slab[sc2_off : sc2_off + sc2_b].view(self._sc2_dt).reshape(self._sc2_shape), non_blocking=True
+                slab[sc2_off : sc2_off + sc2_b]
+                .view(self._sc2_dt)
+                .reshape(self._sc2_shape),
+                non_blocking=True,
             )
         if not async_h2d:
             torch.cuda.current_stream().synchronize()
@@ -763,7 +904,9 @@ class InPlaceNvfp4Store(ExpertStore):
 
     # ---- defensive: unused on the eager wave/keep-warm path -----------------------------------------
     def read_full(self, targets, *, stage_key=0):
-        raise RuntimeError("InPlaceNvfp4Store.read_full: scratch prefill unsupported (wave path only)")
+        raise RuntimeError(
+            "InPlaceNvfp4Store.read_full: scratch prefill unsupported (wave path only)"
+        )
 
     def row(self, name, e):
         raise RuntimeError("InPlaceNvfp4Store is read-only (in-place); no fill row")
@@ -782,34 +925,68 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
     window *misses* stage from the checkpoint at eager BCG breaks. The cold tier stays IN-PLACE (checkpoint
     O_DIRECT reads on demand) so we never materialize the 427 GB expert set. The pager owns the window
     policy (``refresh_window_freq`` -> :meth:`set_window_membership`); this store only executes row swaps and
-    the hot/cold reads. Reuses ``InPlaceNvfp4Store``'s source indexing + resident scalars + CPU swizzle."""
+    the hot/cold reads. Reuses ``InPlaceNvfp4Store``'s source indexing + resident scalars + CPU swizzle.
+    """
 
     pinned = True
 
-    def __init__(self, layer, num_experts_E, num_resident_K, device, *, model_path, layer_idx, W=None):
+    def __init__(
+        self,
+        layer,
+        num_experts_E,
+        num_resident_K,
+        device,
+        *,
+        model_path,
+        layer_idx,
+        W=None,
+    ):
         self.E = num_experts_E
         self.K = num_resident_K
         self.device = device
         self.layer_idx = layer_idx
         self.host = None
-        self.W = max(int(num_resident_K), min(int(W if W is not None else _WINDOW_W), num_experts_E))
+        self.W = max(
+            int(num_resident_K),
+            min(int(W if W is not None else _WINDOW_W), num_experts_E),
+        )
         self.cold_backing = "disk"
-        self._cold_mm = {}  # no slot-ready mmap tier; cold reads route through gather_rows_into (checkpoint)
+        self._cold_mm = (
+            {}
+        )  # no slot-ready mmap tier; cold reads route through gather_rows_into (checkpoint)
         self._cold_fd = {}
         gpu_all = discover_paged_params(layer, num_resident_K)
         assert gpu_all, "no per-expert params found on layer"
-        assert gpu_all["w13_weight"].dtype == torch.uint8, "windowed nvfp4 expects uint8 packed weights"
-        self._sc_w13 = "w13_blockscale_swizzled" if "w13_blockscale_swizzled" in gpu_all else "w13_weight_scale"
-        self._sc_w2 = "w2_blockscale_swizzled" if "w2_blockscale_swizzled" in gpu_all else "w2_weight_scale"
+        assert (
+            gpu_all["w13_weight"].dtype == torch.uint8
+        ), "windowed nvfp4 expects uint8 packed weights"
+        self._sc_w13 = (
+            "w13_blockscale_swizzled"
+            if "w13_blockscale_swizzled" in gpu_all
+            else "w13_weight_scale"
+        )
+        self._sc_w2 = (
+            "w2_blockscale_swizzled"
+            if "w2_blockscale_swizzled" in gpu_all
+            else "w2_weight_scale"
+        )
         # Keep ONLY the 4 real paged tensors. At K=1, discover_paged_params over-collects [1]-shaped resident
         # scalars (e.g. g1_alphas_up) whose bytes aren't 16-aligned and which the captured gather must not
         # move — the resident scalars ride the separate _refresh_nvfp4_scalars path (nvfp4_full_e).
         keep = ("w13_weight", "w2_weight", self._sc_w13, self._sc_w2)
         self.gpu = {n: gpu_all[n] for n in keep}
-        self.item_bytes = {n: p[0].numel() * p.element_size() for n, p in self.gpu.items()}
-        _bad = {n: (b, tuple(self.gpu[n].shape)) for n, b in self.item_bytes.items() if b % 16}
+        self.item_bytes = {
+            n: p[0].numel() * p.element_size() for n, p in self.gpu.items()
+        }
+        _bad = {
+            n: (b, tuple(self.gpu[n].shape))
+            for n, b in self.item_bytes.items()
+            if b % 16
+        }
         assert not _bad, f"captured gather needs 16B-aligned slots; offenders: {_bad}"
-        self._names = list(self.gpu)  # canonical tensor order (must match pager's list(self.gpu))
+        self._names = list(
+            self.gpu
+        )  # canonical tensor order (must match pager's list(self.gpu))
 
         self._index_expert_sources(model_path, layer_idx)
         self.nvfp4_full_e = self._compute_resident_scalars()
@@ -817,7 +994,8 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
         # host_hot: fixed pinned [W, *slot] per tensor (stable UVA base for the in-graph gather).
         W = self.W
         self.host_hot = {
-            n: torch.empty((W, *p.shape[1:]), dtype=p.dtype, pin_memory=True) for n, p in self.gpu.items()
+            n: torch.empty((W, *p.shape[1:]), dtype=p.dtype, pin_memory=True)
+            for n, p in self.gpu.items()
         }
         # tier maps (CPU int64 [E]). LAZY window: start EMPTY (all cold) and let refresh_window_freq +
         # cold-staging warm it — pre-filling a static [0,W) wouldn't match the routed experts anyway, and
@@ -835,7 +1013,10 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
             logging.getLogger(__name__).info(
                 "[paged-experts] WINDOWED NVFP4 (captured path): W=%d experts/layer x %.1f MB pinned "
                 "(~%.1f GB over %d layers); cold tier in-place from checkpoint",
-                W, slot_mb, W * slot_mb * _MOE_LAYERS_HINT / 1e3, _MOE_LAYERS_HINT,
+                W,
+                slot_mb,
+                W * slot_mb * _MOE_LAYERS_HINT / 1e3,
+                _MOE_LAYERS_HINT,
             )
 
     # ---- host_hot fill (a window row <- one checkpoint expert, slot-ready) --------------------------
@@ -853,7 +1034,9 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
         g = self._read_small(s[gate]["weight_scale"])
         u = self._read_small(s[up]["weight_scale"])
         dn = self._read_small(s[down]["weight_scale"])
-        sw13 = _cpu_swizzle_blockscale(torch.cat([g, u], dim=0).unsqueeze(0))[0].contiguous()
+        sw13 = _cpu_swizzle_blockscale(torch.cat([g, u], dim=0).unsqueeze(0))[
+            0
+        ].contiguous()
         sw2 = _cpu_swizzle_blockscale(dn.unsqueeze(0))[0].contiguous()
         self.host_hot[self._sc_w13][row].view(-1).copy_(sw13.view(-1))
         self.host_hot[self._sc_w2][row].view(-1).copy_(sw2.view(-1))
@@ -871,14 +1054,20 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
             if _CR_PROF:
                 _CR_READ_NS[0] += time.perf_counter_ns() - t0
         elif name == "w2_weight":
-            _pread_into_direct(s[down][self._W][5], s[down][self._W][1], memoryview(dst.view(-1).numpy()))
+            _pread_into_direct(
+                s[down][self._W][5],
+                s[down][self._W][1],
+                memoryview(dst.view(-1).numpy()),
+            )
             if _CR_PROF:
                 _CR_READ_NS[0] += time.perf_counter_ns() - t0
         elif name == self._sc_w13:
             g = self._read_small(s[gate]["weight_scale"])
             u = self._read_small(s[up]["weight_scale"])
             t1 = time.perf_counter_ns() if _CR_PROF else 0
-            sw = _cpu_swizzle_blockscale(torch.cat([g, u], dim=0).unsqueeze(0))[0].contiguous()
+            sw = _cpu_swizzle_blockscale(torch.cat([g, u], dim=0).unsqueeze(0))[
+                0
+            ].contiguous()
             dst.view(-1).copy_(sw.view(-1))
             if _CR_PROF:
                 _CR_READ_NS[0] += t1 - t0
@@ -902,7 +1091,11 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
                 tot = (r + w) or 1.0
                 logging.getLogger(__name__).info(
                     "[cold-split] %d cold reads: disk-pread=%.0fms (%.0f%%) | swizzle-CPU=%.0fms (%.0f%%)",
-                    _CR_LOG_EVERY, r / 1e6, 100 * r / tot, w / 1e6, 100 * w / tot,
+                    _CR_LOG_EVERY,
+                    r / 1e6,
+                    100 * r / tot,
+                    w / 1e6,
+                    100 * w / tot,
                 )
                 _CR_READ_NS[0] = 0.0
                 _CR_SWZ_NS[0] = 0.0
@@ -910,11 +1103,22 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
     # ---- windowed interface (pager contract) -------------------------------------------------------
     def set_window_membership(self, hot_experts):
         """Re-pin the hot window to ``hot_experts`` (top-W by freq, from the pager). Demoted experts drop to
-        cold (hot_pos=-1); promoted experts are read from the checkpoint into the freed rows. Returns moved."""
-        hot = [int(e) for e in (hot_experts.tolist() if torch.is_tensor(hot_experts) else list(hot_experts))]
+        cold (hot_pos=-1); promoted experts are read from the checkpoint into the freed rows. Returns moved.
+        """
+        hot = [
+            int(e)
+            for e in (
+                hot_experts.tolist()
+                if torch.is_tensor(hot_experts)
+                else list(hot_experts)
+            )
+        ]
         hot = hot[: self.W]
         hot_set = set(hot)
-        occupied = {int(self.hot_pos[e]): int(e) for e in (self.hot_pos >= 0).nonzero().flatten().tolist()}
+        occupied = {
+            int(self.hot_pos[e]): int(e)
+            for e in (self.hot_pos >= 0).nonzero().flatten().tolist()
+        }
         free_rows = [r for r in range(self.W) if r not in occupied]
         promoted = [e for e in hot if int(self.hot_pos[e]) < 0]
         demoted = [occ_e for r, occ_e in occupied.items() if occ_e not in hot_set]
@@ -929,7 +1133,9 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
                 self.cold_pos[de] = de
             else:
                 break  # window full of still-hot experts
-            self._fill_host_row(row, pe)  # cold tier is virtual -> read promoted expert from checkpoint
+            self._fill_host_row(
+                row, pe
+            )  # cold tier is virtual -> read promoted expert from checkpoint
             self.hot_pos[pe] = row
             self.cold_pos[pe] = -1
             moved += 1
@@ -944,13 +1150,20 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
             e = int(e)
             hp = int(self.hot_pos[e])
             if hp >= 0:
-                buf[i].copy_(self.host_hot[name][hp])  # window hit: cheap in-RAM copy, keep serial
+                buf[i].copy_(
+                    self.host_hot[name][hp]
+                )  # window hit: cheap in-RAM copy, keep serial
             elif not _COLD_STAGE.gather_one(self, name, e, buf[i]):
-                cold.append((i, e))  # window miss: disk read — batch for the lean parallel fan-out
+                cold.append(
+                    (i, e)
+                )  # window miss: disk read — batch for the lean parallel fan-out
         if _LEAN_GATHER and len(cold) > 1:
             # fan the cold preads out for NVMe queue depth; each writes its own buf row (no aliasing),
             # _read_cold_tensor's bounce buffer is thread-local, so this is race-free.
-            futs = [_READ_POOL.submit(self._read_cold_tensor, name, e, buf[i]) for i, e in cold]
+            futs = [
+                _READ_POOL.submit(self._read_cold_tensor, name, e, buf[i])
+                for i, e in cold
+            ]
             for f in futs:
                 f.result()
         else:
@@ -968,7 +1181,8 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
         from the completed staged buffer instead of blocking on a synchronous O_DIRECT read. Called at the
         wave break with the layer's full distinct set (across-wave overlap) and per-wave with each wave's
         cold ids (idempotent — a re-request of a staged expert is a no-op). The CROSS-STEP temporal variant
-        was measured net-negative (4.04->4.86 s/tok); this within-step variant is the path."""
+        was measured net-negative (4.04->4.86 s/tok); this within-step variant is the path.
+        """
         if experts is None:
             return
         if os.environ.get("SGLANG_RING_PREFETCH", "0") != "1":
@@ -978,11 +1192,15 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
         ids = experts.tolist() if torch.is_tensor(experts) else list(experts)
         for e in ids:
             e = int(e)
-            if int(self.hot_pos[e]) < 0:  # cold only; hot experts gather from host_hot in-window
+            if (
+                int(self.hot_pos[e]) < 0
+            ):  # cold only; hot experts gather from host_hot in-window
                 _COLD_STAGE.prefetch(self, e)
 
     # ---- eager fallback (off-graph prefill / eager decode) -----------------------------------------
-    def page_in(self, src_experts, dst_slots, *, stage_bank=0, async_h2d=False, src_host=None):
+    def page_in(
+        self, src_experts, dst_slots, *, stage_bank=0, async_h2d=False, src_host=None
+    ):
         if src_experts.numel() == 0:
             return
         srcs = src_host if src_host is not None else src_experts.to("cpu").tolist()
@@ -998,7 +1216,10 @@ class WindowedNvfp4Store(InPlaceNvfp4Store):
                     gp[slot].copy_(self.host_hot[name][hp].to(dev, non_blocking=True))
                 else:
                     if scratch is None:
-                        scratch = {n: torch.empty_like(self.host_hot[n][0], pin_memory=True) for n in self._names}
+                        scratch = {
+                            n: torch.empty_like(self.host_hot[n][0], pin_memory=True)
+                            for n in self._names
+                        }
                     self._read_cold_tensor(name, e, scratch[name])
                     gp[slot].copy_(scratch[name].to(dev, non_blocking=True))
         if not async_h2d:

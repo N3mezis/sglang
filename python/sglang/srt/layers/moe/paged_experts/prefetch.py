@@ -27,13 +27,23 @@ import torch
 logger = logging.getLogger(__name__)
 
 ON = os.environ.get("SGLANG_PE_PREFETCH", "0") != "0"
-_N = int(os.environ.get("SGLANG_PE_PREFETCH_N", "1"))            # lead: prefetch this many layers ahead
-_MMAX = int(os.environ.get("SGLANG_PE_PREFETCH_MMAX", "16"))     # cap on extras beyond top-k
-_DELTA = float(os.environ.get("SGLANG_PE_PREFETCH_DELTA", "0.10"))  # boundary width beyond the k-th score
-_FLOOR = float(os.environ.get("SGLANG_PE_PREFETCH_FLOOR", "0.0"))   # drop predictions with margin < FLOOR
-_LOG_EVERY = int(os.environ.get("SGLANG_PE_PREFETCH_LOG", "500"))   # prove-execution heartbeat (calls)
+_N = int(
+    os.environ.get("SGLANG_PE_PREFETCH_N", "1")
+)  # lead: prefetch this many layers ahead
+_MMAX = int(
+    os.environ.get("SGLANG_PE_PREFETCH_MMAX", "16")
+)  # cap on extras beyond top-k
+_DELTA = float(
+    os.environ.get("SGLANG_PE_PREFETCH_DELTA", "0.10")
+)  # boundary width beyond the k-th score
+_FLOOR = float(
+    os.environ.get("SGLANG_PE_PREFETCH_FLOOR", "0.0")
+)  # drop predictions with margin < FLOOR
+_LOG_EVERY = int(
+    os.environ.get("SGLANG_PE_PREFETCH_LOG", "500")
+)  # prove-execution heartbeat (calls)
 
-_layers = {}      # layer_id -> (moe module, top_k)
+_layers = {}  # layer_id -> (moe module, top_k)
 _calls = 0
 _issued = 0
 _mode_logged = False
@@ -58,7 +68,8 @@ def _store(moe):
             logger.warning(
                 "[pe-prefetch] store resolution failed (%s: %s); experts=%s quant_method=%s "
                 "_pager=%s — prefetch disabled for such layers",
-                type(e).__name__, e,
+                type(e).__name__,
+                e,
                 type(getattr(moe, "experts", None)).__name__,
                 type(qm).__name__,
                 getattr(qm, "_pager", "<missing>"),
@@ -95,7 +106,8 @@ def prefetch_ahead(cur_moe, h: torch.Tensor) -> None:
             logger.info(
                 "[pe-prefetch] active: store=%s cold_direct_all=%s (True means WILLNEED hints are "
                 "suppressed — page-ins bypass the cache; hints only help mmap-fault reads)",
-                type(st).__name__, direct,
+                type(st).__name__,
+                direct,
             )
     for n in range(1, _N + 1):
         ent = _layers.get(cur_id + n)
@@ -114,8 +126,10 @@ def prefetch_ahead(cur_moe, h: torch.Tensor) -> None:
             keep = [
                 il[i]
                 for i in range(len(il))
-                if (i < k or vl[i] >= kth - _DELTA)                  # top-k + boundary band
-                and (not _FLOOR or vl[i] - floor_ref >= _FLOOR)      # optional low-margin cutoff
+                if (i < k or vl[i] >= kth - _DELTA)  # top-k + boundary band
+                and (
+                    not _FLOOR or vl[i] - floor_ref >= _FLOOR
+                )  # optional low-margin cutoff
             ]
             if keep:
                 store.prefetch_cold(keep)
@@ -126,5 +140,9 @@ def prefetch_ahead(cur_moe, h: torch.Tensor) -> None:
     if _LOG_EVERY and _calls % _LOG_EVERY == 0:
         logger.info(
             "[pe-prefetch] alive: %d calls, %d expert hints issued (N=%d DELTA=%.2f FLOOR=%.2f)",
-            _calls, _issued, _N, _DELTA, _FLOOR,
+            _calls,
+            _issued,
+            _N,
+            _DELTA,
+            _FLOOR,
         )

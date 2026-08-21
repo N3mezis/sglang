@@ -65,13 +65,16 @@ def _store_v2_layer_dir(cache_dir: Optional[str], layer_idx: int) -> Optional[st
     """Per-layer directory of the v2 RAW store cache (one page-aligned .bin per paged tensor +
     manifest.json) — the mmap+register (zero-copy) store's format. v1 (safetensors) stays readable for
     the copy path; v2 exists because safetensors tensor offsets are only 8-byte aligned, while the UVA
-    gather needs a 16-byte-aligned base — a per-tensor file's mmap base is page-aligned by construction."""
+    gather needs a 16-byte-aligned base — a per-tensor file's mmap base is page-aligned by construction.
+    """
     return os.path.join(cache_dir, "v2", f"layer_{layer_idx}") if cache_dir else None
+
 
 def _v2_cache_complete(layer_dir: Optional[str], names) -> bool:
     if not layer_dir or not os.path.exists(os.path.join(layer_dir, "manifest.json")):
         return False
     return all(os.path.exists(os.path.join(layer_dir, f"{n}.bin")) for n in names)
+
 
 def _save_store_v2(store, cache_dir: Optional[str], layer_idx: int) -> None:
     """Persist the filled host store as v2 raw per-tensor files (atomic per file), so the NEXT boot can
@@ -83,12 +86,20 @@ def _save_store_v2(store, cache_dir: Optional[str], layer_idx: int) -> None:
         os.makedirs(layer_dir, exist_ok=True)
         manifest = {}
         for name, p in store.gpu.items():
-            host = store.host.get(name) if getattr(store, "host", None) is not None else None
-            if host is None:  # windowed store: reconstruct expert order via the fill accessors
+            host = (
+                store.host.get(name)
+                if getattr(store, "host", None) is not None
+                else None
+            )
+            if (
+                host is None
+            ):  # windowed store: reconstruct expert order via the fill accessors
                 host = torch.empty((store.E, *p.shape[1:]), dtype=p.dtype)
                 for e in range(store.E):
                     host[e].copy_(store.row(name, e))
-            raw = host.contiguous().view(torch.uint8).numpy()  # byte reinterpretation (bf16/fp8-safe)
+            raw = (
+                host.contiguous().view(torch.uint8).numpy()
+            )  # byte reinterpretation (bf16/fp8-safe)
             path = os.path.join(layer_dir, f"{name}.bin")
             with open(path + ".tmp", "wb") as f:
                 f.write(raw.tobytes())

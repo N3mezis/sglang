@@ -105,12 +105,12 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.hash_topk import HashTopK
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
+from sglang.srt.layers.moe.paged_experts import route_probe as _route_probe
 from sglang.srt.layers.moe.token_dispatcher.base import (
     BaseDispatcher,
     CombineInput,
     DispatchOutput,
 )
-from sglang.srt.layers.moe.paged_experts import route_probe as _route_probe
 from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,

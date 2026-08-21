@@ -209,7 +209,9 @@ class LagunaMoE(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
 
-        if _pe_prefetch.ON and hidden_states.shape[0] == 1:  # kick next layers' cold read-ahead early
+        if (
+            _pe_prefetch.ON and hidden_states.shape[0] == 1
+        ):  # kick next layers' cold read-ahead early
             _pe_prefetch.prefetch_ahead(self, hidden_states)
 
         shared_out = self.shared_expert(hidden_states)

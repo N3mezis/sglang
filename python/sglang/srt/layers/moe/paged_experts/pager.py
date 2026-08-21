@@ -170,7 +170,9 @@ _PRED_STATS_ON = os.environ.get("SGLANG_PE_PRED_STATS") not in (None, "", "0")
 _PRED_HIT = 0  # routed_t ∩ routed_{t-1}  (routing stability)
 _PRED_TOTAL = 0  # routed_t
 _PRED_MISS_HIT = 0  # missed_t ∩ routed_{t-1}  (predictable misses)
-_PRED_MISS_TOTAL = 0  # missed_t  (experts routed this step but NOT resident = actual page-ins)
+_PRED_MISS_TOTAL = (
+    0  # missed_t  (experts routed this step but NOT resident = actual page-ins)
+)
 _PRED_LAYER_STEPS = 0
 _PRED_LOG_EVERY = 2000  # layer-steps between readouts
 
@@ -621,10 +623,16 @@ class ExpertPager:
         if distinct is None:
             distinct = self.distinct_active(topk_ids)
         l2g_t = self.logical_to_gpu_index  # [E] int32 CPU host mirror
-        l2g = l2g_t.tolist()  # one bulk read -> python list; avoids ~2*len(distinct) 0-d tensor builds
-        se = self.slot_expert  # already a python list; mutations below persist (same object)
+        l2g = (
+            l2g_t.tolist()
+        )  # one bulk read -> python list; avoids ~2*len(distinct) 0-d tensor builds
+        se = (
+            self.slot_expert
+        )  # already a python list; mutations below persist (same object)
         needed = set(distinct)
-        if _PRED_STATS_ON:  # SGLANG_PE_PRED_STATS: routing + miss temporal hit-rate (l2g is pre-step here)
+        if (
+            _PRED_STATS_ON
+        ):  # SGLANG_PE_PRED_STATS: routing + miss temporal hit-rate (l2g is pre-step here)
             _record_pred_stats(self, needed, {e for e in distinct if l2g[e] < 0})
         for e in distinct:  # touch recency/frequency of resident hits
             s = l2g[e]
@@ -654,7 +662,9 @@ class ExpertPager:
             if not hasattr(self, "_kw_empty"):
                 self._kw_empty = torch.empty(0, dtype=torch.int64, device=self.device)
             return self._kw_empty, self._kw_empty
-        l2g_t.copy_(torch.tensor(l2g, dtype=l2g_t.dtype))  # one bulk write-back (miss steps only)
+        l2g_t.copy_(
+            torch.tensor(l2g, dtype=l2g_t.dtype)
+        )  # one bulk write-back (miss steps only)
         self.logical_to_gpu_index_cuda.copy_(l2g_t, non_blocking=True)
         return (
             torch.tensor(src, dtype=torch.int64, device=self.device),
@@ -696,8 +706,12 @@ class ExpertPager:
         # graphs holding freed pointers (aliasing / illegal-access class — crashed multi-bs concurrency,
         # suspected in the adaptive-spec intermittent corruption). Allocate ONCE here, oversized; every
         # tier and the eager wave path take a [:t] view of the same never-moving storage.
-        self._topk_store = torch.empty(262144, dtype=i32, device=dev)  # 1 MB; covers prefill chunks (tokens*topk)
-        self._safe_ids_store = torch.empty(self.K, dtype=i32, device=dev)  # keep-warm t <= K (caller guard)
+        self._topk_store = torch.empty(
+            262144, dtype=i32, device=dev
+        )  # 1 MB; covers prefill chunks (tokens*topk)
+        self._safe_ids_store = torch.empty(
+            self.K, dtype=i32, device=dev
+        )  # keep-warm t <= K (caller guard)
         self._masked_tw_store = torch.empty(self.K, dtype=torch.float32, device=dev)
         # gather_multi descriptors: one fused launch pages ALL paged tensors (6 launches -> 1 for marlin
         # int4). Base pointers are capture-stable: the UVA store pointer and the GPU pool allocations are
@@ -764,7 +778,12 @@ class ExpertPager:
             self._dst_d[:n].copy_(torch.tensor(dst, dtype=i32, device=dev))
             self._n_out_d.fill_(n)
             paged_experts_gather_multi(
-                self._gm_stores, self._gm_slots, self._gm_e16s, self._src_d, self._dst_d, self._n_out_d
+                self._gm_stores,
+                self._gm_slots,
+                self._gm_e16s,
+                self._src_d,
+                self._dst_d,
+                self._n_out_d,
             )
         # rebuild maps host-side from the reconciled layout, push once
         for e, s_ in zip(src, dst):
@@ -835,7 +854,9 @@ class ExpertPager:
         t = topk_ids.numel()
         if self._safe_ids_store is None or self._safe_ids_store.numel() < t:
             self._safe_ids_store = torch.empty(t, dtype=torch.int32, device=self.device)
-            self._masked_tw_store = torch.empty(t, dtype=torch.float32, device=self.device)
+            self._masked_tw_store = torch.empty(
+                t, dtype=torch.float32, device=self.device
+            )
         self._safe_ids_d = self._safe_ids_store[:t]
         self._masked_tw_d = self._masked_tw_store[:t]
         paged_experts_remap_mask(
@@ -875,7 +896,9 @@ class ExpertPager:
         their out-of-graph cold-staging break)."""
         self._prep_topk_ondevice(topk_ids)
         l2g = self.logical_to_gpu_index_cuda  # serves as both expert_slot and idx
-        lfu = self._lfu_flag(topk_ids)  # --paged-experts-eviction (incl. "auto"), as the host path
+        lfu = self._lfu_flag(
+            topk_ids
+        )  # --paged-experts-eviction (incl. "auto"), as the host path
         fusable = (
             topk_weights is not None
             and topk_weights.dtype == torch.float32
@@ -1238,7 +1261,8 @@ class ExpertPager:
 
 def _fill_and_cache_store(store, method, model_path, layer_idx, dev) -> None:
     """Fill the host store from the checkpoint, then persist the v2 repack cache so a later boot with
-    ``--paged-experts-store mmap`` can map these bytes in place instead of repacking again."""
+    ``--paged-experts-store mmap`` can map these bytes in place instead of repacking again.
+    """
     try:
         # One ExpertFill per quant format, selected by predicate (fills/). The registry keys on the
         # store's paged params + the checkpoint quant_method (gptq vs awq register identical keys).

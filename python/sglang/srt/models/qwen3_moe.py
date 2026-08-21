@@ -328,7 +328,9 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if _pe_prefetch.ON and num_tokens == 1:  # kick next layers' cold read-ahead before this layer's work
+        if (
+            _pe_prefetch.ON and num_tokens == 1
+        ):  # kick next layers' cold read-ahead before this layer's work
             _pe_prefetch.prefetch_ahead(self, hidden_states)
 
         # router_logits: (num_tokens, n_experts)

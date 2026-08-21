@@ -33,7 +33,6 @@ from sglang.srt.layers.moe.paged_experts.forward import (
     _wave_apply,
     mask_and_remap_expert_ids,
 )
-
 from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
@@ -61,7 +60,15 @@ class Placement(ABC):
 # (SGLANG_PE_TAU_LOG_EVERY layer-calls) so the skip distribution can be cross-referenced against
 # frequency tails from other modalities. Runs before decide AND before the keep-warm/wave branch, so
 # it also shrinks the distinct set. Side effect: LFU freq counts see the redirected top-1 id twice.
-_TAU = float(os.environ.get("SGLANG_PE_TAU", "0"))
+from sglang.srt.layers.moe.paged_experts import flags as _pe_flags
+
+
+def _get_tau() -> float:
+    return _pe_flags.resolve(
+        arg_name="paged_experts_tau", env_name="SGLANG_PE_TAU", cast=float, default=0.0
+    )
+
+
 _TAU_LOG_EVERY = int(os.environ.get("SGLANG_PE_TAU_LOG_EVERY", "2000"))
 _tau_calls = 0
 _tau_pairs = 0
@@ -72,6 +79,7 @@ _tau_hist = None
 
 def _tau_skip(pager, topk_output):
     global _tau_calls, _tau_pairs, _tau_skipped, _tau_mass_skipped, _tau_hist
+    _tau = _get_tau()
     ids, w = topk_output.topk_ids, topk_output.topk_weights
     if ids.numel() == 0 or w is None:
         return
@@ -80,14 +88,16 @@ def _tau_skip(pager, topk_output):
     safe = torch.where(valid, ids, torch.zeros_like(ids))
     miss = (m[safe.long()] < 0) & valid
     wmax = w.max(dim=-1, keepdim=True).values
-    skip = miss & (w < _TAU * wmax)
+    skip = miss & (w < _tau * wmax)
     _tau_calls += 1
     _tau_pairs += int(ids.numel())
     if bool(skip.any()):
         if _tau_hist is None:
             _tau_hist = torch.zeros(m.numel(), dtype=torch.int64, device=ids.device)
         _tau_hist.index_add_(
-            0, ids[skip].long(), torch.ones(int(skip.sum()), dtype=torch.int64, device=ids.device)
+            0,
+            ids[skip].long(),
+            torch.ones(int(skip.sum()), dtype=torch.int64, device=ids.device),
         )
         _tau_mass_skipped += float(w[skip].sum())
         _tau_skipped += int(skip.sum())
@@ -99,9 +109,17 @@ def _tau_skip(pager, topk_output):
         top = torch.topk(_tau_hist, 10)
         logger.info(
             "[tau-dial] tau=%.2f calls=%d skipped=%d/%d pairs (%.1f%%) mass_skipped=%.1f | top skipped experts: %s",
-            _TAU, _tau_calls, _tau_skipped, _tau_pairs, 100 * _tau_skipped / max(1, _tau_pairs),
+            _tau,
+            _tau_calls,
+            _tau_skipped,
+            _tau_pairs,
+            100 * _tau_skipped / max(1, _tau_pairs),
             _tau_mass_skipped,
-            " ".join(f"e{int(i)}:{int(c)}" for i, c in zip(top.indices.tolist(), top.values.tolist()) if c > 0),
+            " ".join(
+                f"e{int(i)}:{int(c)}"
+                for i, c in zip(top.indices.tolist(), top.values.tolist())
+                if c > 0
+            ),
         )
 
 
@@ -116,7 +134,7 @@ class EagerPlacement(Placement):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         pager = method._pager
-        if _TAU > 0.0:
+        if _get_tau() > 0.0:
             _tau_skip(pager, dispatch_output.topk_output)
         topk_ids = dispatch_output.topk_output.topk_ids
         distinct = pager.distinct_active(topk_ids)
@@ -138,7 +156,9 @@ class EagerPlacement(Placement):
                 cs.wait_stream(ts)  # routed GEMM must see the paged-in experts
             else:
                 pager.page_in(src, dst, src_host=sh, dst_host=dh)
-                if ov is not None:  # no misses to hide behind: run it inline (still correct)
+                if (
+                    ov is not None
+                ):  # no misses to hide behind: run it inline (still correct)
                     ov.result = ov.fn()
             remap = mask_and_remap_expert_ids(topk_ids, pager.logical_to_gpu_index_cuda)
             hidden = _gemm_hidden(

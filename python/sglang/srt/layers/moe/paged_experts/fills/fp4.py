@@ -69,7 +69,11 @@ def _fill_mxfp4_from_checkpoint(
     dn_s = load("down_proj_scales").view(torch.uint8)  # [E, hidden, inter//32]
     gu_bias = load("gate_up_proj_bias")  # [E, 2*inter] bf16
     dn_bias = load("down_proj_bias")  # [E, hidden]
-    for _p in _loaded_shards:  # release the consumed shards' page cache (bound peak load RAM)
+    for (
+        _p
+    ) in (
+        _loaded_shards
+    ):  # release the consumed shards' page cache (bound peak load RAM)
         _drop_file_cache(_p)
 
     e8 = torch.float8_e8m0fnu
@@ -414,7 +418,10 @@ def _fill_dsv4_mxfp4_marlin_from_checkpoint(
     for n, t in (
         ("w13_weight", w13),
         ("w2_weight", w2),
-        ("w13_weight_scale_inv", w13_s.view(e8)),  # _inv name -> prepare renames + deletes it
+        (
+            "w13_weight_scale_inv",
+            w13_s.view(e8),
+        ),  # _inv name -> prepare renames + deletes it
         ("w2_weight_scale_inv", w2_s.view(e8)),
     ):
         setattr(mock, n, torch.nn.Parameter(t.to(dev), requires_grad=False))
@@ -454,7 +461,8 @@ class Dsv4Mxfp4MarlinFill(ExpertFill):
             if not cache._STORE_CACHE_LOGGED:
                 cache._STORE_CACHE_LOGGED = True
                 logger.info(
-                    "[paged-experts] host store loading from the repack cache (%s)", cache_dir
+                    "[paged-experts] host store loading from the repack cache (%s)",
+                    cache_dir,
                 )
         else:
             _fill_dsv4_mxfp4_marlin_from_checkpoint(store, model_path, layer_idx)

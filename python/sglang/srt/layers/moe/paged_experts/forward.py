@@ -30,8 +30,18 @@ import torch
 # ships dark and gives a clean A/B.
 _SHARED_OVERLAP_ON = os.environ.get("SGLANG_PE_SHARED_OVERLAP") not in (None, "", "0")
 
+
 # SGLANG_PE_NO_SCRATCH=1: disable the double-buffered scratch prefill pipeline (fall back to waves).
-_SCRATCH_DISABLED = os.environ.get("SGLANG_PE_NO_SCRATCH") not in (None, "", "0")
+def _scratch_disabled() -> bool:
+    from sglang.srt.layers.moe.paged_experts import flags as _pe_flags
+
+    return _pe_flags.resolve(
+        arg_name="paged_experts_disable_scratch_prefill",
+        env_name="SGLANG_PE_NO_SCRATCH",
+        cast=lambda v: str(v) not in ("", "0", "False", "false"),
+        default=False,
+    )
+
 
 # SGLANG_PE_WAVE_SKIP=1: in the wave path, leave out-of-wave pairs at id -1 instead of clamping them to
 # slot 0, so the aligner drops them and marlin never GEMMs them (see the flag's note in fused_marlin_moe).
@@ -57,13 +67,16 @@ class OverlapHandle:
 
     def __init__(self, fn):
         self.fn = fn
-        self.result = None  # the placement sets this iff it ran fn; else None -> caller runs fn
+        self.result = (
+            None  # the placement sets this iff it ran fn; else None -> caller runs fn
+        )
 
 
 @contextlib.contextmanager
 def shared_expert_overlap(fn):
     """Register ``fn`` (router-independent work) for the paged keep-warm path to overlap with the routed
-    page-in. Yields a handle whose ``.result`` is ``fn()``'s output when the overlap ran it, else None."""
+    page-in. Yields a handle whose ``.result`` is ``fn()``'s output when the overlap ran it, else None.
+    """
     h = OverlapHandle(fn)
     prev = getattr(_OVERLAP, "handle", None)
     _OVERLAP.handle = h
@@ -144,7 +157,9 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
                 device=s2l.device,
             )
         idx.copy_(s2l)  # int32 slot->logical -> int64 index buffer (no alloc)
-        idx.clamp_(min=0)  # empty slots (-1) -> 0; their GEMM output is masked out downstream
+        idx.clamp_(
+            min=0
+        )  # empty slots (-1) -> 0; their GEMM output is masked out downstream
         torch.index_select(method._nvfp4_stacked, 1, idx, out=method._nvfp4_gathered)
         for i, nm in enumerate(method._nvfp4_names):
             getattr(layer, nm).data.copy_(method._nvfp4_gathered[i])
@@ -166,7 +181,9 @@ def _refresh_nvfp4_scalars(method, layer, logical_to_slot=None):
         for nm, full in fe.items():
             tgt = getattr(layer, nm).data
             if full.dim() == 0:
-                tgt.copy_(full)  # per-tensor scalar (input_scale_quant is 0-dim) — no per-slot scatter
+                tgt.copy_(
+                    full
+                )  # per-tensor scalar (input_scale_quant is 0-dim) — no per-slot scatter
             else:
                 tgt[slots] = full[resident]
 
@@ -207,8 +224,13 @@ def _paranoia_audit(method, layer):
                 log.error(
                     "[paranoia] step %d L%s: WEIGHT bytes diverge: logical %d in slot %d, "
                     "%d/%d bytes differ, first at offset %d",
-                    step, getattr(layer, "layer_id", "?"), e, s_,
-                    nz.numel(), gslot.numel(), int(nz[0]),
+                    step,
+                    getattr(layer, "layer_id", "?"),
+                    e,
+                    s_,
+                    nz.numel(),
+                    gslot.numel(),
+                    int(nz[0]),
                 )
                 return
         # (b) scalar: slot alpha vs full-E table
@@ -220,11 +242,18 @@ def _paranoia_audit(method, layer):
                 log.error(
                     "[paranoia] step %d L%s: SCALAR diverges: logical %d in slot %d, "
                     "g1_alpha got %.6g want %.6g",
-                    step, getattr(layer, "layer_id", "?"), e, s_, got, want,
+                    step,
+                    getattr(layer, "layer_id", "?"),
+                    e,
+                    s_,
+                    got,
+                    want,
                 )
                 return
     if step % 200 == 0:
-        log.warning("[paranoia] step %d: %d resident slots verified clean", step, checked)
+        log.warning(
+            "[paranoia] step %d: %d resident slots verified clean", step, checked
+        )
 
 
 def _gemm_hidden(
@@ -247,7 +276,9 @@ def _gemm_hidden(
     """
     topk_output = dispatch_output.topk_output
     tw = topk_output.topk_weights
-    mask = remap >= 0  # compute once; scalar `0` in where avoids two throwaway zeros_like allocs
+    mask = (
+        remap >= 0
+    )  # compute once; scalar `0` in where avoids two throwaway zeros_like allocs
     masked_tw = torch.where(mask, tw, 0.0)
     if wave_skip and _WAVE_SKIP:
         # Leave masked ids NEGATIVE: the aligner drops them (ignore_invalid_expert), so no GEMM block
@@ -315,7 +346,7 @@ def _scratch_prefill_apply(method, layer, dispatch_output, topk_ids, distinct=No
     pager = method._pager
     if torch.cuda.is_current_stream_capturing():
         return None
-    if _SCRATCH_DISABLED:
+    if _scratch_disabled():
         # SGLANG_PE_NO_SCRATCH=1: kill-switch — route prefill through the wave path instead. Isolation
         # lever for a concurrency crash observed INSIDE the scratch pipeline (illegal access surfacing at
         # the GEMM1->swiglu boundary with interleaved multi-request chunked prefills); the banked
@@ -537,7 +568,12 @@ def _ondevice_wave_apply(method, layer, dispatch_output, topk_ids):
             if fused is not None:
                 safe_ids, masked_tw = fused
                 partial = _gemm_hidden_fused(
-                    method, layer, dispatch_output, safe_ids, masked_tw, clone_hidden=True
+                    method,
+                    layer,
+                    dispatch_output,
+                    safe_ids,
+                    masked_tw,
+                    clone_hidden=True,
                 )
             else:
                 remap = mask_and_remap_expert_ids(
