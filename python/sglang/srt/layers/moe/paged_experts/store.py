@@ -363,6 +363,55 @@ class PinnedExpertStore(ExpertStore):
 
     pinned = True
 
+    _fused_pagein = (
+        None  # (stores, slots, e16s, straggler_names, n_buf) or False when ineligible
+    )
+
+    def _fused_pagein_tables(self):
+        """Descriptor tables for the ONE-launch multi-tensor page-in (built once; pointers are stable —
+        the slot pool and pinned host store are allocated at init and never reallocated). Tensors whose
+        per-expert block is not 16-byte aligned (the float4 copy unit) stay on the per-tensor
+        ``transfer_kv`` path as stragglers."""
+        if self._fused_pagein is None:
+            import os as _os
+
+            if _os.environ.get("SGLANG_PE_FUSED_PAGEIN", "1") == "0":
+                self._fused_pagein = False
+                return self._fused_pagein
+            try:
+                from sglang.kernels.jit.paged_experts_decide import (
+                    paged_experts_host_devptr,
+                )
+
+                eligible = [n for n in self.gpu if self.item_bytes[n] % 16 == 0]
+                if len(eligible) < 2:
+                    self._fused_pagein = False
+                    return self._fused_pagein
+                dev = next(iter(self.gpu.values())).device
+                stores = torch.tensor(
+                    [paged_experts_host_devptr(self.host[n]) for n in eligible],
+                    dtype=torch.int64,
+                    device=dev,
+                )
+                slots = torch.tensor(
+                    [self.gpu[n].data.data_ptr() for n in eligible],
+                    dtype=torch.int64,
+                    device=dev,
+                )
+                e16s = torch.tensor(
+                    [self.item_bytes[n] // 16 for n in eligible],
+                    dtype=torch.int64,
+                    device=dev,
+                )
+                stragglers = [n for n in self.gpu if n not in eligible]
+                n_buf = torch.zeros(1, dtype=torch.int32, device=dev)
+                self._fused_pagein = (stores, slots, e16s, stragglers, n_buf)
+            except Exception:
+                self._fused_pagein = (
+                    False  # jit module unavailable: per-tensor fallback
+                )
+        return self._fused_pagein
+
     def page_in(
         self,
         src_experts: torch.Tensor,
@@ -377,10 +426,32 @@ class PinnedExpertStore(ExpertStore):
             return
         from sgl_kernel import transfer_kv_per_layer_mla
 
-        for name, gpu_param in self.gpu.items():
+        fused = self._fused_pagein_tables() if src_experts.is_cuda else False
+        if fused:
+            from sglang.kernels.jit.paged_experts_decide import (
+                paged_experts_gather_multi,
+            )
+
+            stores, slots, e16s, stragglers, n_buf = fused
+            src32 = (
+                src_experts
+                if src_experts.dtype == torch.int32
+                else src_experts.to(torch.int32)
+            )
+            dst32 = (
+                dst_slots
+                if dst_slots.dtype == torch.int32
+                else dst_slots.to(torch.int32)
+            )
+            n_buf.fill_(int(src_experts.numel()))
+            paged_experts_gather_multi(stores, slots, e16s, src32, dst32, n_buf)
+            names = stragglers
+        else:
+            names = list(self.gpu)
+        for name in names:
             transfer_kv_per_layer_mla(
                 src=self.host[name],
-                dst=gpu_param.data,
+                dst=self.gpu[name].data,
                 src_indices=src_experts,
                 dst_indices=dst_slots,
                 item_size=self.item_bytes[name],
