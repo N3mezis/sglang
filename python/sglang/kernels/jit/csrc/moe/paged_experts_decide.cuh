@@ -14,13 +14,12 @@
 
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 
-#include <cstdlib>  // std::getenv / std::atoi (env-tunable gather grid for C2C)
-
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
 #include <climits>
 #include <cstdint>
+#include <cstdlib>         // std::getenv / std::atoi (env-tunable gather grid for C2C)
 #include <cuda_runtime.h>  // For cudaHostGetDevicePointer (UVA device pointer of the pinned store)
 
 namespace {
@@ -116,8 +115,7 @@ SGL_DEVICE int pick_victim_warp(
     const int f = (lfu && se >= 0) ? freq[se] : 0;
     const int lu = slot_lastuse[s];
     // (cold, f, lu) smaller wins; tie -> lower slot index (serial keeps the first, i.e. lowest, s).
-    if (cold < b_cold ||
-        (cold == b_cold && (f < b_f || (f == b_f && (lu < b_lu || (lu == b_lu && s < b_s)))))) {
+    if (cold < b_cold || (cold == b_cold && (f < b_f || (f == b_f && (lu < b_lu || (lu == b_lu && s < b_s)))))) {
       b_cold = cold;
       b_f = f;
       b_lu = lu;
@@ -129,8 +127,7 @@ SGL_DEVICE int pick_victim_warp(
     const int of = __shfl_down_sync(0xffffffffu, b_f, off);
     const int ol = __shfl_down_sync(0xffffffffu, b_lu, off);
     const int os = __shfl_down_sync(0xffffffffu, b_s, off);
-    if (oc < b_cold ||
-        (oc == b_cold && (of < b_f || (of == b_f && (ol < b_lu || (ol == b_lu && os < b_s)))))) {
+    if (oc < b_cold || (oc == b_cold && (of < b_f || (of == b_f && (ol < b_lu || (ol == b_lu && os < b_s)))))) {
       b_cold = oc;
       b_f = of;
       b_lu = ol;
@@ -193,11 +190,10 @@ __global__ void decide_kernel(
   int n = 0;
   for (int i = 0; i < topk_n; ++i) {
     const int e = topk[i];
-    if (e < 0 || e >= E) continue;        // warp-uniform
-    if (expert_slot[e] >= 0) continue;    // warp-uniform: resident (or just assigned this step)
-    const int victim =
-        pick_victim_warp(lane, topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, nullptr, pin);
-    if (victim < 0) continue;             // warp-uniform (broadcast): pool too small (shouldn't happen)
+    if (e < 0 || e >= E) continue;      // warp-uniform
+    if (expert_slot[e] >= 0) continue;  // warp-uniform: resident (or just assigned this step)
+    const int victim = pick_victim_warp(lane, topk, topk_n, K, lfu, slot_expert, slot_lastuse, freq, nullptr, pin);
+    if (victim < 0) continue;  // warp-uniform (broadcast): pool too small (shouldn't happen)
     if (lane == 0) {
       const int old = slot_expert[victim];
       if (old >= 0) expert_slot[old] = -1;
@@ -407,7 +403,8 @@ __global__ void decide_wave_kernel(
     }
     return;
   }
-  for (int i = tid; i < K; i += nthr) sflag[i] = 0;
+  for (int i = tid; i < K; i += nthr)
+    sflag[i] = 0;
   __syncthreads();
   for (int i = tid; i < topk_n; i += nthr) {
     const int e = topk[i];
@@ -559,26 +556,27 @@ void decide(
   const DLDevice device = device_.unwrap();
 
   auto* decide_kern = pe_use_pdl() ? decide_kernel<true> : decide_kernel<false>;
-  LaunchKernel(1, 32, device).config({.use_pdl = pe_use_pdl()})(
-      decide_kern,
-      static_cast<const int32_t*>(topk.data_ptr()),
-      t,
-      e,
-      k,
-      static_cast<int>(lfu),
-      static_cast<int>(pin),
-      static_cast<int32_t*>(step_ctr.data_ptr()),
-      static_cast<int32_t*>(slot_expert.data_ptr()),
-      static_cast<int32_t*>(expert_slot.data_ptr()),
-      static_cast<int32_t*>(slot_lastuse.data_ptr()),
-      static_cast<int32_t*>(freq.data_ptr()),
-      static_cast<int32_t*>(src.data_ptr()),
-      static_cast<int32_t*>(dst.data_ptr()),
-      static_cast<int32_t*>(n_out.data_ptr()),
-      static_cast<int32_t*>(idx.data_ptr()),
-      nullptr,
-      nullptr,
-      nullptr);
+  LaunchKernel(1, 32, device)
+      .config({.use_pdl = pe_use_pdl()})(
+          decide_kern,
+          static_cast<const int32_t*>(topk.data_ptr()),
+          t,
+          e,
+          k,
+          static_cast<int>(lfu),
+          static_cast<int>(pin),
+          static_cast<int32_t*>(step_ctr.data_ptr()),
+          static_cast<int32_t*>(slot_expert.data_ptr()),
+          static_cast<int32_t*>(expert_slot.data_ptr()),
+          static_cast<int32_t*>(slot_lastuse.data_ptr()),
+          static_cast<int32_t*>(freq.data_ptr()),
+          static_cast<int32_t*>(src.data_ptr()),
+          static_cast<int32_t*>(dst.data_ptr()),
+          static_cast<int32_t*>(n_out.data_ptr()),
+          static_cast<int32_t*>(idx.data_ptr()),
+          nullptr,
+          nullptr,
+          nullptr);
 }
 
 // decide + fused forward remap (paged-experts #4): same residency decision as ``decide``, but the same
@@ -623,26 +621,27 @@ void decide_remap(
   const DLDevice device = device_.unwrap();
 
   auto* decide_kern = pe_use_pdl() ? decide_kernel<true> : decide_kernel<false>;
-  LaunchKernel(1, 32, device).config({.use_pdl = pe_use_pdl()})(
-      decide_kern,
-      static_cast<const int32_t*>(topk.data_ptr()),
-      t,
-      e,
-      k,
-      static_cast<int>(lfu),
-      static_cast<int>(pin),
-      static_cast<int32_t*>(step_ctr.data_ptr()),
-      static_cast<int32_t*>(slot_expert.data_ptr()),
-      static_cast<int32_t*>(expert_slot.data_ptr()),
-      static_cast<int32_t*>(slot_lastuse.data_ptr()),
-      static_cast<int32_t*>(freq.data_ptr()),
-      static_cast<int32_t*>(src.data_ptr()),
-      static_cast<int32_t*>(dst.data_ptr()),
-      static_cast<int32_t*>(n_out.data_ptr()),
-      static_cast<int32_t*>(idx.data_ptr()),
-      static_cast<const float*>(tw.data_ptr()),
-      static_cast<int32_t*>(safe_ids.data_ptr()),
-      static_cast<float*>(masked_tw.data_ptr()));
+  LaunchKernel(1, 32, device)
+      .config({.use_pdl = pe_use_pdl()})(
+          decide_kern,
+          static_cast<const int32_t*>(topk.data_ptr()),
+          t,
+          e,
+          k,
+          static_cast<int>(lfu),
+          static_cast<int>(pin),
+          static_cast<int32_t*>(step_ctr.data_ptr()),
+          static_cast<int32_t*>(slot_expert.data_ptr()),
+          static_cast<int32_t*>(expert_slot.data_ptr()),
+          static_cast<int32_t*>(slot_lastuse.data_ptr()),
+          static_cast<int32_t*>(freq.data_ptr()),
+          static_cast<int32_t*>(src.data_ptr()),
+          static_cast<int32_t*>(dst.data_ptr()),
+          static_cast<int32_t*>(n_out.data_ptr()),
+          static_cast<int32_t*>(idx.data_ptr()),
+          static_cast<const float*>(tw.data_ptr()),
+          static_cast<int32_t*>(safe_ids.data_ptr()),
+          static_cast<float*>(masked_tw.data_ptr()));
 }
 
 void decide_bounded(
@@ -828,15 +827,16 @@ void gather_multi(
     return e && std::atoi(e) > 0 ? std::atoi(e) : 512;
   }();
   auto* gm_kern = pe_use_pdl() ? gather_multi_kernel<true> : gather_multi_kernel<false>;
-  LaunchKernel(gm_grid, gm_block, device).config({.use_pdl = pe_use_pdl()})(
-      gm_kern,
-      static_cast<const int64_t*>(stores.data_ptr()),
-      static_cast<const int64_t*>(slots.data_ptr()),
-      static_cast<const int64_t*>(e16s.data_ptr()),
-      nt,
-      static_cast<const int32_t*>(src.data_ptr()),
-      static_cast<const int32_t*>(dst.data_ptr()),
-      static_cast<const int32_t*>(n_out.data_ptr()));
+  LaunchKernel(gm_grid, gm_block, device)
+      .config({.use_pdl = pe_use_pdl()})(
+          gm_kern,
+          static_cast<const int64_t*>(stores.data_ptr()),
+          static_cast<const int64_t*>(slots.data_ptr()),
+          static_cast<const int64_t*>(e16s.data_ptr()),
+          nt,
+          static_cast<const int32_t*>(src.data_ptr()),
+          static_cast<const int32_t*>(dst.data_ptr()),
+          static_cast<const int32_t*>(n_out.data_ptr()));
 }
 
 void scatter_multi(

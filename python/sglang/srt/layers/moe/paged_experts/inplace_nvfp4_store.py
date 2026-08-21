@@ -245,7 +245,7 @@ class _SlabPool:
         ]  # row views; each is contiguous + pinned
         self.mv = [memoryview(s.numpy()) for s in self.slabs]
         self.free = list(range(self.n))
-        self.lru: "OrderedDict" = OrderedDict()  # key -> slab_idx (most-recent last)
+        self.lru: OrderedDict = OrderedDict()  # key -> slab_idx (most-recent last)
         self.lock = threading.Lock()
         self.hits = 0
         self.misses = 0
@@ -471,7 +471,7 @@ def _mem_census(tag: str) -> None:
         logging.getLogger(__name__).warning("[paged-experts] mem census failed: %r", e)
 
 
-def _get_pool(slab_bytes: int) -> "_SlabPool":
+def _get_pool(slab_bytes: int) -> _SlabPool:
     """Lazily create the global pinned slab pool on FIRST page-in (inference), not at store __init__
     (which runs in process_weights_after_loading, during the load window). Deferring keeps the multi-GB
     pin off the load-time RAM peak — the load completes on the loader footprint, then the pin allocates

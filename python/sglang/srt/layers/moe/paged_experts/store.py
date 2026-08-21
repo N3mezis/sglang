@@ -17,8 +17,6 @@ Future tiers (disk-mmap, compressed) are additional ``ExpertStore`` subclasses â
 
 from __future__ import annotations
 
-import ctypes
-import json
 import logging
 import math
 import mmap
@@ -1018,7 +1016,7 @@ class SwapExpertStore(ExpertStore):
             for name, p in self.gpu.items():
                 self.host[name] = _pinned_empty((self._rows, *p.shape[1:]), p.dtype)
             # initial layout: expert e in slot e for e<K; expert K+i in host row i.
-            self.expert_row: "OrderedDict[int, int]" = OrderedDict(
+            self.expert_row: OrderedDict[int, int] = OrderedDict(
                 (self.K + i, i) for i in range(self.E - self.K)
             )
             self.free_rows = list(range(self.E - self.K, self.E - self.K + self._spare))
@@ -1050,7 +1048,7 @@ class SwapExpertStore(ExpertStore):
         # residency bookkeeping shared by both modes.
         self.slot_expert = list(range(self.K))  # slot -> expert
         self.expert_slot = {e: e for e in range(self.K)}  # pool-resident expert -> slot
-        self._row_release: Dict[int, "torch.cuda.Event"] = (
+        self._row_release: Dict[int, torch.cuda.Event] = (
             {}
         )  # freed row -> event of its last promote-read
         self._d2h_stream = (

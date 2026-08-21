@@ -3,7 +3,6 @@
 import os  # noqa: E402  (used by the verbatim body below)
 from typing import Dict
 
-import torch
 
 from ..store import ExpertStore
 from .base import ExpertFill

@@ -11,8 +11,6 @@ offline artifact) lives in ``setup_pager`` below.
 
 from __future__ import annotations
 
-import functools
-import json
 import logging
 import os
 import time

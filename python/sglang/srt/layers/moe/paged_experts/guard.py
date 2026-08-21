@@ -155,7 +155,7 @@ def check_paged_experts_quant(hf_text_config: Any) -> None:
             g = next(iter(groups.values()), {}) or {}
             w = g.get("weights", {}) or {}
             act = g.get("input_activations") or {}
-            strat = (w.get("strategy") or "").lower()
+            strategy = (w.get("strategy") or "").lower()
             if (w.get("num_bits") or 8) != 8 or (
                 w.get("type") or "float"
             ).lower() != "float":
@@ -166,10 +166,10 @@ def check_paged_experts_quant(hf_text_config: Any) -> None:
             # Only per-CHANNEL weight scales ([out,1] rows that page) are wired + tested. Per-tensor
             # fp8 has [E]/[E,2] scalar scales that need the resident-scalar path (as nvfp4 does) and a
             # different fill; no per-tensor+dynamic checkpoint exists in the wild to validate, so reject.
-            if strat not in ("channel", ""):
+            if strategy not in ("channel", ""):
                 raise RuntimeError(
                     f"Paged Experts supports compressed-tensors fp8 float-quantized only with "
-                    f"per-channel weight scales; this checkpoint uses strategy={strat!r} (per-tensor "
+                    f"per-channel weight scales; this checkpoint uses strategy={strategy!r} (per-tensor "
                     "fp8 scalar scales are not wired)."
                 )
             if act and not act.get("dynamic", False):
