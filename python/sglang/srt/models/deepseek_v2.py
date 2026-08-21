@@ -110,6 +110,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
+from sglang.srt.layers.moe.paged_experts import route_probe as _route_probe
 from sglang.srt.layers.moe.topk import BypassedTopKOutput, TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
@@ -1004,6 +1005,8 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
                 **topk_kwargs,
             )
+        if _route_probe.ON and hidden_states.shape[0] == 1:
+            _route_probe.probe(self, hidden_states, router_logits, topk_output)
         deferred_finalize = (
             has_shared_output
             and not self._shared_expert_tp1

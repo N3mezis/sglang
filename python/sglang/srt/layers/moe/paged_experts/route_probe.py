@@ -80,6 +80,18 @@ def _report():
             log("[route-probe] W=%d n=%d | %s", W, n, "  ".join(cells))
 
 
+
+def _rank_scores(moe, router_logits: torch.Tensor) -> torch.Tensor:
+    """Flat [E] scores in the model's own selection order. Qwen-style softmax top-k is monotone in raw
+    logits; DeepSeek-style routers select on sigmoid(logits) + e_score_correction_bias, which REORDERS —
+    mirror it when the bias exists (same handling as prefetch._scores)."""
+    rl = router_logits.flatten().float()
+    bias = getattr(moe.gate, "e_score_correction_bias", None)
+    if bias is not None:
+        return torch.sigmoid(rl) + bias.flatten().float()
+    return rl
+
+
 def probe(moe, hidden, router_logits, topk_output):
     global _prev_layer, _tokens
     if _tokens >= _MAX or hidden.shape[0] != 1:
@@ -87,7 +99,7 @@ def probe(moe, hidden, router_logits, topk_output):
     L = moe.layer_id
     try:
         actual = set(int(x) for x in topk_output.topk_ids.flatten().tolist())
-        logits = router_logits.flatten().float()
+        logits = _rank_scores(moe, router_logits)
     except Exception:
         return
     k = len(actual) or 8
@@ -134,8 +146,8 @@ def probe(moe, hidden, router_logits, topk_output):
         if hp is None:
             continue
         try:
-            srl, _ = moe.gate(hp)
-            srl = srl.flatten().float()
+            out = moe.gate(hp)
+            srl = _rank_scores(moe, out[0] if isinstance(out, tuple) else out)
             svals, sidx = torch.topk(srl, min(maxrank, srl.numel()))
             sranked = sidx.tolist()
         except Exception:
