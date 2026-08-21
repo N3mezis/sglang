@@ -2613,19 +2613,6 @@ class ServerArgs:
         "best prior for the generation's working set; biggest effect on short outputs (agent turns), "
         "which otherwise spend most of their decode re-faulting the working set. LRU adapts from there.",
     ] = False
-    paged_experts_swap_ram_gb: A[
-        Optional[float],
-        "PER-MOE-LAYER RAM cache budget (GB) for the swap store's disk mode. Default (unset) auto-sizes "
-        "from MemAvailable / MoE-layer count; set explicitly when running >RAM models (auto-sizing is "
-        "conservative, and total = this x MoE layers must stay well under host RAM). Env fallback: "
-        "SGLANG_PE_SWAP_RAM_GB.",
-    ] = None
-    paged_experts_pin_gb: A[
-        Optional[float],
-        "Pinned slab-cache budget (GB, GLOBAL) for the in-place NVFP4 store. Pinned memory cannot swap: "
-        "over-pinning can thrash the host or kill SSH — keep total pinned well under free RAM (e.g. 8 on "
-        "a 62 GB box under load). Default 20. Env fallback: SGLANG_INPLACE_PIN_GB.",
-    ] = None
     paged_experts_disable_scratch_prefill: A[
         bool,
         "Disable the scratch streaming-prefill pipeline and prefill through the wave path instead. "

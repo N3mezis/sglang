@@ -114,6 +114,11 @@ _NONPAGED_SUFFIXES = (
 )
 
 
+_SWAP_AUTO_BUDGET_TOTAL = (
+    None  # whole-model auto budget, resolved once (see _auto_ram_rows)
+)
+
+
 def _host_available_bytes() -> int:
     """Available host memory in bytes (Linux ``/proc/meminfo`` ``MemAvailable``), or 0 if unknown."""
     try:
@@ -1061,24 +1066,20 @@ class SwapExpertStore(ExpertStore):
         small forces disk spillover; sized >= E-K degenerates to the pure single-copy swap (no disk).
         """
         row_bytes = max(1, sum(self.item_bytes.values()))
-        from sglang.srt.layers.moe.paged_experts import flags as _pe_flags
-
-        gb = _pe_flags.resolve(
-            arg_name="paged_experts_swap_ram_gb",
-            env_name="SGLANG_PE_SWAP_RAM_GB",
-            cast=float,
-            default=None,
-        )
-        if gb:
+        gb = os.environ.get("SGLANG_PE_SWAP_RAM_GB")
+        if gb not in (None, ""):
             budget = float(gb) * 1e9
         else:
-            avail = _host_available_bytes()
-            # MemAvailable is a WHOLE-HOST number but this budget is charged PER MoE LAYER, so it must be
-            # divided by the layer count: 0.15 * avail per layer on a 48-layer model asks for 7.2x
-            # MemAvailable and thrashes the host to death (sshd starves before the loader finishes).
-            # Take a quarter of MemAvailable for the WHOLE model and split it evenly across layers.
-            nlayers = max(1, _moe_layer_count_hint())
-            budget = (0.25 * avail / nlayers) if avail else (2e9 / nlayers)
+            # MemAvailable is a WHOLE-HOST number but this budget is charged PER MoE LAYER, so it must
+            # be divided by the layer count (0.15 * avail PER LAYER once asked for 7.2x MemAvailable and
+            # thrashed the host to death). Resolve the whole-model budget ONCE and cache it: per-layer
+            # stores initialize sequentially and each init shrinks MemAvailable, so re-reading it per
+            # layer hands later layers systematically smaller caches.
+            global _SWAP_AUTO_BUDGET_TOTAL
+            if _SWAP_AUTO_BUDGET_TOTAL is None:
+                avail = _host_available_bytes()
+                _SWAP_AUTO_BUDGET_TOTAL = (0.25 * avail) if avail else 2e9
+            budget = _SWAP_AUTO_BUDGET_TOTAL / max(1, _moe_layer_count_hint())
         return max(1, int(budget // row_bytes))
 
     def fill_tensor(self, name: str, full: torch.Tensor) -> None:

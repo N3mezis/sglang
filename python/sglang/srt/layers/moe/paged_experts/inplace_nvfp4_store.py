@@ -45,17 +45,22 @@ _READ_POOL = ThreadPoolExecutor(
 
 
 def _pin_budget() -> int:
-    from sglang.srt.layers.moe.paged_experts import flags as _pe_flags
+    """Pinned slab-cache budget, auto-sized from LIVE host state. The pool is created lazily at the
+    first page-in — after weights, KV and the rest of boot have already claimed their memory — so
+    MemAvailable at that moment is the honest budget base: take half of what remains beyond an 8 GB
+    host reserve (pinned memory cannot swap; over-pinning thrashes the box and can starve sshd),
+    floored at 2 GB so tiny hosts still get a working cache. ``SGLANG_INPLACE_PIN_GB`` remains as an
+    explicit override escape hatch."""
+    env = os.environ.get("SGLANG_INPLACE_PIN_GB")
+    if env not in (None, ""):
+        return int(float(env) * 1e9)
+    from sglang.srt.layers.moe.paged_experts.store import _host_available_bytes
 
-    return int(
-        _pe_flags.resolve(
-            arg_name="paged_experts_pin_gb",
-            env_name="SGLANG_INPLACE_PIN_GB",
-            cast=float,
-            default=20.0,
-        )
-        * 1e9
-    )
+    avail = _host_available_bytes()
+    if not avail:
+        return int(8e9)  # /proc/meminfo unreadable: small and safe
+    budget = 0.5 * max(0.0, avail - 8e9)
+    return int(max(2e9, budget))
 
 
 # O_DIRECT: DMA weight reads straight past the page cache. The buffered path caps ~2.7 GB/s under RAM
