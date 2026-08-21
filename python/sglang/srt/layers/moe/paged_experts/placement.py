@@ -18,6 +18,7 @@ is a new subclass — no ``use_ondevice`` bool threaded through method / pager /
 from __future__ import annotations
 
 import logging
+import os
 from abc import ABC, abstractmethod
 
 import torch
@@ -49,6 +50,61 @@ class Placement(ABC):
         """Decide + page-in + run the K-slot GEMM for one step; return a ``StandardCombineInput``."""
 
 
+# --- tau-dial: weight-gated cold-miss skipping (SGLANG_PE_TAU, default 0 = off) -----------------
+# On a disk-backed cold tier the step time is ~proportional to fetched bytes, so skipping the routed
+# pairs that are BOTH cold (a fetch away) AND low-weight (weight < TAU * the token's max weight) trades
+# a bounded output approximation for a linear byte saving. APPROXIMATE-MoE: quality must be measured
+# alongside any throughput number (two-axis price sheet). Mechanism: the skipped pair is redirected to
+# the token's own top-1 expert (never skipped, by construction) with weight zeroed — no fetch is
+# planned, no new kernel path runs, the redundant row contributes exactly nothing through the weighted
+# reduce. Wasted compute on one resident row; saved disk bytes. Skips are LOGGED per expert
+# (SGLANG_PE_TAU_LOG_EVERY layer-calls) so the skip distribution can be cross-referenced against
+# frequency tails from other modalities. Runs before decide AND before the keep-warm/wave branch, so
+# it also shrinks the distinct set. Side effect: LFU freq counts see the redirected top-1 id twice.
+_TAU = float(os.environ.get("SGLANG_PE_TAU", "0"))
+_TAU_LOG_EVERY = int(os.environ.get("SGLANG_PE_TAU_LOG_EVERY", "2000"))
+_tau_calls = 0
+_tau_pairs = 0
+_tau_skipped = 0
+_tau_mass_skipped = 0.0
+_tau_hist = None
+
+
+def _tau_skip(pager, topk_output):
+    global _tau_calls, _tau_pairs, _tau_skipped, _tau_mass_skipped, _tau_hist
+    ids, w = topk_output.topk_ids, topk_output.topk_weights
+    if ids.numel() == 0 or w is None:
+        return
+    m = pager.logical_to_gpu_index_cuda
+    valid = (ids >= 0) & (ids < m.numel())
+    safe = torch.where(valid, ids, torch.zeros_like(ids))
+    miss = (m[safe.long()] < 0) & valid
+    wmax = w.max(dim=-1, keepdim=True).values
+    skip = miss & (w < _TAU * wmax)
+    _tau_calls += 1
+    _tau_pairs += int(ids.numel())
+    if bool(skip.any()):
+        if _tau_hist is None:
+            _tau_hist = torch.zeros(m.numel(), dtype=torch.int64, device=ids.device)
+        _tau_hist.index_add_(
+            0, ids[skip].long(), torch.ones(int(skip.sum()), dtype=torch.int64, device=ids.device)
+        )
+        _tau_mass_skipped += float(w[skip].sum())
+        _tau_skipped += int(skip.sum())
+        top1 = w.argmax(dim=-1, keepdim=True)
+        top1_ids = ids.gather(-1, top1)
+        ids.copy_(torch.where(skip, top1_ids.expand_as(ids), ids))
+        w.masked_fill_(skip, 0.0)
+    if _TAU_LOG_EVERY and _tau_calls % _TAU_LOG_EVERY == 0:
+        top = torch.topk(_tau_hist, 10)
+        logger.info(
+            "[tau-dial] tau=%.2f calls=%d skipped=%d/%d pairs (%.1f%%) mass_skipped=%.1f | top skipped experts: %s",
+            _TAU, _tau_calls, _tau_skipped, _tau_pairs, 100 * _tau_skipped / max(1, _tau_pairs),
+            _tau_mass_skipped,
+            " ".join(f"e{int(i)}:{int(c)}" for i, c in zip(top.indices.tolist(), top.values.tolist()) if c > 0),
+        )
+
+
 class EagerPlacement(Placement):
     """Host decide (keep-warm + LRU/LFU) + ``transfer_kv`` page-in. Kernel-free; requires
     ``--disable-cuda-graph`` (the host decision is data-dependent, so the step is not capturable).
@@ -60,6 +116,8 @@ class EagerPlacement(Placement):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
         pager = method._pager
+        if _TAU > 0.0:
+            _tau_skip(pager, dispatch_output.topk_output)
         topk_ids = dispatch_output.topk_output.topk_ids
         distinct = pager.distinct_active(topk_ids)
         if len(distinct) <= pager.K:  # keep-warm: page only the misses
