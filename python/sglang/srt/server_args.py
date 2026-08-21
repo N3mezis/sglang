@@ -2613,14 +2613,6 @@ class ServerArgs:
         "best prior for the generation's working set; biggest effect on short outputs (agent turns), "
         "which otherwise spend most of their decode re-faulting the working set. LRU adapts from there.",
     ] = False
-    paged_experts_tau: A[
-        Optional[float],
-        "Weight-gated cold-miss skipping (APPROXIMATE MoE — changes outputs; quality must be validated "
-        "per workload). Routed pairs that are both COLD (a fetch away) and low-weight (weight < tau x the "
-        "token's max weight) are dropped instead of fetched: ~1/bytes speedup on disk-backed cold tiers. "
-        "Measured on Laguna/jixi: tau=0.5 -> ~1.8x decode with prose intact but arithmetic degraded; "
-        "reasoning workloads should keep this off. Default off (0). Env fallback: SGLANG_PE_TAU.",
-    ] = None
     paged_experts_swap_ram_gb: A[
         Optional[float],
         "PER-MOE-LAYER RAM cache budget (GB) for the swap store's disk mode. Default (unset) auto-sizes "
