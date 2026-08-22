@@ -140,9 +140,21 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         captured_fn = (
             eager_on_graph(True)(forward_fn) if self._debug_eager else forward_fn
         )
+        # ROWS, not batch size. ``shape_key.size`` is the batch size for a non-ragged graph
+        # (``_capture_graph_size`` returns ``bs``), but the body emits one row per TOKEN --
+        # ``bs * num_draft_tokens`` under speculative target-verify. Sizing the shared buffer and
+        # capping ``out_rows`` by ``size`` therefore stored a 1-row slice for a bs=1 / draft=4 verify
+        # graph, and replay handed back logits for one position instead of four
+        # (eagle_sample: "shape '[1, 4]' is invalid for input of size 1"). Plain decode hid it because
+        # there bs == num_tokens. Capture runs largest-shape-first (`reversed(capture_bs)`, so the pool
+        # is allocated for the big shapes), so the first warmup output has the max row count and is the
+        # right basis for the one-time allocation.
         size = shape_key.size
         if self._shared_output_buffer is None:
-            self._shared_output_buffer = self._alloc_full_buffer(warmup_out, size)
+            self._shared_output_buffer = self._alloc_full_buffer(
+                warmup_out, self._leading_rows(warmup_out, size)
+            )
+        buffer_rows = self._leading_rows(self._shared_output_buffer, size)
         with graph_pool_capture_scope(), BreakableCUDAGraphCapture(
             cuda_graph=graph,
             pool=self._pool,
@@ -150,7 +162,14 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             barrier_fn=self._tp_group.barrier,
         ):
             out = captured_fn()
-            out_rows = self._output_rows(out, size)
+            produced = self._leading_rows(out, buffer_rows)
+            if produced > buffer_rows:
+                raise RuntimeError(
+                    f"breakable graph capture for {shape_key}: body produced {produced} output rows "
+                    f"but the shared output buffer holds {buffer_rows}. Capture must run "
+                    f"largest-shape-first so the first allocation is the widest."
+                )
+            out_rows = self._output_rows(out, buffer_rows)
             self._copy_output_to_buffer(out, self._shared_output_buffer, out_rows)
 
         stored = self._slice_output(self._shared_output_buffer, out_rows)
@@ -158,6 +177,27 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._outputs[shape_key] = stored
         # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
         self._capture_inputs[shape_key] = capture_inputs
+
+    def _leading_rows(self, output: Any, fallback: int) -> int:
+        """Leading-dim length of the first tensor in ``output``, else ``fallback``. Unlike
+        :meth:`_output_rows` this does not clamp -- it reports what the structure actually carries, so
+        it can size the buffer and detect a body that outgrew it."""
+        if torch.is_tensor(output):
+            return output.shape[0]
+        if isinstance(output, PPProxyTensors):
+            rows = [t.shape[0] for t in output.tensors.values()]
+            return max(rows) if rows else fallback
+        if isinstance(output, (list, tuple)):
+            rows = [self._leading_rows(o, fallback) for o in output if o is not None]
+            return max(rows) if rows else fallback
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            rows = [
+                self._leading_rows(v, fallback)
+                for v in (getattr(output, f.name) for f in dataclasses.fields(output))
+                if torch.is_tensor(v)
+            ]
+            return max(rows) if rows else fallback
+        return fallback
 
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.
