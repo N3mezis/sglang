@@ -77,6 +77,61 @@ _HYBRID_STATE_MAX_SLOTS = 32
 _MEASURED_EXPERT_MARGIN = 1.05
 
 
+def _spec_state_reserve_bytes(sa, mp, mrr: int) -> int:
+    """Device bytes the SPEC-VERIFY path adds on a hybrid (mamba / linear-attention) model, on top of the
+    per-request state cache.
+
+    Mirrors ``MambaPool``'s speculative allocation, which sizes every buffer
+    ``[num_mamba_layers, spec_state_size + 1, ...]`` with ``spec_state_size = max_running_requests``:
+
+    * ``intermediate_ssm_state_cache`` — during verify the recurrence writes each draft position's
+      post-state, so this is ``(mrr + 1) * draft_tokens`` copies of the per-request TEMPORAL state. It is
+      the dominant term ("~46x the conv state", "~9GB @ K3 dspark gamma=7" per its own comment) and is
+      skipped entirely under ``--enable-linear-replayssm-spec``, which rolls back from a ring instead.
+    * the ReplaySSM ring, when that flag IS set. ``replayssm_ring_bytes_per_req``'s docstring states it is
+      not part of ``mamba_cache_per_req`` and "the memory solver must charge it separately".
+    * ``intermediate_conv_window_cache`` — the (K-1)-wide conv window per draft token. CUDA overlaps them
+      into one ``draft_tokens + K - 2`` column buffer per (layer, slot); the dense layout keeps
+      ``draft_tokens x (K-1)``.
+
+    Returns 0 when speculation is off, the draft depth is unknown, or the model is not hybrid.
+    """
+    import math
+
+    d = int(getattr(sa, "speculative_num_draft_tokens", 0) or 0)
+    if not getattr(sa, "speculative_algorithm", None) or d <= 0:
+        return 0
+    try:
+        layers = len(mp.layers)
+        slots = mrr + 1
+        total = 0
+        if getattr(sa, "enable_linear_replayssm_spec", False):
+            # Fold-every-commit keeps a draft-sized window; KDA's stays L-sized (memory_pool.py:609).
+            record_len = (
+                int(getattr(sa, "linear_replayssm_cache_len", 16) or 16)
+                if mp.is_kda
+                else d
+            )
+            total += mp.replayssm_ring_bytes_per_req(record_len) * slots
+        else:
+            ssm_per_req = (
+                math.prod(mp.shape.temporal) * mp.dtype.temporal.itemsize * layers
+            )
+            total += ssm_per_req * slots * d
+        win = max(1, int(mp.shape.conv_kernel) - 1)
+        cols = (
+            d * win
+            if getattr(mp.shape, "disable_conv_window_dedup", False)
+            else d + win - 1
+        )
+        # prod(conv_shape) == win * channels (one axis IS the window), so //win recovers the channels.
+        conv_channels = sum(math.prod(c) // win for c in mp.shape.conv)
+        total += conv_channels * cols * slots * layers * mp.dtype.conv.itemsize
+        return int(total)
+    except Exception:
+        return 0  # unknown hybrid geometry: fall back to charging nothing rather than guessing
+
+
 def _nonexpert_weight_bytes_from_checkpoint(model_path: str) -> Optional[int]:
     """EXACT non-expert weight bytes, summed from the checkpoint's safetensors headers (8-byte length
     prefix + JSON; ``data_offsets`` give exact per-tensor sizes — no tensor data is read). Routed
@@ -419,23 +474,51 @@ def resolve_num_resident_experts(
     # down to zero (boot failure: "Not enough GPU memory for hybrid state cache").
     # The params live on the HF (text) config (e.g. Qwen3NextConfig.mamba2_cache_params); the property
     # asserts an initialized TP group internally, which holds here (model build follows distributed init).
-    mamba_per_req = 0
+    mamba_params = None
     for _cfg in (htc, mc.hf_config):
         try:
-            mamba_per_req = _cfg.mamba2_cache_params.mamba_cache_per_req
+            mamba_params = _cfg.mamba2_cache_params
             break
         except Exception:
             continue
+    mamba_per_req = mamba_params.mamba_cache_per_req if mamba_params is not None else 0
     hybrid_slots = 0
+    spec_state_reserve = 0
+    hybrid_reserve = 0
     if mamba_per_req and not (kv_gb is not None and kv_gb >= 0):
         # An explicit --paged-experts-kv-reserve-gb is the user's TOTAL budget for KV + hybrid state
         # (the documented knob for hybrid concurrency) — don't stack the automatic reserve on top.
-        # Scale with the DECLARED concurrency, like the token-KV term above (see _HYBRID_STATE_* notes).
+        # Mirror the KV configurator's own joint solve (kv_cache_configurator, "Solve jointly for
+        # max_mamba_cache_size (K) ... (K + 1) * per_req + (K / ratio + 1) * D * per_req =
+        # mamba_budget_bytes"): slot count scales with the DECLARED concurrency x the radix ratio, both
+        # buffers carry the pool's +1 padding slot, and under speculation the per-draft intermediates
+        # (NOT part of mamba_cache_per_req) come out of the same budget.
         want = int(getattr(sa, "max_mamba_cache_size", None) or 0) or (
             mrr * _HYBRID_STATE_RADIX_MULT
         )
         hybrid_slots = max(1, min(_HYBRID_STATE_MAX_SLOTS, want))
-        kv_reserve += mamba_per_req * hybrid_slots
+        hybrid_reserve = mamba_per_req * (hybrid_slots + 1)
+        spec_state_reserve = _spec_state_reserve_bytes(sa, mamba_params, mrr)
+        # The mamba pool does NOT get the whole leftover: when max_mamba_cache_size is auto, the
+        # configurator hands it only mfr/(1+mfr) of what remains after weights and gives the rest to the
+        # token-KV pool. So protecting N bytes of state means reserving N*(1+mfr)/mfr of leftover, and
+        # reserving only N is what left draft=4 with 4 of the 5 slots one request needs.
+        #
+        # That split only BINDS when the leftover is tight, and speculation is what makes it tight: with
+        # spec off, the mem_fraction headroom the KV configurator may also dip into covers the state
+        # cache comfortably (measured: reserving 0.44GB at K=89 still yielded 8 slots, needing 5). So
+        # inflate only under speculation — otherwise this would cost the default config ~6 resident
+        # experts to fix a shortfall it does not have.
+        mfr = float(getattr(sa, "mamba_full_memory_ratio", 0.9) or 0.9)
+        inflate = (
+            (1.0 + mfr) / mfr
+            if spec_state_reserve
+            and not int(getattr(sa, "max_mamba_cache_size", None) or 0)
+            else 1.0
+        )
+        # The state budget and the token-KV term both describe leftover-after-weights, so the binding
+        # one wins; they do not stack.
+        kv_reserve = max(kv_reserve, (hybrid_reserve + spec_state_reserve) * inflate)
 
     # Speculative decoding with a BUILT-IN draft (NEXTN/DSPARK from the checkpoint) loads the MTP/nextn
     # layer RESIDENT (paged experts skips it) — VRAM the K sizing must subtract, or K over-sizes and the
@@ -472,6 +555,11 @@ def resolve_num_resident_experts(
         (
             f" hybrid_state={hybrid_slots}x{mamba_per_req / 1e6:.0f}MB"
             if hybrid_slots
+            else ""
+        )
+        + (
+            f" spec_state={spec_state_reserve / 1e9:.2f}GB(draft={getattr(sa, 'speculative_num_draft_tokens', 0)})"
+            if spec_state_reserve
             else ""
         ),
     )
