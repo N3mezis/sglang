@@ -406,10 +406,17 @@ class PinnedExpertStore(ExpertStore):
                 stragglers = [n for n in self.gpu if n not in eligible]
                 n_buf = torch.zeros(1, dtype=torch.int32, device=dev)
                 self._fused_pagein = (stores, slots, e16s, stragglers, n_buf)
-            except Exception:
-                self._fused_pagein = (
-                    False  # jit module unavailable: per-tensor fallback
+                logger.info(
+                    "[paged-experts] FUSED page-in active: %d tensors/launch, stragglers: %s",
+                    len(eligible),
+                    ",".join(stragglers) or "none",
                 )
+            except Exception as e:
+                logger.warning(
+                    "[paged-experts] fused page-in unavailable (%r) — per-tensor fallback",
+                    e,
+                )
+                self._fused_pagein = False
         return self._fused_pagein
 
     def page_in(
