@@ -55,9 +55,6 @@ _REPLAY_PAGERS: list = []
 # Shared double-buffered wave context per device: (transfer_stream, ev_h2d[2], ev_gemm[2], idx_banks[2]).
 # Global because the staging pin buffers it sequences are shared across layers (see ``wave_ctx``).
 _WAVE_CTX: Dict = {}
-# Streaming-prefill scratch pools per device: two full-E per-layer expert buffers ping-ponged across
-# layers (see ``scratch_ctx``). ``False`` = allocation failed once; stay on the wave path.
-_SCRATCH_CTX: Dict = {}
 _MISS_VEC: Optional[torch.Tensor] = (
     None  # [N] int32; slot i = layer i's window-miss count this replay
 )
@@ -354,7 +351,6 @@ def reset_paged_experts_state() -> None:
     # Drop the previous model's staging/wave device buffers + streams (sized to the old geometry);
     # they re-validate shape per call but would otherwise leak across an in-process rebuild.
     _WAVE_CTX.clear()
-    _SCRATCH_CTX.clear()
 
 
 class ExpertPager:
@@ -481,107 +477,6 @@ class ExpertPager:
             # tail; the keep-warm path needs it just as much, which a per-step slot-vs-map audit proved
             # (clean for ~40 steps, then permanently divergent once the first relocation happened).
             self.store.reconcile_pager(self)
-
-    def scratch_ctx(self):
-        """Streaming-prefill scratch pools: TWO full-``[E, *slot]`` buffer sets (one per paged tensor),
-        ping-ponged across layers — while layer i's vanilla E-wide GEMM computes out of one set, the
-        transfer stream fills the other with layer i+1's whole expert set. GLOBAL per device (every MoE
-        layer has identical per-expert shapes in the supported models; verified per call). Returns
-        ``(bufs[2], ev_ready[2], ev_gemm[2])`` or ``None`` (allocation failed / shape mismatch — the
-        caller falls back to the wave path)."""
-        global _SCRATCH_CTX
-        key = torch.device(self.device).index or 0
-        ctx = _SCRATCH_CTX.get(key)
-        if ctx is None:
-            try:
-                bufs = tuple(
-                    {
-                        name: torch.empty(
-                            (self.E, *p.shape[1:]), dtype=p.dtype, device=self.device
-                        )
-                        for name, p in self.store.gpu.items()
-                    }
-                    for _ in range(2)
-                )
-                ctx = (
-                    bufs,
-                    (torch.cuda.Event(), torch.cuda.Event()),
-                    (torch.cuda.Event(), torch.cuda.Event()),
-                )
-            except torch.cuda.OutOfMemoryError:
-                logger.warning(
-                    "[paged-experts] streaming-prefill scratch (2x full-E layer set) does not fit "
-                    "free VRAM — prefill stays on the wave path"
-                )
-                ctx = False
-            _SCRATCH_CTX[key] = ctx
-        if ctx is False:
-            return None
-        # per-call shape guard: a layer whose paged tensors differ (names or shapes) can't use the pool
-        ref = ctx[0][0]
-        if len(ref) != len(self.store.gpu):
-            return None
-        for name, p in self.store.gpu.items():
-            t = ref.get(name)
-            if t is None or t.shape != (self.E, *p.shape[1:]) or t.dtype != p.dtype:
-                return None
-        return ctx
-
-    def scratch_fill_resident_aware(self, bufs: Dict[str, torch.Tensor]) -> bool:
-        """Fill the scratch pool for the streaming prefill from TWO sources: experts resident in this
-        layer's K-slot pool are copied device-to-device (~15x the PCIe rate; pool rows are exact copies
-        of their store rows — page-in never mutates), and only the complement streams from the pinned
-        host store. The split is planned ON DEVICE from the live residency map (``scratch_split``): the
-        host mirror is stale after captured decode replays, and reading the device map back would stall
-        the CPU on the transfer stream. Both plans execute via ``gather_multi`` (address-agnostic copy;
-        the D2D pass gets plain device pool pointers instead of UVA host pointers). Returns ``False``
-        when the on-device machinery isn't set up (caller falls back to ``store.read_full``).
-        """
-        if not self.ondevice or self._gm_stores is None:
-            return False
-        from sglang.kernels.jit.paged_experts_decide import (
-            paged_experts_gather_multi,
-            paged_experts_scratch_split,
-        )
-
-        plans = getattr(self, "_scratch_plans", None)
-        if plans is None:
-            mk = lambda n: torch.zeros(n, dtype=torch.int32, device=self.device)
-            plans = (mk(self.E), mk(self.E), mk(1), mk(self.E), mk(self.E), mk(1))
-            self._scratch_plans = plans
-        base_cache = getattr(self, "_scratch_dst_bases", None)
-        if base_cache is None:
-            base_cache = {}
-            self._scratch_dst_bases = base_cache
-        # keyed per bank buffer-set (two banks, distinct pointers); the buffers are persistent, so
-        # their base pointers are stable. Order must match the pool/store descriptor tensors (built
-        # from the same store.gpu iteration order).
-        dst_bases = base_cache.get(id(bufs))
-        if dst_bases is None:
-            dst_bases = torch.tensor(
-                [bufs[name].data_ptr() for name in self.store.gpu],
-                dtype=torch.int64,
-                device=self.device,
-            )
-            base_cache[id(bufs)] = dst_bases
-        res_src, res_dst, res_n, h2d_src, h2d_dst, h2d_n = plans
-        paged_experts_scratch_split(
-            self.logical_to_gpu_index_cuda,
-            res_src,
-            res_dst,
-            res_n,
-            h2d_src,
-            h2d_dst,
-            h2d_n,
-        )
-        # complement from the pinned host store (UVA bases), residents from the pool (device bases)
-        paged_experts_gather_multi(
-            self._gm_stores, dst_bases, self._gm_e16s, h2d_src, h2d_dst, h2d_n
-        )
-        paged_experts_gather_multi(
-            self._gm_slots, dst_bases, self._gm_e16s, res_src, res_dst, res_n
-        )
-        return True
 
     def wave_ctx(self):
         """Shared state for the double-buffered (banked) wave path: ONE transfer stream, two event pairs

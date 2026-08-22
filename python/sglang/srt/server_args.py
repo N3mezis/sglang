@@ -2612,13 +2612,6 @@ class ServerArgs:
         "best prior for the generation's working set; biggest effect on short outputs (agent turns), "
         "which otherwise spend most of their decode re-faulting the working set. LRU adapts from there.",
     ] = False
-    paged_experts_disable_scratch_prefill: A[
-        bool,
-        "Disable the scratch streaming-prefill pipeline and prefill through the wave path instead. "
-        "Correct but 2-3x slower concurrent prefill; use as the workaround while the scratch pipeline's "
-        "interleaved multi-request crash (illegal access in _scratch_prefill_apply) is open. Env "
-        "fallback: SGLANG_PE_NO_SCRATCH.",
-    ] = False
 
     # -------------------------------------------------------------------------
     # Mamba cache and linear attn

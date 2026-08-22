@@ -15,7 +15,7 @@ moved per token (8 top_k x 75 layers x ~22 MB), so I/O + H2D dominate; the desig
     the pinned budget (``SGLANG_INPLACE_PIN_GB``), the higher the hit rate.
 
 Eager-path only (``--disable-cuda-graph``): implements ``page_in`` + the K-slot ``gpu`` params +
-``item_bytes``; ``host`` is None (scratch-prefill short-circuits to the wave path). ModelOpt NVFP4 per-proj
+``item_bytes``; ``host`` is None (no materialized host store). ModelOpt NVFP4 per-proj
 ``{gate,up,down}_proj.{weight,weight_scale,weight_scale_2,input_scale}`` (compressed-tensors names via the
 reciprocal normalization). Fused w13 slot = gate rows [:I] + up rows [I:]; w2 = down.
 """
@@ -906,12 +906,6 @@ class InPlaceNvfp4Store(ExpertStore):
         if _PE_TIMING:
             _stage("h2d_launch", time.perf_counter_ns() - _t0)
             _stage_tick()
-
-    # ---- defensive: unused on the eager wave/keep-warm path -----------------------------------------
-    def read_full(self, targets, *, stage_key=0):
-        raise RuntimeError(
-            "InPlaceNvfp4Store.read_full: scratch prefill unsupported (wave path only)"
-        )
 
     def row(self, name, e):
         raise RuntimeError("InPlaceNvfp4Store is read-only (in-place); no fill row")
