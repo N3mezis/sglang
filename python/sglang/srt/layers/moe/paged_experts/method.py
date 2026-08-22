@@ -32,13 +32,6 @@ from sglang.srt.layers.moe.paged_experts.sizing import (
 
 logger = logging.getLogger(__name__)
 
-# Hybrid-state reserve: slots of per-request mamba/linear-attention state auto-K sets aside so the
-# state cache sglang sizes AFTER weights cannot end up empty. Sized generously (32 slots ~ 2 GB at
-# Qwen3.6 state sizes) because sglang splits the leftover between KV and mamba AND the radix cache
-# multiplies the per-request slot need (~5x); this yields a couple of radix-on requests on a 16 GB
-# card. For higher hybrid concurrency raise --paged-experts-kv-reserve-gb (smaller K, more state room).
-_HYBRID_STATE_SLOTS = 32
-
 # Captured at import (BEFORE model weights load) so the resolver sizes K against sglang's PRE-load free
 # memory P — the basis of sglang's own KV accounting (KV_pool = post_load_free - P*(1-mem_fraction)).
 # Using total board memory over-counts by the CUDA-context overhead and over-sizes K into an OOM.
@@ -64,35 +57,23 @@ _PRE_LOAD_HOST_AVAIL = _host_available_bytes()
 # estimated reserve happened to sit ~0.2 GB above their true non-expert weights booted reliably.
 _NONEXPERT_RUNTIME_RESERVE = 0.5e9
 
-# 'max' auto-K (--paged-experts-num-resident max). auto respects --mem-fraction-static, holding back
-# pre_free*(1-mem_fraction) (~10% of VRAM) as capture/activation slack; on a model that only partly fits,
-# that headroom caps K below the physical ceiling. 'max' reclaims MOST of it — but NOT by bypassing
-# mem_fraction: sglang's KV configurator reserves exactly that slack for the CUDA-graph capture pool and
-# REJECTS weights above mem_fraction*pre_free, so bypassing it OOMs capture / gets rejected on a near-fitting
-# model (e.g. DSV4, which already sits ~78% resident under auto). Instead 'max' leaves a small, explicit
-# SAFE SLACK for the capture pool and RAISES the served mem_fraction to match, so the configurator permits
-# the larger weight budget while capture still fits. The slack scales with the captured decode-graph batch
-# (heavier graphs -> bigger pool; DSA/indexer models capture a lot, hence the conservative base). It never
-# pushes past _MAX_MEM_FRACTION_CEIL (always >=1-ceil left for capture) and never drops below the served
-# fraction (max is >= auto). This is a K/capture split, not the old free-minus-tiny-reserve edge-gamble.
-_MAX_CAPTURE_BASE = (
-    2.5e9  # capture/activation slack floor (covers a single captured decode graph)
-)
-_MAX_CAPTURE_PER_GRAPH = (
-    0.5e9  # extra slack per captured decode-graph batch (cuda_graph_max_bs_decode)
-)
-_MAX_MEM_FRACTION_CEIL = (
-    0.96  # hardest 'max' pushes weights; the remaining >=4% stays as capture slack
-)
-_AGGRESSIVE_WORKSPACE_SLACK = (
-    0.2e9  # real loader/quant workspace kept on top of the EXACT non-expert bytes
-)
+# Hybrid-state reserve: slots of per-request mamba/linear-attention state auto-K sets aside so the state
+# cache sglang sizes AFTER weights cannot end up empty ("Not enough GPU memory for hybrid state cache").
+# The slot count scales with the DECLARED concurrency, like the token-KV term: one in-flight request needs
+# one state slot, and the mamba radix cache multiplies that need (~5x, its extra_buffer strategy keeps
+# retired states around for prefix reuse). This was a flat 32 slots regardless of concurrency, which
+# reserved 2.4 GB (= 27 resident experts, K 88 -> 64) on a --max-running-requests 1 Qwen3-Next-80B config
+# whose state cache can only ever use one request's worth. --max-mamba-cache-size, when set, is sglang's
+# own statement of how many slots it will allocate and is honoured verbatim instead.
+_HYBRID_STATE_RADIX_MULT = 5
+# Ceiling, so a pathologically high --max-running-requests cannot drive the whole budget into state cache
+# (compute_num_resident_experts already clamps to a top_k pool, but this keeps the reserve meaningful).
+_HYBRID_STATE_MAX_SLOTS = 32
 # Small slop on the MEASURED per-expert checkpoint size (below). The supported repacks are size-
 # preserving — marlin re-lays-out 4-bit weights (same bytes) and keeps e8m0 scales; bf16/fp8 fills are
 # direct copies — so the measured on-disk size IS the resident size (verified: DSV4 marlin resident
 # 14.38MB == measured 14.37MB). This margin only covers store 8-byte-alignment padding + estimate slop;
-# it is NOT a repack-inflation fudge (that was a wrong ~10% guess) and NOT the capture-pool reserve
-# (that is act_reserve, sized separately).
+# it is NOT a repack-inflation fudge (that was a wrong ~10% guess).
 _MEASURED_EXPERT_MARGIN = 1.05
 
 
@@ -363,10 +344,9 @@ def resolve_num_resident_experts(
     ``mem_fraction_static`` / ``context_length`` / ``kv_cache_dtype`` off ``get_global_server_args()`` and the
     arch off ``ModelConfig``, then call the pure sizing formula.
 
-    ``num_resident`` is the ``--paged-experts-num-resident`` value: ``"auto"`` (conservative, respects
-    mem_fraction) or ``"max"`` (reclaim the concurrency-scaled safety margins). Reading the SAME mem_fraction
-    the server runs at keeps K and the KV pool coherent by construction. Cached: every MoE layer resolves the
-    same K. (Only called for ``auto``/``max``; a pinned int K bypasses this.)
+    ``num_resident`` is the ``--paged-experts-num-resident`` value: only ``"auto"`` reaches here (a pinned
+    int K bypasses this). Reading the SAME mem_fraction the server runs at keeps K and the KV pool coherent
+    by construction. Cached: every MoE layer resolves the same K.
     """
     from sglang.srt.server_args import get_global_server_args
 
@@ -402,38 +382,6 @@ def resolve_num_resident_experts(
             embed_bytes += int(1.0e9)  # VL checkpoints load a vision tower + projector
         nonexpert_bytes = max(nonexpert_reserve_gb * 1e9, _NONEXPERT_BASE + embed_bytes)
 
-    # 'max' reclaim (--paged-experts-num-resident max): replace the mem_fraction activation headroom with a
-    # measured, batch-scaled reserve and shrink the non-expert padding to a small workspace slack (see
-    # _AGGRESSIVE_* above). Works at bs>1 — the reserve carries a per-running-request term. (To override the
-    # reserve, pin K explicitly with --paged-experts-num-resident <int>.)
-    aggressive = num_resident == "max"
-    act_reserve = None
-    max_slack = None
-    if aggressive:
-        # Shrink the non-expert padding to a real-workspace slack, then reclaim auto's mem_fraction
-        # headroom by RAISING the served fraction, leaving only a small capture-sized SAFE SLACK that
-        # sglang's KV configurator keeps for the capture pool. Sizing then goes through the normal
-        # mem_fraction path (act_reserve stays None) with the raised fraction — no bypass.
-        if exact is not None:
-            nonexpert_bytes = exact + _AGGRESSIVE_WORKSPACE_SLACK
-        graph_bs = max(
-            1,
-            int(
-                getattr(sa, "cuda_graph_max_bs_decode", 0)
-                or getattr(sa, "cuda_graph_max_bs", 0)
-                or 1
-            ),
-        )
-        max_slack = _MAX_CAPTURE_BASE + _MAX_CAPTURE_PER_GRAPH * graph_bs
-        raised = min(_MAX_MEM_FRACTION_CEIL, 1.0 - max_slack / max(free, 1.0))
-        mem_frac = max(
-            mem_frac, raised
-        )  # >= served fraction: max is never less aggressive than auto
-        # The KV configurator reads mem_fraction_static LIVE (weight ceiling = fraction*pre_free, capture
-        # slack = pre_free*(1-fraction)); raise it so the larger weight budget is permitted and the slack
-        # is exactly our capture reserve.
-        sa.mem_fraction_static = mem_frac
-
     # KV reserve (the K/KV split): kv-token count x per-token, MLA cell or MHA/GQA per-token.
     # The token count is mrr x context capped at --max-total-tokens: sglang's real KV pool honors that
     # cap, so reserving the uncapped product starves K for KV that will never be allocated (mrr=128 x
@@ -450,8 +398,14 @@ def resolve_num_resident_experts(
         kv_reserve = kv_tokens * cell
     else:  # MHA / GQA — reuse the pure helper (get_num_kv_heads handles GQA + TP)
         tp = getattr(sa, "tp_size", 1) or 1
+        # Only layers that actually hold token-KV count. In a hybrid (linear-attention) model the
+        # linear-attn layers keep a mamba STATE instead, reserved separately below, so charging them a
+        # per-token KV cell over-reserves by num_hidden_layers/attn_layers (4x on Qwen3-Next, whose
+        # full_attention_interval=4 leaves 12 of 48 layers with real KV).
+        interval = getattr(mc, "full_attention_interval", None)
+        kv_layers = max(1, layers // int(interval)) if interval else layers
         per_token = kv_reserve_bytes_mha(
-            num_layers=layers,
+            num_layers=kv_layers,
             num_kv_heads=mc.get_num_kv_heads(tp),
             head_dim=(mc.head_dim + mc.v_head_dim) // 2,  # combined K+V per-head width
             kv_dtype_bytes=kv_elt,
@@ -462,8 +416,7 @@ def resolve_num_resident_experts(
 
     # Hybrid (mamba / linear-attention) models keep a per-request STATE cache outside the token-KV
     # pool; sglang sizes it from what is left after weights — which auto-K would otherwise consume
-    # down to zero (boot failure: "Not enough GPU memory for hybrid state cache"). Reserve room for a
-    # modest slot count using sglang's own per-request figure.
+    # down to zero (boot failure: "Not enough GPU memory for hybrid state cache").
     # The params live on the HF (text) config (e.g. Qwen3NextConfig.mamba2_cache_params); the property
     # asserts an initialized TP group internally, which holds here (model build follows distributed init).
     mamba_per_req = 0
@@ -473,10 +426,16 @@ def resolve_num_resident_experts(
             break
         except Exception:
             continue
+    hybrid_slots = 0
     if mamba_per_req and not (kv_gb is not None and kv_gb >= 0):
         # An explicit --paged-experts-kv-reserve-gb is the user's TOTAL budget for KV + hybrid state
         # (the documented knob for hybrid concurrency) — don't stack the automatic reserve on top.
-        kv_reserve += mamba_per_req * _HYBRID_STATE_SLOTS
+        # Scale with the DECLARED concurrency, like the token-KV term above (see _HYBRID_STATE_* notes).
+        want = int(getattr(sa, "max_mamba_cache_size", None) or 0) or (
+            mrr * _HYBRID_STATE_RADIX_MULT
+        )
+        hybrid_slots = max(1, min(_HYBRID_STATE_MAX_SLOTS, want))
+        kv_reserve += mamba_per_req * hybrid_slots
 
     # Speculative decoding with a BUILT-IN draft (NEXTN/DSPARK from the checkpoint) loads the MTP/nextn
     # layer RESIDENT (paged experts skips it) — VRAM the K sizing must subtract, or K over-sizes and the
@@ -496,7 +455,6 @@ def resolve_num_resident_experts(
         per_expert_layer_bytes=per_el,
         top_k=top_k,
         num_experts=num_experts_E,
-        activation_reserve_bytes=act_reserve,
     )
     logger.info(
         "[paged-experts] resident K=%d/%d (%d%%): free=%.2fGB mem_fraction=%.3f "
@@ -512,8 +470,8 @@ def resolve_num_resident_experts(
         per_el / 1e6,
         moe_layers,
         (
-            f" MAX capture_slack={max_slack / 1e9:.2f}GB mem_fraction->{mem_frac:.3f}"
-            if aggressive
+            f" hybrid_state={hybrid_slots}x{mamba_per_req / 1e6:.0f}MB"
+            if hybrid_slots
             else ""
         ),
     )
@@ -736,12 +694,23 @@ def make_for_layer(
     _geo_mc, _geo_htc = _moe_geometry()[:2]
     check_paged_experts_quant(_quant_source(_geo_mc, _geo_htc))
     E = int(getattr(layer, "num_local_experts", None) or layer.num_experts)
-    if num_resident in ("auto", "max"):
+    if num_resident == "auto":
         K = resolve_num_resident_experts(
             E, str(num_resident), nonexpert_reserve_gb=nonexpert_reserve_gb
         )
     else:
-        K = int(num_resident)
+        try:
+            K = int(num_resident)
+        except (TypeError, ValueError):
+            # 'max' was removed: auto now sizes both KV-reserve terms from the DECLARED concurrency, so it
+            # already reaches the same K that 'max' was reaching by spending safety headroom. Say so
+            # instead of failing on int('max').
+            raise ValueError(
+                f"--paged-experts-num-resident: expected an integer or 'auto', got {num_resident!r}. "
+                "('max' was removed — 'auto' now sizes the KV/state reserve from --max-running-requests "
+                "and reaches the same K without spending the capture-pool headroom. To force a larger "
+                "pool, pass an explicit integer or lower --paged-experts-kv-reserve-gb.)"
+            ) from None
     store_kind = getattr(server_args, "paged_experts_store", "pinned")
     pin_host = store_kind != "paged"
     # Use the on-device (capturable) decode path unless CUDA graphs are disabled. With graphs off it's the

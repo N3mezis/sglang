@@ -2555,9 +2555,8 @@ class ServerArgs:
     ] = False
     paged_experts_num_resident: A[
         str,
-        "Resident experts per layer (K) for --enable-paged-experts: an int to pin K, 'auto' to size from "
-        "free VRAM (safe margins, respects --mem-fraction-static), or 'max' to reclaim the concurrency-scaled "
-        "safety margins for the most resident experts (measured reserve; opt-in, spends headroom).",
+        "Resident experts per layer (K) for --enable-paged-experts: an int to pin K, or 'auto' to size "
+        "from free VRAM (safe margins, respects --mem-fraction-static).",
     ] = "auto"
     paged_experts_store: A[
         str,

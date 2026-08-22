@@ -26,7 +26,6 @@ def compute_num_resident_experts(
     per_expert_layer_bytes: float,
     top_k: int,
     num_experts: int,
-    activation_reserve_bytes: float | None = None,
 ) -> int:
     """Largest K that fits, clamped to ``[top_k, num_experts]``.
 
@@ -39,22 +38,13 @@ def compute_num_resident_experts(
     (e.g. a high ``--max-running-requests`` x full context) drives the budget negative and floors K to
     ``top_k`` — starving K for a KV pool that can never be allocated (sglang sizes the real KV pool from
     the leftover afterwards, clamped to physical VRAM).
-
-    ``activation_reserve_bytes`` ('max' sizing): when given, it REPLACES the ``free*(1-mem_fraction)``
-    percentage reserve with a FIXED, batch-scaled byte reserve for activations + cuda-graph pool +
-    fragmentation slack. The percentage scales with card size, not with the activation peak, so it
-    over-reserves ~a GB; a measured reserve reclaims that for K (opt-in — spends the safety headroom).
     """
     per_expert_pool = (
         moe_layers * per_expert_layer_bytes
     )  # VRAM for one resident expert (all layers)
-    if activation_reserve_bytes is not None:
-        # Fixed measured reserve ('max'): spend the percentage headroom down to a real floor.
-        budget = free_vram_bytes - activation_reserve_bytes - nonexpert_bytes
-    else:
-        budget = (
-            free_vram_bytes * mem_fraction - nonexpert_bytes
-        )  # shared by the K-slot pool AND the KV pool
+    budget = (
+        free_vram_bytes * mem_fraction - nonexpert_bytes
+    )  # shared by the K-slot pool AND the KV pool
     # Clamp the KV reserve to what's physically left after a minimum (top_k) pool so an over-estimate floors
     # K to top_k, not negative.
     kv_reserve_bytes = max(0.0, min(kv_reserve_bytes, budget - top_k * per_expert_pool))
