@@ -38,7 +38,6 @@ from sglang.srt.layers.moe.token_dispatcher.ascend_tp import (
     AscendTPDispatcher,
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
-from sglang.srt.layers.moe.token_dispatcher.deepep_v2 import DeepEPv2Dispatcher
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatcher
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
@@ -167,15 +166,6 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             async_finish=True,
             return_recv_hook=True,
         )
-    elif a2a_backend.is_deepep_v2():
-        return DeepEPv2Dispatcher(
-            group=get_tp_group().device_group,
-            router_topk=moe_runner_config.top_k,
-            num_experts=moe_runner_config.num_experts,
-            num_local_experts=moe_runner_config.num_local_experts,
-            hidden_size=moe_runner_config.hidden_size,
-            params_dtype=moe_runner_config.params_dtype,
-        )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
             group=get_tp_group().device_group,
@@ -303,10 +293,10 @@ class FusedMoE(torch.nn.Module):
 
         self._num_global_routed = num_experts - num_shared_slots
         if get_exec().moe.ep_join_mode == "scale":
-            storage_ep_size = get_parallel().elastic_ep_initial_size
+            storage_ep_size = get_parallel().config.elastic_ep_initial_size
             assert storage_ep_size is not None
             self._expert_storage_rank = (
-                get_parallel().ep_join_rank_offset + self.moe_ep_rank
+                get_parallel().config.ep_join_rank_offset + self.moe_ep_rank
             )
         else:
             storage_ep_size = self.moe_ep_size
