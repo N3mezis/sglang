@@ -1359,9 +1359,9 @@ def _fill_nvfp4_from_checkpoint(store, model_path, layer_idx, device):
     from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
     E = store.E
-    assert (
-        store.gpu["w13_weight"].dtype == torch.uint8
-    ), "nvfp4 fill expects uint8 packed weights"
+    assert store.gpu["w13_weight"].dtype == torch.uint8, (
+        "nvfp4 fill expects uint8 packed weights"
+    )
     snap = _snapshot_dir(model_path)
     wmap = _weight_map(snap)
     pre = _experts_prefix(wmap, layer_idx)

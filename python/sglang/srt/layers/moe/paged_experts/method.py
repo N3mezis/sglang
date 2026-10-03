@@ -76,9 +76,12 @@ _NONEXPERT_RUNTIME_RESERVE = 0.5e9
 # reserve carries a small per-running-request term. base + per_req*mrr; bs=1 == 0.5 GB (the tuned value).
 # Higher mrr also grows the KV reserve, which squeezes K on its own — so aggressive at high concurrency
 # self-limits. Validated for modest bs (≤~4 on this card); the linear term errs toward safety beyond that.
-_AGGRESSIVE_ACT_BASE = 0.4e9  # bs-independent: prefill-chunk activation + fragmentation slack
-_AGGRESSIVE_ACT_PER_REQ = 0.1e9  # per running request: decode logits/workspaces + captured-graph pool
-_AGGRESSIVE_WORKSPACE_SLACK = 0.2e9  # real loader/quant workspace kept on top of the EXACT non-expert bytes
+# bs-independent: prefill-chunk activation + fragmentation slack
+_AGGRESSIVE_ACT_BASE = 0.4e9
+# per running request: decode logits/workspaces + captured-graph pool
+_AGGRESSIVE_ACT_PER_REQ = 0.1e9
+# real loader/quant workspace kept on top of the EXACT non-expert bytes
+_AGGRESSIVE_WORKSPACE_SLACK = 0.2e9
 
 
 def _nonexpert_weight_bytes_from_checkpoint(model_path: str) -> Optional[int]:

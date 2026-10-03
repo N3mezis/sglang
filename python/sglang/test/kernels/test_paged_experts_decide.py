@@ -293,9 +293,9 @@ def test_decide_gather_capturable():
     es_l = es.tolist()
     for e in (2, 10, 13):
         sidx = es_l[e]
-        assert (
-            sidx >= 0 and (slot[sidx] == e + 1).all().item()
-        ), f"expert {e} not gathered to its slot"
+        assert sidx >= 0 and (slot[sidx] == e + 1).all().item(), (
+            f"expert {e} not gathered to its slot"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +423,9 @@ def test_decide_bounded_matches_reference(lfu):
         assert needed.tolist() == r_needed, f"step {step}: needed"
         # deferred (window-miss) experts must stay unresident this step
         for e in cold_log[:nc].tolist():
-            assert (
-                es[e].item() == -1
-            ), f"step {step}: deferred expert {e} should be unresident"
+            assert es[e].item() == -1, (
+                f"step {step}: deferred expert {e} should be unresident"
+            )
 
 
 @requires_cuda
@@ -560,9 +560,9 @@ def test_decide_bounded_prefers_hot_tier_victims():
     )
     assert int(n_out.item()) == 1
     assert se.tolist()[2] == 3, "oldest HOT slot (2) must be the victim"
-    assert (
-        int(es[9].item()) == 1 and int(es[12].item()) == 3
-    ), "cold residents must survive"
+    assert int(es[9].item()) == 1 and int(es[12].item()) == 3, (
+        "cold residents must survive"
+    )
     assert int(es[2].item()) == -1, "evicted hot expert unmapped"
 
 

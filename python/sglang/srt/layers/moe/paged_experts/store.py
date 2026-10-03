@@ -364,19 +364,19 @@ class WindowedExpertStore(ExpertStore):
         )
         self.gpu = discover_paged_params(layer, num_resident_K)
         assert self.gpu, "no per-expert params found on layer"
-        self.host_hot: Dict[str, torch.Tensor] = (
-            {}
-        )  # [W, *shape] PINNED (transfer_kv / UVA gather)
-        self.host_cold: Dict[str, torch.Tensor] = (
-            {}
-        )  # [E-W, *shape] cold tier (RAM pageable | disk mmap)
+        self.host_hot: Dict[
+            str, torch.Tensor
+        ] = {}  # [W, *shape] PINNED (transfer_kv / UVA gather)
+        self.host_cold: Dict[
+            str, torch.Tensor
+        ] = {}  # [E-W, *shape] cold tier (RAM pageable | disk mmap)
         self.item_bytes: Dict[str, int] = {}
-        self._cold_mm: Dict[str, mmap.mmap] = (
-            {}
-        )  # disk tier mmap objects, for madvise read-ahead hints
-        self._cold_fd: Dict[str, Optional[int]] = (
-            {}
-        )  # disk tier O_DIRECT fds (None = mmap only)
+        self._cold_mm: Dict[
+            str, mmap.mmap
+        ] = {}  # disk tier mmap objects, for madvise read-ahead hints
+        self._cold_fd: Dict[
+            str, Optional[int]
+        ] = {}  # disk tier O_DIRECT fds (None = mmap only)
         on_disk = cold_backing == "disk"
         for name, p in self.gpu.items():
             self.host_hot[name] = _pinned_empty((self.W, *p.shape[1:]), p.dtype)
