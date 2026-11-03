@@ -560,5 +560,7 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
     "paged_experts_enable_disk",
+    "paged_experts_host_memory_gb",
+    "_max_running_requests_explicitly_set",
 )
 # fmt: on

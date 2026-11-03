@@ -80,6 +80,7 @@ class PostLoad:
         # The step records state on the layer (e.g. that it has run); each run starts from
         # the state before the first.
         self._state = {k: v for k, v in vars(layer).items() if k not in _MODULE_ATTRS}
+        self._params = set(layer._parameters)
 
     def run(
         self, experts: Sequence[int], out: Optional[Dict[str, torch.Tensor]] = None
@@ -171,6 +172,11 @@ class PostLoad:
             delattr(layer, k)
         for k, v in self._state.items():
             setattr(layer, k, v)
+        # Parameters the step created in the last run: it may read them in place of the ones
+        # a run loads (MXFP4 Marlin prefers `w13_weight_scale` to the loaded
+        # `w13_weight_scale_inv`).
+        for name in [name for name in layer._parameters if name not in self._params]:
+            delattr(layer, name)
         for name, template in self._templates.items():
             layer.register_parameter(name, template)
 
@@ -315,6 +321,21 @@ class Mxfp4Format(ExpertFormat):
         return isinstance(base_method, Mxfp4MoEMethod)
 
 
+class Fp8Mxfp4ExpertsFormat(ExpertFormat):
+    """MXFP4 routed experts in an FP8 checkpoint (DeepSeek-V4, or any checkpoint with
+    ``routed_experts_quant_method: mxfp4``), served by the Marlin runner."""
+
+    label = "MXFP4 routed experts of an FP8 checkpoint (Marlin)"
+
+    @classmethod
+    def supports(cls, base_method, scheme) -> bool:
+        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+            Mxfp4MarlinMoEMethod,
+        )
+
+        return isinstance(base_method, Mxfp4MarlinMoEMethod)
+
+
 class ModelOptNvfp4Format(ExpertFormat):
     label = "ModelOpt NVFP4"
     # Swizzled block scales serve FlashInfer's kernels, not Marlin's.
@@ -403,6 +424,7 @@ FORMATS = (
     GptqFormat,
     AwqFormat,
     Mxfp4Format,
+    Fp8Mxfp4ExpertsFormat,
     ModelOptNvfp4Format,
     CompressedTensorsWNA16Format,
     CompressedTensorsNvfp4Format,

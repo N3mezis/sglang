@@ -49,7 +49,12 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   default) sizes K after the model is loaded; see [Choosing K](#choosing-k).
 - **`--paged-experts-enable-disk`**: Let Paged Experts write to disk: keep each MoE layer's
   experts in the [expert cache](#the-expert-cache), so that later starts read them instead of
-  loading and repacking them. Off by default; requires `--enable-paged-experts`.
+  loading and repacking them, and serve the experts that do not fit host memory from there
+  (see [Disk tier](#disk-tier)). Off by default; requires `--enable-paged-experts`.
+- **`--paged-experts-host-memory-gb G`**: Pinned host memory for the experts of all MoE layers.
+  When every expert fits, nothing changes; otherwise the [disk tier](#disk-tier) holds the rest,
+  with `--paged-experts-enable-disk`. Unset, it is what is available at startup within the
+  container's memory limit, minus a reserve.
 
 ## Supported Configurations and Limitations
 
@@ -66,6 +71,7 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   | compressed-tensors W4A16/W8A16 | Marlin | |
   | compressed-tensors NVFP4 | Marlin | weight-only: nvfp4a16, or w4a4 before Blackwell |
   | MXFP4 (e.g. gpt-oss) | Marlin | pass `--moe-runner-backend marlin` |
+  | MXFP4 routed experts of an FP8 checkpoint (e.g. DeepSeek-V4) | Marlin | pass `--moe-runner-backend marlin` |
   | ModelOpt NVFP4 | Marlin | pass `--moe-runner-backend marlin`; runs W4A16 |
 
   Other quantization methods and MoE runners are rejected at startup.
@@ -81,8 +87,19 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   prefill graphs may use the `breakable` backend (the default on CUDA) or be disabled. Other
   combinations are rejected at startup.
 - **Host memory:** the host store holds all E experts of every MoE layer and is page-locked, so
-  the host must be able to pin that much memory. Under WSL2, pinned memory is capped at about
-  half of system RAM.
+  the host must be able to pin that much memory, or the disk tier holds the rest. Under WSL2,
+  pinned memory is capped at about half of system RAM: set `--paged-experts-host-memory-gb`
+  below that.
+- **Disk tier:** the first start writes every layer's file once, about the size of the expert
+  weights; the space is checked at startup. Every load must be able to wait as a view of the
+  mapped checkpoint (the safetensors loaders, see Startup; not a checkpoint that stacks all
+  experts in one tensor), or the start fails. With decode CUDA graphs on and R < E, a step waits
+  at a layer for the experts it reads from disk; one that gives up waiting (after 2 s) is
+  replayed, so the captured decode step must be safe to replay. On hybrid (mamba /
+  linear-attention) models, the step's recurrent state is copied before it runs and restored
+  before a replay; `--enable-linear-replayssm` and `--expert-distribution-recorder-mode` are
+  rejected. Every captured decode step is then also served by a host thread while it runs. With
+  `auto`, K grows at most to the host rows R.
 - **Startup:** with mapped safetensors (`--load-format auto`, `safetensors` or `mistral`, without
   `--weight-loader-disable-mmap`), loading makes no second copy of the experts: each expert is
   read from the checkpoint once, straight into the pinned host store. With other loaders, and
@@ -205,6 +222,37 @@ location once.
 In a container, mount `$SGLANG_CACHE_DIR` (or a directory it points to) to keep the files
 across restarts; without a mount they are written into the container's own filesystem, which
 takes the disk space and loses them with the container.
+
+### Disk tier
+
+With `--paged-experts-enable-disk`, when the host budget cannot hold every expert of every layer,
+each layer keeps all E experts in its [expert cache](#the-expert-cache) file and R of them in
+pinned host rows; the K GPU slots are filled from the rows. Without the flag, such a model fails
+at startup with the sizes and the flag. Layers routed by token id (DeepSeek-V4's hash layers)
+keep every expert in host memory when they take at most half the budget; the other layers split
+the rest evenly.
+
+- **The first start writes the files once**, so a model larger than RAM never has to fit in
+  RAM: the experts' loads are replayed K at a time from the mapped checkpoint (see Startup)
+  straight into the file being built, through the repack on the Marlin runner. Later starts check the same experts as for a model that fits and
+  do not read the other experts from the checkpoint; nor do they read them from the file, except
+  the ones the slots and host rows start with.
+- **The host rows are inclusive:** moving an expert into a slot copies it from its host row,
+  which keeps it; the expert the slot held is dropped (the disk has it), so nothing is written
+  back. An expert only on disk is first read into the least recently used host row (whose
+  expert is dropped), with one read per expert, bypassing the page cache (`O_DIRECT`), and
+  several in flight.
+- **Captured decode** decides on the GPU as before and copies the experts that are in host rows
+  inside the graph. An expert only on disk is flagged: the layer's plan kernel writes the
+  layer's state to pinned host memory before the layer copies its host-row hits, a host thread
+  reads the flagged experts while those copies run, and the step waits at the layer until they
+  are in their slots, then runs on with the experts it routed to. A step that gives up waiting
+  runs on, and the host copies the experts in after it and replays the step. A decode step only
+  writes its own KV entries and outputs, so replaying it gives the same result.
+
+Expert packs (`--load-format expert_pack`) are a different SSD tier: prebuilt packs for
+specific models, read from SSD into a GPU cache. The disk tier needs no preparation and works
+for every checkpoint paged experts supports.
 
 ## Choosing K
 

@@ -30,6 +30,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend_utils.replay_hooks import (
+    replay_until_settled,
+    save_recurrent_state,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
     get_or_create_global_graph_memory_pool,
@@ -229,7 +233,12 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         with graph_pool_replay_scope():
+            restore = save_recurrent_state(
+                self._cuda_graph_runner.model_runner.req_to_token_pool,
+                static_forward_batch.req_pool_indices,
+            )
             self._graphs[shape_key].replay()
+            replay_until_settled(self._graphs[shape_key].replay, restore)
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
