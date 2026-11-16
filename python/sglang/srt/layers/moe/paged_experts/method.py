@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 from types import SimpleNamespace
@@ -58,6 +59,19 @@ from sglang.srt.runtime_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_skip = False  # set while auto-sizing measures a prefill step: the paged layers return zeros
+
+
+@contextlib.contextmanager
+def skipping_paged_experts():
+    global _skip
+    _skip = True
+    try:
+        yield
+    finally:
+        _skip = False
 
 
 class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
@@ -349,6 +363,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
     def apply(self, layer, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
+        if _skip:
+            return StandardCombineInput(
+                hidden_states=torch.zeros_like(dispatch_output.hidden_states)
+            )
         # Decided from shapes alone, so a captured graph always takes the same path.
         topk_output = dispatch_output.topk_output
         if (

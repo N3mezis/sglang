@@ -18,9 +18,9 @@ from sglang.srt.layers.moe.paged_experts import (
     disk_tier,
     expert_cache,
     formats,
-    runners,
-    sizing,
 )
+from sglang.srt.layers.moe.paged_experts import method as method_module
+from sglang.srt.layers.moe.paged_experts import runners, sizing
 from sglang.srt.layers.moe.paged_experts import store as store_module
 from sglang.srt.layers.moe.paged_experts.disk_tier import TieredExpertStore
 from sglang.srt.layers.moe.paged_experts.expert_cache import (
@@ -1390,6 +1390,7 @@ class TestSizing(CustomTestCase):
         context_length=None,
         refuse=False,
         reserve_slots=0,
+        adjust=0,
         **schedule,
     ):
         """Two layers built with K = top_k, sized through ``ExpertSlotSizing`` against a static
@@ -1428,7 +1429,7 @@ class TestSizing(CustomTestCase):
                 if refuse
                 else (contextlib.nullcontext())
             ):
-                ks = slots.size(kv_tokens)
+                ks = slots.size(kv_tokens, adjust)
         return ks, built, caps, overrides
 
     @staticmethod
@@ -1539,6 +1540,78 @@ class TestSizing(CustomTestCase):
         ks, _, caps, _ = self._sized(budget_slots=8, top_ks=(2, 4))
         self.assertEqual(ks, [7, 9])
         self.assertEqual(caps, [2])
+
+    def test_a_prefill_step_takes_only_what_the_headroom_does_not_cover(self):
+        """What was set up since the KV cache came out of the headroom, not the slots; a
+        measured step beyond what is left of it comes out of the slots. Control: one within
+        it changes nothing."""
+        gib = 1 << 30
+        self.assertEqual(sizing._prefill_adjust(1 * gib, 2 * gib, 5 * gib), 2 * gib)
+        self.assertEqual(sizing._prefill_adjust(4 * gib, 2 * gib, 5 * gib), 1 * gib)
+        self.assertEqual(sizing._prefill_adjust(3 * gib, 6 * gib, 5 * gib), 2 * gib)
+        row = sizing._bytes_per_slot(_paged_layer()[0])
+        base, _, _, _ = self._sized(budget_slots=4)
+        self.assertEqual(base, [K, K])
+        ks, _, _, _ = self._sized(budget_slots=4, adjust=-3 * row)
+        self.assertEqual(ks, [TOP_K, TOP_K])  # 1 of 4 spare slots left: no full round
+
+    def test_skipped_paged_layers_return_zeros_without_paging(self):
+        """Control: outside the measurement the same step pages its experts in."""
+        method, layer, _ = _paged_layer()
+        d = _step(8)
+        loads = []
+        with patch.object(
+            type(method.store), "page_in", side_effect=lambda **kw: loads.append(kw)
+        ):
+            with method_module.skipping_paged_experts():
+                out = method.apply(layer=layer, dispatch_output=d).hidden_states
+            self.assertEqual(loads, [])
+            torch.testing.assert_close(out, torch.zeros_like(d.hidden_states))
+            method.apply(layer=layer, dispatch_output=d)
+        self.assertTrue(loads)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
+    def test_measured_activations_are_the_dummy_steps_peak(self):
+        """A stand-in dummy step allocating 64 MiB at its peak measures about that (its inputs
+        not counted), with the paged layers skipped while it runs; a step longer than the
+        context runs one context and scales. Control: a step allocating nothing measures about
+        nothing. A step that runs out of memory stops the server naming the flags."""
+        seen = []
+
+        def runner(nbytes, fail=False):
+            def dummy_run(requests, *, extend_num_tokens_per_req, **kw):
+                seen.append((requests, extend_num_tokens_per_req, method_module._skip))
+                if fail:
+                    raise torch.OutOfMemoryError("no room")
+                x = torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+                del x
+
+            return SimpleNamespace(
+                model_runner=SimpleNamespace(
+                    device="cuda", model_config=SimpleNamespace(context_len=4096)
+                ),
+                _alloc_dummy_decode_buffers=lambda *a, **kw: torch.empty(
+                    1 << 20, device="cuda"
+                ),
+                _dummy_run=dummy_run,
+                model_context=contextlib.nullcontext,
+            )
+
+        ctx = "sglang.srt.model_executor.runner.flashinfer_autotune.autotune_dummy_run_ctx"
+        with patch(ctx, side_effect=lambda mr, buffers: contextlib.nullcontext()):
+            measured = sizing.measure_prefill_activations(runner(64 << 20), 2048)
+            self.assertGreaterEqual(measured, 64 << 20)
+            self.assertLess(measured, 66 << 20)
+            self.assertEqual(seen[-1], (1, 2048, True))
+            scaled = sizing.measure_prefill_activations(runner(64 << 20), 8192)
+            self.assertEqual(seen[-1], (1, 4096, True))
+            self.assertGreaterEqual(scaled, 128 << 20)
+            self.assertLess(
+                sizing.measure_prefill_activations(runner(0), 2048), 2 << 20
+            )
+            with self.assertRaisesRegex(RuntimeError, "--chunked-prefill-size"):
+                sizing.measure_prefill_activations(runner(0, fail=True), 2048)
+        self.assertFalse(method_module._skip)
 
     def test_a_refused_allocation_fails_naming_the_flags(self):
         with self.assertRaisesRegex(

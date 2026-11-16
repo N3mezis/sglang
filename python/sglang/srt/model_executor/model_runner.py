@@ -1040,7 +1040,10 @@ class ModelRunner:
             pre_model_load_memory=self.pre_model_load_memory
         )
         if expert_slots is not None:
-            expert_slots.size(result.max_total_num_tokens)
+            # Sized once the attention backends are up (``init_cuda_graphs``), after a
+            # dummy prefill step measures its activations.
+            expert_slots.prepare(result.max_total_num_tokens)
+        self.expert_slot_sizing = expert_slots
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool
@@ -1246,6 +1249,12 @@ class ModelRunner:
         return self.sampling_prewarm_result
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        sizing = getattr(self, "expert_slot_sizing", None)
+        if sizing is not None:
+            # Paged experts with auto K: size the slots now that the attention backends are
+            # up, before warmup and capture run the MoE.
+            self.expert_slot_sizing = None
+            sizing.finish(self)
         # from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         # if get_moe_runner_backend().is_flashinfer_megamoe():

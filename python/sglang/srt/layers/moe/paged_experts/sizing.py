@@ -1,7 +1,8 @@
 """K, the experts per MoE layer resident on the GPU, with ``--paged-experts-num-resident auto``
 (see "Choosing K" in the paged experts docs). Layers are built with K = top_k; the KV cache's aim
-is applied as ``--max-total-tokens``, and after the KV cache is allocated the expert slots take
-what the static budget has left, in one allocation for all layers.
+is applied as ``--max-total-tokens``, and once the attention backends are up the expert slots take
+what the static budget has left, less what a measured prefill step needs beyond the
+``--mem-fraction-static`` headroom, in one allocation for all layers.
 """
 
 from __future__ import annotations
@@ -82,6 +83,84 @@ def static_budget_bytes(kv_configurator, pre_model_load_memory: float) -> int:
     return int((free_gb - slack_gb - mm_gb) * _GIB)
 
 
+# A chunk late in a long prompt, or a fragmented allocator, can need a little more than measured.
+_ACTIVATION_MARGIN = 0.10
+
+
+def _free_after_gc(device) -> int:
+    gc.collect()
+    dm = torch.get_device_module(device)
+    dm.empty_cache()
+    return dm.mem_get_info()[0]
+
+
+def _probe_runner(model_runner):
+    """A runner for one dummy forward (``BaseRunner._dummy_run``) and nothing else: no buffers
+    of its own, so the eager runner and graph capture are built afterwards as without it."""
+    from sglang.srt.model_executor.runner.base_runner import BaseRunner
+
+    class _Probe(BaseRunner):
+        def can_run_graph(self, forward_batch):
+            return False
+
+        def load_batch(self, forward_batch, **kwargs):
+            raise NotImplementedError
+
+        def execute(self, forward_batch, **kwargs):
+            raise NotImplementedError
+
+    return _Probe(model_runner)
+
+
+def measure_prefill_activations(runner, tokens: int) -> int:
+    """Peak GPU memory of a ``tokens``-token prefill step beyond its inputs, with the paged MoE
+    layers skipped (their share is ``RunnerContract.prefill_bytes``): PyTorch's peak plus what
+    kernels take outside it. One request of at most the context, scaled to ``tokens``."""
+    from sglang.srt.layers.moe.paged_experts.method import skipping_paged_experts
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.runner.flashinfer_autotune import (
+        autotune_dummy_run_ctx,
+    )
+
+    mr = runner.model_runner
+    dm = torch.get_device_module(mr.device)
+    ran = min(tokens, mr.model_config.context_len)
+    buffers = runner._alloc_dummy_decode_buffers(
+        1, num_tokens_per_req=ran, allocate_logits_buffer=False
+    )
+    free = _free_after_gc(mr.device)
+    allocated, reserved = dm.memory_allocated(), dm.memory_reserved()
+    dm.reset_peak_memory_stats()
+    try:
+        with runner.model_context(), skipping_paged_experts(), torch.no_grad():
+            runner._dummy_run(
+                1,
+                run_ctx=autotune_dummy_run_ctx(mr, buffers),
+                forward_mode_override=ForwardMode.EXTEND,
+                buffers=buffers,
+                extend_num_tokens_per_req=ran,
+            )
+        dm.synchronize()
+    except torch.OutOfMemoryError as e:
+        raise RuntimeError(
+            f"Paged experts: a {tokens}-token prefill step does not fit in GPU memory even "
+            "next to the smallest expert slots (K = top-k); lower --chunked-prefill-size, "
+            "--max-total-tokens or --context-length, or raise --mem-fraction-static"
+        ) from e
+    peak = dm.max_memory_allocated() - allocated
+    outside = free - dm.mem_get_info()[0] - (dm.memory_reserved() - reserved)
+    del buffers
+    measured = peak + max(0, outside)
+    return -(-measured * tokens // ran)
+
+
+def _prefill_adjust(need: int, used: int, slack: int) -> int:
+    """Bytes the slots may take beyond the static budget measured now: what was set up since
+    the KV cache (``used``) came out of the ``--mem-fraction-static`` headroom (``slack``), not
+    out of the slots; a prefill step's ``need`` beyond what is left of it comes out of them."""
+    return min(used, slack) - max(0, need - max(0, slack - used))
+
+
 def _mamba_charge(slots: int, per_slot: int) -> int:
     """Bytes a Mamba pool of ``slots`` takes: one padding slot beyond its size, as SGLang
     charges it (``KVCacheConfigurator._handle_max_mamba_cache``)."""
@@ -151,6 +230,7 @@ class ExpertSlotSizing:
         self.pre_model_load_memory = pre_model_load_memory
         self.floor = kv_floor(kv_configurator.model_config.context_len)
         self.budget_before_kv = budget_before_kv
+        self.kv_tokens = self.free_after_kv = None  # set by ``prepare``
         self.mamba_slots = self._size_mamba_cache()
         if get_schedule().max_total_tokens is None:
             get_context().override(
@@ -217,9 +297,36 @@ class ExpertSlotSizing:
         self.mamba_text = _mamba_text(slots, per_request, requests)
         return slots
 
-    def size(self, kv_tokens: int) -> List[int]:
-        """After the KV cache is allocated: free the K = top-k tables, measure what the
-        static budget has left and give it to the slots, in one allocation."""
+    def prepare(self, kv_tokens: int) -> None:
+        """After the KV cache is allocated; ``finish`` sizes the slots."""
+        self.kv_tokens = kv_tokens
+        self.free_after_kv = _free_after_gc(self.kv_configurator.device)
+
+    def finish(self, model_runner) -> List[int]:
+        """Once the attention backends are up, before anything runs the MoE: measure a
+        prefill step (a dummy forward) and size the slots around it."""
+        tokens = _step_tokens(self.floor.minimum)
+        need = int(
+            measure_prefill_activations(_probe_runner(model_runner), tokens)
+            * (1 + _ACTIVATION_MARGIN)
+        )
+        used = max(0, self.free_after_kv - _free_after_gc(self.kv_configurator.device))
+        slack = int(
+            self.pre_model_load_memory * (1 - get_schedule().mem_fraction_static) * _GIB
+        )
+        logger.info(
+            "Paged experts: a %d-token prefill step needs %.2f GiB (measured, +%d%%); "
+            "%.2f GiB of the --mem-fraction-static headroom is left for it",
+            tokens,
+            need / _GIB,
+            round(_ACTIVATION_MARGIN * 100),
+            max(0, slack - used) / _GIB,
+        )
+        return self.size(self.kv_tokens, _prefill_adjust(need, used, slack))
+
+    def size(self, kv_tokens: int, adjust: int = 0) -> List[int]:
+        """Free the K = top-k tables, measure what the static budget has left (plus
+        ``adjust``, see ``_prefill_adjust``) and give it to the slots, in one allocation."""
         from sglang.srt.layers.moe.paged_experts.method import (
             _cap_decode_capture_batch_sizes,
             _router_top_k,
@@ -246,7 +353,7 @@ class ExpertSlotSizing:
         for layer, m in zip(self.layers, methods):
             m.release_slots(layer)
         spare = static_budget_bytes(self.kv_configurator, self.pre_model_load_memory)
-        spare -= sum(k * r for k, r in zip(base, row))
+        spare += adjust - sum(k * r for k, r in zip(base, row))
         # A host-planned step (a prefill chunk) needs its merged entries and one compacted
         # runner call beyond what the runner itself takes; one MoE layer runs at a time.
         tokens = _step_tokens(self.floor.minimum)
